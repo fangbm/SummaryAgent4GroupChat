@@ -13,6 +13,8 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
+    #[serde(default)]
+    pub platform: PlatformConfig,
     pub wx4py: Wx4pyConfig,
     pub listen: ListenConfig,
     pub time_range: TimeRangeConfig,
@@ -47,6 +49,20 @@ impl AgentConfig {
     pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PlatformConfig {
+    #[serde(default)]
+    pub kind: PlatformKindConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformKindConfig {
+    #[default]
+    Wx4py,
+    Discord,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -510,6 +526,12 @@ mod tests {
         let cfg: PrivacyConfig = toml::from_str("").unwrap();
         assert!(!cfg.redact_enabled);
         assert!(cfg.cloud_allowed);
+    }
+
+    #[test]
+    fn platform_defaults_to_wx4py() {
+        let cfg: PlatformConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.kind, PlatformKindConfig::Wx4py);
     }
 
     #[test]

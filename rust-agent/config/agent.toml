@@ -1,3 +1,6 @@
+[platform]
+kind = "wx4py"
+
 [wx4py]
 # wx4py uses Windows UI automation, so groups must be WeChat display names.
 python_executable = "..\\.venv\\Scripts\\python.exe"

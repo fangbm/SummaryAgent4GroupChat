@@ -64,6 +64,9 @@ scripts/
 `rust-agent/config/agent.toml` 新增主要配置：
 
 ```toml
+[platform]
+kind = "wx4py"
+
 [wx4py]
 python_executable = "..\\.venv\\Scripts\\python.exe"
 sidecar_script = "..\\scripts\\wx4py_sidecar.py"
@@ -80,6 +83,7 @@ group_name_map = {}
 
 注意：
 
+- `platform.kind = "wx4py"` 是当前已实现的平台；`discord` 作为后续接入保留值，当前启动会给出未实现错误。
 - `wx4py.groups` 必须是微信里能搜索到的群显示名；wx4py 不能像 wxhook 一样按底层 `@chatroom` ID 全量监听。
 - 若 `wx4py.groups` 为空，Rust 会回退使用 `listen.whitelist_rooms`；两者都为空时启动失败。
 - `wx_cli.group_name_map` 可把触发事件里的群名映射到 `wx-cli export` 可识别的聊天名。

@@ -7,6 +7,8 @@ It does not import or modify the existing Python packages under `../src`.
 
 ```text
 crates/app/          # CLI entrypoint and runtime wiring
+crates/app/src/platform.rs
+                    # platform adapter boundary; wx4py is the first implementation
 crates/core/         # config, models, trigger matching, formatting, privacy switches
 crates/wx4py-client/# wx4py sidecar and wx-cli history adapter
 crates/ai/           # OpenAI-compatible LLM and image clients
@@ -15,6 +17,16 @@ config/agent.toml    # Windows-only default config
 ```
 
 ## Pipeline Switches
+
+The runtime platform is selected through `[platform]`:
+
+```toml
+[platform]
+kind = "wx4py"
+```
+
+`wx4py` is the implemented Windows adapter. The config model also accepts `discord` as a
+reserved value, but the app currently returns a clear "not implemented" startup error for it.
 
 `config/agent.toml` has two independent output switches:
 

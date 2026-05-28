@@ -570,7 +570,7 @@ fn query_wx_cli_cache_messages(
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
             let (sender_id, content) =
-                split_group_sender(&raw_content).unwrap_or_else(|| (fallback_sender, raw_content));
+                split_group_sender(&raw_content).unwrap_or((fallback_sender, raw_content));
             let sender_name = contact_names
                 .get(&sender_id)
                 .filter(|name| name.as_str() != sender_id)

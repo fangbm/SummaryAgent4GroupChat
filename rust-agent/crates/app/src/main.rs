@@ -5,9 +5,11 @@ use std::{
     time::Duration as StdDuration,
 };
 
+mod platform;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wechat_summary_ai::{OpenAiCompatibleLlm, OpenAiImageClient};
 use wechat_summary_core::{
@@ -17,7 +19,8 @@ use wechat_summary_core::{
     TimeRangeCalculator, TriggerMatch, TriggerMatcher,
 };
 use wechat_summary_storage::SqliteStateStore;
-use wx4py_client::{Wx4pyClient, Wx4pyEvent, Wx4pyHistoryMessage};
+
+use crate::platform::{PlatformClient, PlatformEvent, PlatformHistoryMessage};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,15 +34,21 @@ async fn main() -> Result<()> {
 
     let store = SqliteStateStore::open(&config.storage.sqlite_path)?;
     let matcher = TriggerMatcher::new(config.listen.clone())?;
-    let client = Wx4pyClient::start(&config.wx4py, &config.listen, &config.wx_cli)?;
+    let client = PlatformClient::start(&config)?;
+    let platform_rooms = client.configured_rooms(&config);
 
     info!(
-        groups = ?config.wx4py.groups,
-        "wx4py message receiving enabled"
+        platform = client.kind().as_str(),
+        rooms = ?platform_rooms,
+        "platform message receiving enabled"
     );
     append_runtime_log(
         &config,
-        &format!("wx4py enabled groups={:?}", config.wx4py.groups),
+        &format!(
+            "platform enabled kind={} rooms={:?}",
+            client.kind().as_str(),
+            platform_rooms
+        ),
     );
 
     let mut next_scheduled_run = next_scheduled_run_after(Utc::now(), &config);
@@ -74,7 +83,7 @@ async fn main() -> Result<()> {
         }
 
         if let Some(event) = client.next_event_timeout(StdDuration::from_secs(1))? {
-            handle_wx4py_event(&config, &store, &matcher, &client, event).await?;
+            handle_platform_event(&config, &store, &matcher, &client, event).await?;
         }
     }
 }
@@ -102,35 +111,19 @@ fn append_runtime_log(config: &AgentConfig, message: &str) {
     }
 }
 
-fn incoming_from_wx4py(event: Wx4pyEvent) -> Option<IncomingMessage> {
-    let room_id = event.room_id.clone();
-    let timestamp = event.timestamp()?;
-
-    Some(IncomingMessage {
-        room_id,
-        room_name: event.room_name,
-        sender_id: event.sender_id.unwrap_or_else(|| "unknown".to_string()),
-        sender_name: event.sender_name,
-        content: event.content,
-        msg_type: "text".to_string(),
-        timestamp,
-        is_self: false,
-    })
-}
-
-async fn handle_wx4py_event(
+async fn handle_platform_event(
     config: &AgentConfig,
     store: &SqliteStateStore,
     matcher: &TriggerMatcher,
-    client: &Wx4pyClient,
-    event: Wx4pyEvent,
+    client: &PlatformClient,
+    event: PlatformEvent,
 ) -> Result<()> {
     let event_preview = event.content.chars().take(40).collect::<String>();
     info!(
         room_id = ?event.room_id,
         content_len = event.content.chars().count(),
         content_preview = %event_preview,
-        "wx4py event received"
+        "platform event received"
     );
     append_runtime_log(
         config,
@@ -141,11 +134,7 @@ async fn handle_wx4py_event(
             event_preview
         ),
     );
-    let Some(incoming) = incoming_from_wx4py(event) else {
-        debug!("wx4py event skipped before trigger matching");
-        append_runtime_log(config, "event skipped before trigger matching");
-        return Ok(());
-    };
+    let incoming = IncomingMessage::from(event);
     let Some(trigger) = matcher.match_message(&incoming) else {
         append_runtime_log(
             config,
@@ -243,10 +232,10 @@ async fn handle_wx4py_event(
 async fn run_scheduled_summaries(
     config: &AgentConfig,
     store: &SqliteStateStore,
-    client: &Wx4pyClient,
+    client: &PlatformClient,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let rooms = scheduled_rooms(config);
+    let rooms = scheduled_rooms(config, &client.configured_rooms(config));
     if rooms.is_empty() {
         warn!("scheduled summary skipped because no rooms are configured");
         append_runtime_log(config, "scheduled summary skipped no rooms");
@@ -380,7 +369,7 @@ impl PipelineOptions {
 
 async fn run_summary_pipeline(
     config: &AgentConfig,
-    client: &Wx4pyClient,
+    client: &PlatformClient,
     incoming: &IncomingMessage,
     trigger: &TriggerMatch,
     range: &ResolvedTimeRange,
@@ -423,13 +412,13 @@ async fn run_summary_pipeline(
             config.privacy.max_messages_to_llm as u32,
         )
         .await
-        .context("querying wx-cli decrypted chat history")?;
+        .context("querying platform chat history")?;
     info!(
         room_id = %trigger.room_id,
         history_len = history.len(),
         since = %range.since,
         until = %range.until,
-        "wx-cli history query completed"
+        "platform history query completed"
     );
     history.retain(|message| {
         !is_current_trigger_message(message, incoming) && !is_agent_status_message(message)
@@ -700,7 +689,7 @@ async fn generate_summary_image(
 
 async fn send_summary_image(
     config: &AgentConfig,
-    client: &Wx4pyClient,
+    client: &PlatformClient,
     room_id: &str,
     artifact: &ImageArtifact,
 ) -> Result<()> {
@@ -750,19 +739,16 @@ fn next_scheduled_run_after(now: DateTime<Utc>, config: &AgentConfig) -> Option<
     }
 }
 
-fn scheduled_rooms(config: &AgentConfig) -> Vec<String> {
+fn scheduled_rooms(config: &AgentConfig, platform_rooms: &[String]) -> Vec<String> {
     let rooms = if !config.scheduled_summary.rooms.is_empty() {
-        &config.scheduled_summary.rooms
-    } else if !config.wx4py.groups.is_empty() {
-        &config.wx4py.groups
+        config.scheduled_summary.rooms.clone()
     } else {
-        &config.listen.whitelist_rooms
+        platform_rooms.to_vec()
     };
 
     rooms
-        .iter()
+        .into_iter()
         .filter(|room| !room.trim().is_empty())
-        .cloned()
         .collect()
 }
 
@@ -824,13 +810,16 @@ fn cloud_blocked(config: &AgentConfig, room_id: &str) -> bool {
                 .any(|room| room == room_id))
 }
 
-fn is_current_trigger_message(message: &Wx4pyHistoryMessage, incoming: &IncomingMessage) -> bool {
+fn is_current_trigger_message(
+    message: &PlatformHistoryMessage,
+    incoming: &IncomingMessage,
+) -> bool {
     message.timestamp == incoming.timestamp
         && message.content.trim() == incoming.content.trim()
         && (message.sender_id == incoming.sender_id || message.is_self)
 }
 
-fn is_agent_status_message(message: &Wx4pyHistoryMessage) -> bool {
+fn is_agent_status_message(message: &PlatformHistoryMessage) -> bool {
     let content = message.content.trim();
     content.starts_with("收到 /总结")
         || content.starts_with("收到 #总结")
@@ -874,7 +863,7 @@ fn format_error_chain(error: &anyhow::Error) -> String {
         .join(": ")
 }
 
-fn history_to_chat_message(message: Wx4pyHistoryMessage) -> ChatMessage {
+fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
     ChatMessage {
         timestamp: message.timestamp,
         sender_id: message.sender_id,
@@ -900,7 +889,7 @@ mod tests {
     #[test]
     fn current_trigger_message_matches_self_history_row() {
         let timestamp = Utc.timestamp_opt(1_716_464_700, 0).unwrap();
-        let history = Wx4pyHistoryMessage {
+        let history = PlatformHistoryMessage {
             timestamp,
             sender_id: "self".to_string(),
             sender_name: Some("我".to_string()),
@@ -949,7 +938,7 @@ mod tests {
 
     #[test]
     fn detects_agent_status_messages() {
-        let message = Wx4pyHistoryMessage {
+        let message = PlatformHistoryMessage {
             timestamp: Utc::now(),
             sender_id: "self".into(),
             sender_name: None,
@@ -1036,7 +1025,21 @@ mod tests {
     fn scheduled_rooms_default_to_wx4py_groups() {
         let config = test_config();
 
-        assert_eq!(scheduled_rooms(&config), vec!["测试群".to_string()]);
+        assert_eq!(
+            scheduled_rooms(&config, &["测试群".to_string()]),
+            vec!["测试群".to_string()]
+        );
+    }
+
+    #[test]
+    fn scheduled_rooms_config_overrides_platform_rooms() {
+        let mut config = test_config();
+        config.scheduled_summary.rooms = vec!["定时群".to_string()];
+
+        assert_eq!(
+            scheduled_rooms(&config, &["平台群".to_string()]),
+            vec!["定时群".to_string()]
+        );
     }
 
     fn test_config() -> AgentConfig {
