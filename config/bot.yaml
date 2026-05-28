@@ -1,0 +1,35 @@
+bot:
+  # Requires a bot CLI that exposes watch --json, send-text, and send-image.
+  # The tested AirboZH/wx-bot-cli (`wxbot`) does not currently provide this full surface.
+  cli_path: "wx-bot-cli"
+  listen:
+    triggers: ["@", "#", "/总结"]
+    match_mode: "prefix"
+    whitelist_groups:
+      - "1234567890@chatroom"
+      - "AI交流群"
+    blacklist_users: []
+  message:
+    content_types: ["text"]
+    ignore_self: true
+  time_range:
+    mode: "between_triggers"
+    fallback_minutes: 30
+
+windows_bridge:
+  host: "127.0.0.1"
+  port: 8765
+  protocol: "websocket"
+  path: "/ws"
+  token: "${WECHAT_PIPELINE_IPC_TOKEN:-change-me}"
+  reconnect_seconds: 5
+  file_transfer:
+    download_dir: "./runtime/linux-images"
+    timeout_seconds: 60
+
+storage:
+  sqlite_path: "./runtime/linux-bot.sqlite3"
+
+runtime:
+  log_level: "INFO"
+  metrics_enabled: true

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+runtime/
+rust-agent/runtime/
+rust-agent/wx4py_send_audit.jsonl
+*.sqlite3
+*.log
+.env
+*.egg-info/
+.deps/
+rust-agent/target/

@@ -1,0 +1,17 @@
+[package]
+name = "wechat-summary-app"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wechat-summary-ai = { path = "../ai" }
+wechat-summary-core = { path = "../core" }
+wechat-summary-storage = { path = "../storage" }
+wx4py-client = { path = "../wx4py-client" }

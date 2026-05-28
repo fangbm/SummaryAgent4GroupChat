@@ -1,0 +1,98 @@
+server:
+  host: "0.0.0.0"
+  port: 8765
+  websocket_path: "/ws"
+  metrics_enabled: true
+
+wechat:
+  # Preferred Windows-only replacement for wx-bot-cli/wcferry.
+  # wxhook is full-featured: receive messages, send text/images/files, query contacts/groups, SQL.
+  provider: "wxhook"
+  debug: false
+  rpc_port: 10086        # legacy wcferry only
+  require_login: true
+  faked_version: null    # optional wxhook Bot(faked_version=...)
+  # wxhook's native injector is safer when DLL/EXE paths contain ASCII only.
+  wxhook_tools_dir: "C:\\Users\\Public\\wx-summary-agent\\tools"
+  listen:
+    triggers: ["@", "#", "/总结"]
+    match_mode: "prefix"
+    whitelist_groups:
+      - "1234567890@chatroom"
+      - "AI交流群"
+    blacklist_users: []
+    content_types: ["text"]
+    ignore_self: true
+  time_range:
+    mode: "between_triggers"
+    fallback_minutes: 30
+    fixed_minutes: 30
+    fixed_hours: 2
+  # Optional display-name -> wxid/roomid overrides for sending and wx-cli export.
+  receiver_map: {}
+
+security:
+  ipc_token: "${WECHAT_PIPELINE_IPC_TOKEN:-change-me}"
+  download_secret: "${WECHAT_PIPELINE_DOWNLOAD_SECRET:-change-me-download}"
+  download_url_ttl_seconds: 900
+
+storage:
+  sqlite_path: "./runtime/windows-worker.sqlite3"
+
+wx_cli:
+  executable: "wx"
+  export_format: "json"
+  max_messages: 5000
+  temp_dir: "./runtime/wx-exports"
+  group_name_map: {}
+
+privacy:
+  mode: "protected"
+  redact_enabled: true
+  max_messages_to_llm: 800
+  max_chars_to_llm: 20000
+  cloud_allowed: true
+  sensitive_groups: []
+
+llm:
+  provider: "openai_compatible"
+  api_key: "${LLM_API_KEY:-}"
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  timeout_seconds: 120
+  max_output_tokens: 2000
+  temperature: 0.3
+  proxy:
+    enabled: false
+    http: "${HTTP_PROXY:-}"
+    https: "${HTTP_PROXY:-}"
+  system_prompt: |
+    你是一位专业的群聊内容整理助手。请根据提供的微信群聊记录原文及用户发言统计数据，
+    按时间顺序整理内容，提取核心讨论话题、关键观点和结论。
+    输出语言与聊天记录保持一致，总字数控制在 500 字以内。
+
+image_gen:
+  enabled: true
+  provider: "openai"
+  api_key: "${IMAGE_API_KEY:-}"
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-image-1.5"
+  size: "1024x1536"
+  quality: "high"
+  timeout_seconds: 300
+  proxy:
+    enabled: false
+    http: "${HTTP_PROXY:-}"
+    https: "${HTTP_PROXY:-}"
+  prompt_template: |
+    请根据以下群聊整理内容生成一张适合手机查看的信息图：
+
+    内容摘要：
+    {summary}
+
+    要求：简洁现代、中文为主、包含标题、要点列表和时间线元素、适合微信群分享。
+
+file_transfer:
+  output_dir: "./runtime/windows-output"
+  public_base_url: "http://127.0.0.1:8765/images"
+  cleanup_after_days: 7

@@ -1,0 +1,13 @@
+[Unit]
+Description=WeChat AI Pipeline Linux Bot (legacy API mode)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/wechat-ai-pipeline
+EnvironmentFile=/opt/wechat-ai-pipeline/.env
+ExecStart=/opt/wechat-ai-pipeline/venv/bin/python -m linux_bot.main --config config/bot.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

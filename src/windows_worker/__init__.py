@@ -1,0 +1,2 @@
+"""Windows-side worker service."""
+

@@ -1,0 +1,12 @@
+[package]
+name = "wechat-summary-storage"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+

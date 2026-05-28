@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/ai",
+    "crates/app",
+    "crates/core",
+    "crates/storage",
+    "crates/wx4py-client",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+md5 = "0.7"
+thiserror = "1.0"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.10", features = ["v4"] }

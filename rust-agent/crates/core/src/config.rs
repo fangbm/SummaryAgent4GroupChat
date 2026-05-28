@@ -1,0 +1,561 @@
+use std::{collections::HashMap, fs, path::Path};
+
+use serde::Deserialize;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("failed to read config: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("failed to parse config TOML: {0}")]
+    Toml(#[from] toml::de::Error),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentConfig {
+    pub wx4py: Wx4pyConfig,
+    pub listen: ListenConfig,
+    pub time_range: TimeRangeConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub scheduled_summary: ScheduledSummaryConfig,
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub wx_cli: WxCliConfig,
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
+    pub llm: LlmConfig,
+    #[serde(default)]
+    pub text_summary: TextSummaryConfig,
+    #[serde(default)]
+    pub image_summary: ImageSummaryConfig,
+    pub image_gen: ImageGenConfig,
+    #[serde(default)]
+    pub image_prompt: ImagePromptConfig,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+    pub runtime: RuntimeConfig,
+}
+
+impl AgentConfig {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let text = fs::read_to_string(path)?;
+        Ok(toml::from_str(&text)?)
+    }
+
+    pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Wx4pyConfig {
+    #[serde(default = "default_python_executable")]
+    pub python_executable: String,
+    #[serde(default = "default_wx4py_sidecar_script")]
+    pub sidecar_script: String,
+    #[serde(default = "default_wx4py_ready_timeout")]
+    pub ready_timeout_seconds: u64,
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListenConfig {
+    pub triggers: Vec<String>,
+    #[serde(default)]
+    pub match_mode: MatchMode,
+    #[serde(default)]
+    pub whitelist_rooms: Vec<String>,
+    #[serde(default)]
+    pub blacklist_users: Vec<String>,
+    #[serde(default = "default_text_content_types")]
+    pub content_types: Vec<String>,
+    #[serde(default = "default_true")]
+    pub ignore_self: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    #[default]
+    Prefix,
+    Contains,
+    Regex,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TimeRangeConfig {
+    #[serde(default)]
+    pub mode: TimeRangeMode,
+    #[serde(default = "default_fallback_minutes")]
+    pub fallback_minutes: i64,
+    #[serde(default = "default_fallback_minutes")]
+    pub fixed_minutes: i64,
+    #[serde(default = "default_fixed_hours")]
+    pub fixed_hours: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_successful_request_cooldown_seconds")]
+    pub successful_request_cooldown_seconds: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScheduledSummaryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_scheduled_local_hour")]
+    pub local_hour: u32,
+    #[serde(default)]
+    pub local_minute: u32,
+    #[serde(default = "default_scheduled_range_hours")]
+    pub range_hours: i64,
+    #[serde(default)]
+    pub rooms: Vec<String>,
+    #[serde(default = "default_true")]
+    pub send_text: bool,
+    #[serde(default = "default_true")]
+    pub send_image: bool,
+    #[serde(default = "default_true")]
+    pub ignore_rate_limit: bool,
+}
+
+impl Default for ScheduledSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            local_hour: default_scheduled_local_hour(),
+            local_minute: 0,
+            range_hours: default_scheduled_range_hours(),
+            rooms: Vec::new(),
+            send_text: true,
+            send_image: true,
+            ignore_rate_limit: true,
+        }
+    }
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            successful_request_cooldown_seconds: default_successful_request_cooldown_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeRangeMode {
+    #[default]
+    BetweenTriggers,
+    FixedMinutes,
+    FixedHours,
+    Today,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageConfig {
+    pub sqlite_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WxCliConfig {
+    #[serde(default = "default_wx_cli_executable")]
+    pub executable: String,
+    #[serde(default = "default_wx_cli_export_format")]
+    pub export_format: String,
+    #[serde(default = "default_wx_cli_max_messages")]
+    pub max_messages: u32,
+    #[serde(default = "default_wx_cli_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_wx_cli_temp_dir")]
+    pub temp_dir: String,
+    #[serde(default)]
+    pub group_name_map: HashMap<String, String>,
+}
+
+impl Default for WxCliConfig {
+    fn default() -> Self {
+        Self {
+            executable: default_wx_cli_executable(),
+            export_format: default_wx_cli_export_format(),
+            max_messages: default_wx_cli_max_messages(),
+            timeout_seconds: default_wx_cli_timeout_seconds(),
+            temp_dir: default_wx_cli_temp_dir(),
+            group_name_map: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrivacyConfig {
+    #[serde(default)]
+    pub redact_enabled: bool,
+    #[serde(default = "default_max_messages")]
+    pub max_messages_to_llm: usize,
+    #[serde(default = "default_max_chars")]
+    pub max_chars_to_llm: usize,
+    #[serde(default = "default_true")]
+    pub cloud_allowed: bool,
+    #[serde(default)]
+    pub sensitive_rooms: Vec<String>,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            redact_enabled: false,
+            max_messages_to_llm: default_max_messages(),
+            max_chars_to_llm: default_max_chars(),
+            cloud_allowed: true,
+            sensitive_rooms: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmConfig {
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    pub api_key_env: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_llm_base_url_env")]
+    pub base_url_env: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_llm_model_env")]
+    pub model_env: String,
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default)]
+    pub system_prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TextSummaryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_text_summary_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_text_summary_user_prompt_template")]
+    pub user_prompt_template: String,
+}
+
+impl Default for TextSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            system_prompt: default_text_summary_system_prompt(),
+            user_prompt_template: default_text_summary_user_prompt_template(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageSummaryConfig {
+    #[serde(default = "default_image_summary_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_image_summary_user_prompt_template")]
+    pub user_prompt_template: String,
+}
+
+impl Default for ImageSummaryConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: default_image_summary_system_prompt(),
+            user_prompt_template: default_image_summary_user_prompt_template(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageGenConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    pub api_key_env: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_image_base_url_env")]
+    pub base_url_env: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_image_model_env")]
+    pub model_env: String,
+    pub size: String,
+    #[serde(default)]
+    pub quality: Option<String>,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub official_fallback: bool,
+    #[serde(default = "default_image_poll_initial_delay")]
+    pub poll_initial_delay_seconds: u64,
+    #[serde(default = "default_image_poll_interval")]
+    pub poll_interval_seconds: u64,
+    #[serde(default = "default_image_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImagePromptConfig {
+    #[serde(default = "default_image_prompt_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_image_prompt_user_prompt_template")]
+    pub user_prompt_template: String,
+}
+
+impl Default for ImagePromptConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: default_image_prompt_system_prompt(),
+            user_prompt_template: default_image_prompt_user_prompt_template(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub http: Option<String>,
+    #[serde(default)]
+    pub https: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeConfig {
+    pub output_dir: String,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    #[serde(default = "default_cleanup_days")]
+    pub cleanup_after_days: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_text_content_types() -> Vec<String> {
+    vec!["text".to_string()]
+}
+
+fn default_python_executable() -> String {
+    ".\\.venv\\Scripts\\python.exe".to_string()
+}
+
+fn default_wx4py_sidecar_script() -> String {
+    "..\\scripts\\wx4py_sidecar.py".to_string()
+}
+
+fn default_wx4py_ready_timeout() -> u64 {
+    60
+}
+
+fn default_wx_cli_executable() -> String {
+    "wx".to_string()
+}
+
+fn default_wx_cli_export_format() -> String {
+    "json".to_string()
+}
+
+fn default_wx_cli_max_messages() -> u32 {
+    5_000
+}
+
+fn default_wx_cli_timeout_seconds() -> u64 {
+    20
+}
+
+fn default_wx_cli_temp_dir() -> String {
+    ".\\runtime\\wx-exports".to_string()
+}
+
+fn default_fallback_minutes() -> i64 {
+    30
+}
+
+fn default_fixed_hours() -> i64 {
+    2
+}
+
+fn default_successful_request_cooldown_seconds() -> i64 {
+    300
+}
+
+fn default_scheduled_local_hour() -> u32 {
+    22
+}
+
+fn default_scheduled_range_hours() -> i64 {
+    24
+}
+
+fn default_max_messages() -> usize {
+    800
+}
+
+fn default_max_chars() -> usize {
+    20_000
+}
+
+fn default_llm_timeout() -> u64 {
+    120
+}
+
+fn default_llm_base_url_env() -> String {
+    "LLM_BASE_URL".to_string()
+}
+
+fn default_llm_model_env() -> String {
+    "LLM_MODEL".to_string()
+}
+
+fn default_image_base_url_env() -> String {
+    "IMAGE_BASE_URL".to_string()
+}
+
+fn default_image_model_env() -> String {
+    "IMAGE_MODEL".to_string()
+}
+
+fn default_image_timeout() -> u64 {
+    300
+}
+
+fn default_image_poll_initial_delay() -> u64 {
+    10
+}
+
+fn default_image_poll_interval() -> u64 {
+    5
+}
+
+fn default_max_output_tokens() -> u32 {
+    2_000
+}
+
+fn default_temperature() -> f32 {
+    0.3
+}
+
+fn default_text_summary_system_prompt() -> String {
+    "你是一位专业的微信群聊总结助手。请基于聊天记录输出适合直接发回微信群的简洁文字总结，不要输出 JSON，不要编造聊天记录中没有的信息。".to_string()
+}
+
+fn default_text_summary_user_prompt_template() -> String {
+    "{chat_input}".to_string()
+}
+
+fn default_image_summary_system_prompt() -> String {
+    "你是一个微信聊天记录数据分析助手。请把聊天记录整理成适合后续生成信息图的数据报告，重点包含关键数字、热点话题、活跃用户、关键词、时间分布和可视化文案。".to_string()
+}
+
+fn default_image_summary_user_prompt_template() -> String {
+    "{chat_input}".to_string()
+}
+
+fn default_image_prompt_system_prompt() -> String {
+    "你是专业的信息图生图提示词工程师。请把群聊分析结果转写成适合图像生成模型的完整中文提示词，只输出提示词本身，不要输出解释。".to_string()
+}
+
+fn default_image_prompt_user_prompt_template() -> String {
+    r#"图片总结 LLM 的群聊分析结果如下：
+{image_summary}
+
+原始聊天记录与统计输入如下：
+{chat_input}
+
+请生成一段用于生图模型的提示词。要求：
+- 竖版手机海报，适合微信群分享
+- 中文信息图，包含标题、关键数字、热点话题、活跃用户、时间分布和简短洞察
+- 视觉风格现代、清晰、信息密度适中
+- 不要要求展示真实手机号、邮箱、身份证、地址等隐私信息
+- 只输出最终生图 prompt，不要 Markdown，不要 JSON"#
+        .to_string()
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_cleanup_days() -> u32 {
+    7
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn privacy_redaction_defaults_to_off() {
+        let cfg: PrivacyConfig = toml::from_str("").unwrap();
+        assert!(!cfg.redact_enabled);
+        assert!(cfg.cloud_allowed);
+    }
+
+    #[test]
+    fn rate_limit_defaults_to_five_minutes() {
+        let cfg: RateLimitConfig = toml::from_str("").unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.successful_request_cooldown_seconds, 300);
+    }
+
+    #[test]
+    fn scheduled_summary_defaults_to_nightly_24h_with_text_and_image() {
+        let cfg: ScheduledSummaryConfig = toml::from_str("").unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.local_hour, 22);
+        assert_eq!(cfg.local_minute, 0);
+        assert_eq!(cfg.range_hours, 24);
+        assert!(cfg.send_text);
+        assert!(cfg.send_image);
+        assert!(cfg.ignore_rate_limit);
+    }
+
+    #[test]
+    fn summary_and_image_prompt_configs_have_defaults() {
+        let text_summary: TextSummaryConfig = toml::from_str("").unwrap();
+        let image_summary: ImageSummaryConfig = toml::from_str("").unwrap();
+        let image_prompt: ImagePromptConfig = toml::from_str("").unwrap();
+
+        assert!(text_summary.enabled);
+        assert!(text_summary.system_prompt.contains("文字总结"));
+        assert!(text_summary.user_prompt_template.contains("{chat_input}"));
+        assert!(image_summary.user_prompt_template.contains("{chat_input}"));
+        assert!(image_prompt
+            .user_prompt_template
+            .contains("{image_summary}"));
+        assert!(image_prompt.user_prompt_template.contains("{chat_input}"));
+    }
+
+    #[test]
+    fn wx4py_and_wx_cli_configs_have_defaults() {
+        let wx4py: Wx4pyConfig = toml::from_str("").unwrap();
+        let wx_cli: WxCliConfig = toml::from_str("").unwrap();
+
+        assert!(wx4py.python_executable.contains("python"));
+        assert!(wx4py.sidecar_script.contains("wx4py_sidecar.py"));
+        assert_eq!(wx_cli.executable, "wx");
+        assert_eq!(wx_cli.export_format, "json");
+        assert_eq!(wx_cli.timeout_seconds, 20);
+    }
+}

@@ -1,0 +1,11 @@
+services:
+  linux-bot:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    command: ["python", "-m", "linux_bot.main", "--config", "config/bot.yaml"]
+    restart: unless-stopped
+

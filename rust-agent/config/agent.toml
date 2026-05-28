@@ -1,0 +1,349 @@
+[wx4py]
+# wx4py uses Windows UI automation, so groups must be WeChat display names.
+python_executable = "..\\.venv\\Scripts\\python.exe"
+sidecar_script = "..\\scripts\\wx4py_sidecar.py"
+ready_timeout_seconds = 60
+groups = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galgame用户群3"]
+
+[listen]
+triggers = ["#总结", "/总结"]
+match_mode = "prefix"
+whitelist_rooms = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galgame用户群3"]
+blacklist_users = []
+content_types = ["text"]
+ignore_self = true
+
+[time_range]
+mode = "between_triggers"
+fallback_minutes = 30
+fixed_minutes = 30
+fixed_hours = 2
+
+[rate_limit]
+enabled = true
+# Only one successful summary request is allowed per room within this window.
+successful_request_cooldown_seconds = 300
+
+[scheduled_summary]
+enabled = true
+# Local Windows time. Default task runs every day at 22:00 and summarizes the latest 24 hours.
+local_hour = 22
+local_minute = 0
+range_hours = 24
+# Empty means use [wx4py].groups, then listen.whitelist_rooms.
+rooms = []
+# Scheduled summaries defer the text reply until image generation finishes, then send text and image.
+send_text = true
+send_image = true
+# Scheduled summaries are allowed to run even if a manual summary succeeded recently.
+ignore_rate_limit = true
+
+[storage]
+sqlite_path = ".\\runtime\\rust-agent.sqlite3"
+
+[wx_cli]
+# wx-cli decrypts and exports the local WeChat database for history summaries.
+executable = "wx"
+export_format = "json"
+max_messages = 5000
+# wx-cli sometimes hangs while talking to its daemon; fall back to local cache after this.
+timeout_seconds = 20
+temp_dir = ".\\runtime\\wx-exports"
+group_name_map = {}
+
+[privacy]
+redact_enabled = false
+max_messages_to_llm = 10000
+max_chars_to_llm = 750000
+cloud_allowed = true
+sensitive_rooms = []
+
+[text_summary]
+enabled = true
+system_prompt = """
+你是一位专业的微信群聊总结助手。请基于聊天记录输出适合直接发回微信群的中文文字总结。
+要求：简洁、准确、按话题组织；不要输出 JSON或markdown；不要编造聊天记录中没有的信息。
+"""
+user_prompt_template = "{chat_input}"
+
+[llm]
+provider = "openai_compatible"
+# Optional persistent values. If left empty/commented, the *_env variables below are used.
+# api_key = ""
+# base_url = "https://api.example.com/v1"
+# model = "model-name"
+api_key_env = "LLM_API_KEY"
+base_url_env = "LLM_BASE_URL"
+model_env = "LLM_MODEL"
+timeout_seconds = 120
+max_output_tokens = 2000
+temperature = 0.3
+
+[image_summary]
+user_prompt_template = "{chat_input}"
+system_prompt = """
+你是一个“微信聊天记录数据分析助手”。我会提供一段微信群聊导出的聊天记录文本，请你只基于聊天记录本身进行统计、结构化整理和总结，不要编造数据。
+
+你的任务是把聊天记录分析成一份适合生成可视化海报的数据报告。请重点统计：消息数量、图片数量、链接数量、活跃人员、活跃时段、热点话题、关键词、人际关系互动等。
+
+请严格按以下规则处理：
+
+1. 隐私与脱敏
+- 不输出真实手机号、邮箱、身份证、地址、银行卡、订单号等敏感信息。
+- 如果出现真实姓名，可以用“用户A、用户B、用户C”替代，除非聊天记录中本身就是昵称。
+- 不总结涉及个人隐私、财务隐私、健康隐私、情感隐私的具体细节，只做抽象概括。
+- 所有结论都要基于聊天记录，不确定就标注“不足以判断”。
+
+2. 消息类型识别
+请识别并统计：
+- 文本消息
+- 图片消息
+- 视频消息
+- 表情包
+- 链接
+- 文件
+- 语音
+- 系统消息
+- 其他
+
+如果导出的记录里图片、语音、表情等只显示为“[图片]”“[语音]”“[表情]”，也请正常计数。
+
+3. 人员活跃度
+请统计每个人：
+- 发送消息总数
+- 文本消息数
+- 图片/表情/链接数量
+- 占群总消息比例
+- 主要活跃时段
+- 典型聊天角色标签，例如：组织者、信息源、气氛组、技术讨论者、提问者、资源分享者、旁观者等
+
+4. 热点话题
+请从聊天内容中提取 5-10 个热点话题。
+每个话题请包含：
+- 话题名称
+- 简短解释
+- 相关关键词
+- 参与人数
+- 消息数量估计
+- 代表性高频表达，但不要大段引用原文
+- 话题情绪倾向：积极 / 中性 / 消极 / 混合
+
+5. 关键词
+请提取：
+- 高频关键词 Top 30
+- 按类别分组：工作/项目、生活/娱乐、技术/产品、人名/组织、时间/地点、情绪表达
+- 去掉无意义词，比如“哈哈”“然后”“这个”“那个”“可以”等，除非它们本身能反映聊天风格
+
+6. 人际关系互动
+请根据“谁经常回复谁、谁经常被提到、谁和谁连续对话、谁围绕同一话题高频互动”来推断互动关系。
+请输出：
+- 核心人物
+- 高频互动组合
+- 中等互动组合
+- 较少互动组合
+- 社群结构判断，例如：中心化、多个小圈层、松散型、项目协作型、熟人闲聊型等
+注意：这是基于聊天行为的互动分析，不要推断现实中的亲密关系、感情关系或私人关系。
+
+7. 活跃时间
+请按以下维度统计：
+- 每日消息数量
+- 每小时消息数量
+- 工作日 vs 周末活跃度
+- 上午/下午/晚上/深夜哪个时段最活跃
+- 活跃高峰时间段
+
+8. 输出格式
+请严格输出 JSON，不要输出解释性文字。
+JSON 结构如下：
+
+{
+  "meta": {
+    "group_name": "如果能识别则填写，否则为未知群聊",
+    "date_range": {
+      "start": "YYYY-MM-DD 或未知",
+      "end": "YYYY-MM-DD 或未知"
+    },
+    "total_days": 数字或null,
+    "data_note": "示例：基于用户提供的聊天记录文本分析，已脱敏"
+  },
+  "overview": {
+    "total_messages": 数字,
+    "text_messages": 数字,
+    "image_messages": 数字,
+    "video_messages": 数字,
+    "emoji_messages": 数字,
+    "link_messages": 数字,
+    "file_messages": 数字,
+    "voice_messages": 数字,
+    "system_messages": 数字,
+    "other_messages": 数字,
+    "active_users_count": 数字
+  },
+  "message_type_ratio": [
+    {
+      "type": "文字",
+      "count": 数字,
+      "ratio": "百分比"
+    }
+  ],
+  "active_users": [
+    {
+      "rank": 数字,
+      "user": "脱敏昵称",
+      "message_count": 数字,
+      "ratio": "百分比",
+      "text_count": 数字,
+      "image_count": 数字,
+      "link_count": 数字,
+      "main_active_period": "上午/下午/晚上/深夜/不明显",
+      "role_tags": ["组织者", "信息源"],
+      "one_sentence_summary": "一句话概括该用户在群里的聊天特征"
+    }
+  ],
+  "hot_topics": [
+    {
+      "topic": "话题名称",
+      "summary": "一句话解释",
+      "keywords": ["关键词1", "关键词2"],
+      "participant_count": 数字或null,
+      "message_count_estimate": 数字或null,
+      "sentiment": "积极/中性/消极/混合",
+      "poster_label": "适合放在海报上的短标签"
+    }
+  ],
+  "keywords": {
+    "top_keywords": [
+      {
+        "word": "关键词",
+        "count_estimate": 数字或null,
+        "category": "工作/生活/技术/人名组织/时间地点/情绪/其他"
+      }
+    ],
+    "keyword_cloud_suggestions": [
+      {
+        "word": "关键词",
+        "weight": 1到10之间的数字
+      }
+    ]
+  },
+  "relationship_graph": {
+    "core_users": ["用户A", "用户B"],
+    "edges": [
+      {
+        "source": "用户A",
+        "target": "用户B",
+        "interaction_strength": "高/中/低",
+        "reason": "例如：连续对话多、经常互相回复、共同参与同一话题"
+      }
+    ],
+    "community_structure": "中心化/多小圈层/松散型/项目协作型/熟人闲聊型/不足以判断",
+    "summary": "一句话总结群内互动关系"
+  },
+  "activity_time": {
+    "daily_activity": [
+      {
+        "date": "YYYY-MM-DD",
+        "message_count": 数字
+      }
+    ],
+    "hourly_activity": [
+      {
+        "hour": 0,
+        "message_count": 数字
+      }
+    ],
+    "weekday_vs_weekend": {
+      "weekday_messages": 数字,
+      "weekend_messages": 数字,
+      "conclusion": "一句话结论"
+    },
+    "peak_periods": [
+      {
+        "period": "上午高峰",
+        "time_range": "09:00-11:00",
+        "message_count_estimate": 数字或null
+      }
+    ]
+  },
+  "poster_copywriting": {
+    "title": "微信群聊数据分析报告",
+    "subtitle": "消息统计 · 热点话题 · 人际关系洞察",
+    "catgirl_intro": "Hi~ 我是喵小助，帮你把群聊洞察一眼看懂！",
+    "footer_slogan": "用数据洞察群聊，让沟通更高效！",
+    "privacy_note": "示例数据，已脱敏，仅用于群聊行为分析"
+  },
+  "insights": [
+    {
+      "title": "洞察标题",
+      "content": "简短洞察内容",
+      "confidence": "高/中/低"
+    }
+  ],
+  "limitations": [
+    "例如：聊天记录可能不完整，图片和语音内容无法直接解析"
+  ]
+}
+
+请开始分析以下聊天记录：
+"""
+
+[image_prompt]
+system_prompt = """
+你是一个信息可视化设计师。下面是一份微信群聊数据分析 JSON，请你把它整理成一张“猫娘可爱风格”的竖版中文海报内容方案。
+
+设计风格要求：
+- 猫娘可爱风格
+- 粉色、奶油白、薄荷绿、浅蓝为主色
+- 圆角卡片、猫爪、聊天气泡、可爱图标
+- 既要可爱，也要像一个专业数据分析 Dashboard
+- 所有数据必须来自 JSON，不要编造
+
+请输出以下内容：
+
+1. 海报标题
+2. 副标题
+3. 猫娘助手开场白
+4. 总览数据卡片
+5. 消息类型占比卡片
+6. 活跃成员排行榜卡片
+7. 热点话题卡片
+8. 关键词云卡片
+9. 人际关系图卡片
+10. 活跃时段热力图卡片
+11. 底部 slogan
+12. 可直接给 AI 绘图工具使用的完整海报生成 prompt
+
+请使用中文输出，结构清晰，适合直接交给设计师或 AI 绘图模型。
+
+"""
+user_prompt_template = """
+图片总结 LLM 的群聊分析结果如下：
+{image_summary}
+
+原始聊天记录与统计输入如下：
+{chat_input}
+"""
+
+[image_gen]
+enabled = true
+provider = "openai"
+# Optional persistent values. If left empty/commented, the *_env variables below are used.
+# api_key = ""
+# base_url = "https://api.apimart.ai/v1"
+# model = "gpt-image-2"
+api_key_env = "IMAGE_API_KEY"
+base_url_env = "IMAGE_BASE_URL"
+model_env = "IMAGE_MODEL"
+size = "2:3"
+resolution = "1k"
+timeout_seconds = 300
+
+[proxy]
+enabled = false
+http = "http://127.0.0.1:7890"
+https = "http://127.0.0.1:7890"
+
+[runtime]
+output_dir = ".\\runtime\\rust-output"
+log_level = "info"
+cleanup_after_days = 7
