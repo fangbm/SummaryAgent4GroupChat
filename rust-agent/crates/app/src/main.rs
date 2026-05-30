@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -13,14 +14,16 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wechat_summary_ai::{OpenAiCompatibleLlm, OpenAiImageClient};
 use wechat_summary_core::{
-    config::TimeRangeMode,
+    config::{PlatformKindConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
     parse_command_time_range_minutes, AgentConfig, ChatFormatter, PrivacyFilter, ResolvedTimeRange,
     TimeRangeCalculator, TriggerMatch, TriggerMatcher,
 };
 use wechat_summary_storage::SqliteStateStore;
 
-use crate::platform::{PlatformClient, PlatformEvent, PlatformHistoryMessage};
+use crate::platform::{PlatformClient, PlatformEvent, PlatformHistoryMessage, PlatformSender};
+
+const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,8 +37,9 @@ async fn main() -> Result<()> {
 
     let store = SqliteStateStore::open(&config.storage.sqlite_path)?;
     let matcher = TriggerMatcher::new(config.listen.clone())?;
-    let client = PlatformClient::start(&config)?;
+    let client = PlatformClient::start(&config).await?;
     let platform_rooms = client.configured_rooms(&config);
+    let mut recent_trigger_attempts = RecentTriggerAttempts::default();
 
     info!(
         platform = client.kind().as_str(),
@@ -83,7 +87,15 @@ async fn main() -> Result<()> {
         }
 
         if let Some(event) = client.next_event_timeout(StdDuration::from_secs(1))? {
-            handle_platform_event(&config, &store, &matcher, &client, event).await?;
+            handle_platform_event(
+                &config,
+                &store,
+                &matcher,
+                &client,
+                &mut recent_trigger_attempts,
+                event,
+            )
+            .await?;
         }
     }
 }
@@ -116,6 +128,7 @@ async fn handle_platform_event(
     store: &SqliteStateStore,
     matcher: &TriggerMatcher,
     client: &PlatformClient,
+    recent_trigger_attempts: &mut RecentTriggerAttempts,
     event: PlatformEvent,
 ) -> Result<()> {
     let event_preview = event.content.chars().take(40).collect::<String>();
@@ -146,6 +159,44 @@ async fn handle_platform_event(
         return Ok(());
     };
 
+    if recent_trigger_attempts.is_duplicate(&trigger, Utc::now()) {
+        info!(
+            room_id = %trigger.room_id,
+            trigger_content = %trigger.trigger_content,
+            dedupe_window_seconds = TRIGGER_DEDUPE_WINDOW_SECONDS,
+            "duplicate trigger ignored"
+        );
+        append_runtime_log(
+            config,
+            &format!(
+                "duplicate trigger ignored room={} content={:?} window_seconds={}",
+                trigger.room_id, trigger.trigger_content, TRIGGER_DEDUPE_WINDOW_SECONDS
+            ),
+        );
+        return Ok(());
+    }
+
+    let command = parse_summary_command(&trigger, client.kind());
+    if !client.supports(command.target_platform) {
+        let message = format!(
+            "暂不支持从 {} 总结 {} 平台消息。当前已接入的平台：{}。",
+            client.kind().as_str(),
+            command.target_platform.as_str(),
+            client.kind().as_str()
+        );
+        append_runtime_log(
+            config,
+            &format!(
+                "unsupported target platform room={} source_platform={} target_platform={}",
+                trigger.room_id,
+                client.kind().as_str(),
+                command.target_platform.as_str()
+            ),
+        );
+        let _ = client.send_text(&trigger.room_id, &message).await;
+        return Ok(());
+    }
+
     let last_trigger = store.get_last_trigger(&trigger.room_id)?;
     if let Some(remaining) = rate_limit_remaining(incoming.timestamp, last_trigger, config) {
         let message = format!(
@@ -169,26 +220,34 @@ async fn handle_platform_event(
         return Ok(());
     }
 
-    let command_range_minutes = command_range_minutes(&trigger);
     let range = TimeRangeCalculator::resolve_with_override(
         incoming.timestamp,
         last_trigger,
         &config.time_range,
-        command_range_minutes,
+        command.range_minutes,
     );
 
     info!(
         room_id = %trigger.room_id,
+        source_platform = client.kind().as_str(),
+        target_platform = command.target_platform.as_str(),
         since = %range.since,
         until = %range.until,
-        command_range_minutes = ?command_range_minutes,
+        command_range_minutes = ?command.range_minutes,
+        image_token_present = command.image_token_present,
         "trigger accepted; running summary pipeline"
     );
     append_runtime_log(
         config,
         &format!(
-            "trigger accepted room={} since={} until={} command_range_minutes={:?}",
-            trigger.room_id, range.since, range.until, command_range_minutes
+            "trigger accepted room={} source_platform={} target_platform={} since={} until={} command_range_minutes={:?} image_token_present={}",
+            trigger.room_id,
+            client.kind().as_str(),
+            command.target_platform.as_str(),
+            range.since,
+            range.until,
+            command.range_minutes,
+            command.image_token_present
         ),
     );
 
@@ -198,7 +257,7 @@ async fn handle_platform_event(
         &incoming,
         &trigger,
         &range,
-        PipelineOptions::manual(config),
+        PipelineOptions::manual(config, command.image_token_present),
     )
     .await
     {
@@ -227,6 +286,38 @@ async fn handle_platform_event(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct RecentTriggerAttempts {
+    seen_at_by_key: HashMap<String, DateTime<Utc>>,
+}
+
+impl RecentTriggerAttempts {
+    fn is_duplicate(&mut self, trigger: &TriggerMatch, now: DateTime<Utc>) -> bool {
+        let cutoff = now - Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS);
+        self.seen_at_by_key.retain(|_, seen_at| *seen_at >= cutoff);
+
+        let key = trigger_attempt_key(trigger);
+        if self
+            .seen_at_by_key
+            .get(&key)
+            .is_some_and(|seen_at| *seen_at >= cutoff)
+        {
+            return true;
+        }
+
+        self.seen_at_by_key.insert(key, now);
+        false
+    }
+}
+
+fn trigger_attempt_key(trigger: &TriggerMatch) -> String {
+    format!(
+        "{}\n{}",
+        trigger.room_id.trim(),
+        trigger.trigger_content.trim()
+    )
 }
 
 async fn run_scheduled_summaries(
@@ -346,10 +437,12 @@ struct PipelineOptions {
 }
 
 impl PipelineOptions {
-    fn manual(config: &AgentConfig) -> Self {
+    fn manual(config: &AgentConfig, image_token_present: bool) -> Self {
+        let image_enabled_for_request =
+            config.manual_summary.image_by_default ^ image_token_present;
         Self {
             text_summary_enabled: config.text_summary.enabled,
-            image_gen_enabled: config.image_gen.enabled,
+            image_gen_enabled: config.image_gen.enabled && image_enabled_for_request,
             send_progress: true,
             defer_text_until_image_ready: false,
             send_disabled_message: true,
@@ -403,6 +496,20 @@ async fn run_summary_pipeline(
         return Ok(());
     }
 
+    info!(
+        room_id = %trigger.room_id,
+        since = %range.since,
+        until = %range.until,
+        limit = config.privacy.max_messages_to_llm,
+        "querying platform history"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "history query started room={} since={} until={} limit={}",
+            trigger.room_id, range.since, range.until, config.privacy.max_messages_to_llm
+        ),
+    );
     let mut history = client
         .query_text_messages(
             &trigger.room_id,
@@ -413,20 +520,75 @@ async fn run_summary_pipeline(
         )
         .await
         .context("querying platform chat history")?;
+    let platform_history_len = history.len();
+    let first_platform_ts = history.iter().map(|message| message.timestamp).min();
+    let last_platform_ts = history.iter().map(|message| message.timestamp).max();
     info!(
         room_id = %trigger.room_id,
-        history_len = history.len(),
+        history_len = platform_history_len,
         since = %range.since,
         until = %range.until,
+        first_ts = ?first_platform_ts,
+        last_ts = ?last_platform_ts,
         "platform history query completed"
     );
+    append_runtime_log(
+        config,
+        &format!(
+            "history query completed room={} history_len={} since={} until={} first={} last={}",
+            trigger.room_id,
+            platform_history_len,
+            range.since,
+            range.until,
+            first_platform_ts
+                .map(|timestamp| timestamp.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            last_platform_ts
+                .map(|timestamp| timestamp.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+    );
+    let raw_history_len = history.len();
+    if let Some(first_ts) = first_platform_ts {
+        let late_by = first_ts - range.since;
+        if late_by > Duration::hours(1) {
+            warn!(
+                room_id = %trigger.room_id,
+                requested_since = %range.since,
+                first_ts = %first_ts,
+                late_by_minutes = late_by.num_minutes(),
+                "platform history starts later than requested window"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "history coverage starts late room={} requested_since={} first={} missing_before_minutes={}",
+                    trigger.room_id,
+                    range.since,
+                    first_ts,
+                    late_by.num_minutes()
+                ),
+            );
+        }
+    }
     history.retain(|message| {
         !is_current_trigger_message(message, incoming) && !is_agent_status_message(message)
     });
+    let filtered_history_len = history.len();
+    let removed_history_len = raw_history_len.saturating_sub(filtered_history_len);
     info!(
         room_id = %trigger.room_id,
-        history_len = history.len(),
+        history_len = filtered_history_len,
+        raw_history_len,
+        removed_history_len,
         "history after trigger-message filtering"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "history after filtering room={} raw_len={} filtered_len={} removed={}",
+            trigger.room_id, raw_history_len, filtered_history_len, removed_history_len
+        ),
     );
 
     let chat_messages = history
@@ -515,7 +677,30 @@ async fn run_summary_pipeline(
                 .await
                 .context("sending summary text")?;
             info!(room_id = %trigger.room_id, "summary text sent");
+            append_runtime_log(
+                config,
+                &format!("summary text sent room={}", trigger.room_id),
+            );
         }
+    }
+
+    if options.image_gen_enabled && !options.defer_text_until_image_ready {
+        spawn_background_image_pipeline(
+            config.clone(),
+            client.sender(),
+            trigger.room_id.clone(),
+            llm_input,
+            options.text_summary_enabled,
+        );
+        info!(
+            room_id = %trigger.room_id,
+            "manual image pipeline spawned in background"
+        );
+        append_runtime_log(
+            config,
+            &format!("manual image pipeline spawned room={}", trigger.room_id),
+        );
+        return Ok(());
     }
 
     if options.image_gen_enabled {
@@ -600,6 +785,10 @@ async fn run_summary_pipeline(
                         .await
                         .context("sending deferred summary text")?;
                     info!(room_id = %trigger.room_id, "deferred summary text sent");
+                    append_runtime_log(
+                        config,
+                        &format!("deferred summary text sent room={}", trigger.room_id),
+                    );
                 }
                 send_summary_image(config, client, &trigger.room_id, &artifact).await?;
             }
@@ -619,6 +808,13 @@ async fn run_summary_pipeline(
                         .await
                         .context("sending deferred summary text after image failure")?;
                     info!(room_id = %trigger.room_id, "deferred summary text sent after image failure");
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "deferred summary text sent after image failure room={}",
+                            trigger.room_id
+                        ),
+                    );
                 }
                 let prefix = if options.text_summary_enabled {
                     "文字总结已完成，但"
@@ -644,6 +840,146 @@ async fn run_summary_pipeline(
         info!(room_id = %trigger.room_id, "deferred summary text sent without image");
     }
 
+    Ok(())
+}
+
+fn spawn_background_image_pipeline(
+    config: AgentConfig,
+    sender: PlatformSender,
+    room_id: String,
+    llm_input: String,
+    text_summary_enabled: bool,
+) {
+    tokio::spawn(async move {
+        run_background_image_pipeline(config, sender, room_id, llm_input, text_summary_enabled)
+            .await;
+    });
+}
+
+async fn run_background_image_pipeline(
+    config: AgentConfig,
+    sender: PlatformSender,
+    room_id: String,
+    llm_input: String,
+    text_summary_enabled: bool,
+) {
+    let result = run_background_image_pipeline_inner(&config, &sender, &room_id, &llm_input).await;
+    if let Err(error) = result {
+        let error_message = format_error_chain(&error);
+        warn!(room_id = %room_id, error = %error_message, "background image pipeline failed");
+        append_runtime_log(
+            &config,
+            &format!(
+                "background image pipeline failed room={} error={}",
+                room_id, error_message
+            ),
+        );
+        let prefix = if text_summary_enabled {
+            "文字总结已完成，但"
+        } else {
+            ""
+        };
+        if let Err(send_error) = sender
+            .send_text(&room_id, &format!("{prefix}图片生成失败：{error_message}"))
+            .await
+        {
+            warn!(
+                room_id = %room_id,
+                error = %format_error_chain(&send_error),
+                "failed to send background image failure message"
+            );
+        }
+    }
+}
+
+async fn run_background_image_pipeline_inner(
+    config: &AgentConfig,
+    sender: &PlatformSender,
+    room_id: &str,
+    llm_input: &str,
+) -> Result<()> {
+    let llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
+        .context("initializing LLM client for background image pipeline")?;
+    let image_summary_request = render_prompt_template(
+        &config.image_summary.user_prompt_template,
+        llm_input,
+        "",
+        "",
+    );
+    info!(
+        room_id = %room_id,
+        prompt_chars = image_summary_request.chars().count(),
+        "calling LLM for background image summary"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "calling llm background image summary room={} prompt_chars={}",
+            room_id,
+            image_summary_request.chars().count()
+        ),
+    );
+    let image_summary = llm
+        .complete(&config.image_summary.system_prompt, &image_summary_request)
+        .await
+        .context("calling LLM for background image summary")?;
+    info!(
+        room_id = %room_id,
+        output_chars = image_summary.chars().count(),
+        "LLM background image summary completed"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm background image summary completed room={} output_chars={}",
+            room_id,
+            image_summary.chars().count()
+        ),
+    );
+
+    let image_prompt_request = render_prompt_template(
+        &config.image_prompt.user_prompt_template,
+        llm_input,
+        "",
+        &image_summary,
+    );
+    info!(
+        room_id = %room_id,
+        prompt_chars = image_prompt_request.chars().count(),
+        "calling LLM for background image prompt"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "calling llm background image prompt room={} prompt_chars={}",
+            room_id,
+            image_prompt_request.chars().count()
+        ),
+    );
+    let image_prompt = llm
+        .complete(&config.image_prompt.system_prompt, &image_prompt_request)
+        .await
+        .context("calling LLM for background image prompt")?;
+    info!(
+        room_id = %room_id,
+        output_chars = image_prompt.chars().count(),
+        "LLM background image prompt completed"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm background image prompt completed room={} output_chars={}",
+            room_id,
+            image_prompt.chars().count()
+        ),
+    );
+
+    let artifact = generate_summary_image(config, room_id, &image_prompt).await?;
+    send_summary_image_with_sender(config, sender, room_id, &artifact).await?;
+    append_runtime_log(
+        config,
+        &format!("background image pipeline completed room={}", room_id),
+    );
     Ok(())
 }
 
@@ -685,6 +1021,22 @@ async fn generate_summary_image(
         ),
     );
     Ok(artifact)
+}
+
+async fn send_summary_image_with_sender(
+    config: &AgentConfig,
+    sender: &PlatformSender,
+    room_id: &str,
+    artifact: &ImageArtifact,
+) -> Result<()> {
+    info!(room_id = %room_id, path = %artifact.path, "sending summary image");
+    sender
+        .send_image(room_id, &artifact.path)
+        .await
+        .context("sending summary image")?;
+    info!(room_id = %room_id, "summary image sent");
+    append_runtime_log(config, &format!("summary image sent room={}", room_id));
+    Ok(())
 }
 
 async fn send_summary_image(
@@ -764,12 +1116,62 @@ fn render_prompt_template(
         .replace("{image_summary}", image_summary)
 }
 
-fn command_range_minutes(trigger: &TriggerMatch) -> Option<i64> {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct SummaryCommand {
+    target_platform: PlatformKindConfig,
+    range_minutes: Option<i64>,
+    image_token_present: bool,
+}
+
+fn parse_summary_command(
+    trigger: &TriggerMatch,
+    default_platform: PlatformKindConfig,
+) -> SummaryCommand {
     let args = trigger
         .trigger_content
-        .strip_prefix(&trigger.trigger_symbol)?
+        .strip_prefix(&trigger.trigger_symbol)
+        .unwrap_or_default()
         .trim();
-    parse_command_time_range_minutes(args)
+    parse_summary_command_args(args, default_platform)
+}
+
+fn parse_summary_command_args(args: &str, default_platform: PlatformKindConfig) -> SummaryCommand {
+    let args = args.trim();
+    if args.is_empty() {
+        return SummaryCommand {
+            target_platform: default_platform,
+            range_minutes: None,
+            image_token_present: false,
+        };
+    }
+
+    let mut target_platform = default_platform;
+    let mut image_token_present = false;
+    let mut range_tokens = Vec::new();
+    for token in args.split_whitespace() {
+        if let Some(platform) = parse_platform_token(token) {
+            target_platform = platform;
+        } else if is_image_token(token) {
+            image_token_present = true;
+        } else {
+            range_tokens.push(token);
+        }
+    }
+
+    SummaryCommand {
+        target_platform,
+        range_minutes: parse_command_time_range_minutes(&range_tokens.join(" ")),
+        image_token_present,
+    }
+}
+
+fn parse_platform_token(token: &str) -> Option<PlatformKindConfig> {
+    PlatformKindConfig::parse_alias(token)
+}
+
+fn is_image_token(token: &str) -> bool {
+    let token = token.trim();
+    matches!(token, "图片") || matches!(token.to_ascii_lowercase().as_str(), "image" | "img")
 }
 
 fn rate_limit_remaining(
@@ -958,7 +1360,14 @@ mod tests {
             trigger_content: "/总结 1h".into(),
         };
 
-        assert_eq!(command_range_minutes(&trigger), Some(60));
+        assert_eq!(
+            parse_summary_command(&trigger, PlatformKindConfig::Wx4py),
+            SummaryCommand {
+                target_platform: PlatformKindConfig::Wx4py,
+                range_minutes: Some(60),
+                image_token_present: false,
+            }
+        );
     }
 
     #[test]
@@ -969,7 +1378,156 @@ mod tests {
             trigger_content: "/总结 刚才说了什么".into(),
         };
 
-        assert_eq!(command_range_minutes(&trigger), None);
+        assert_eq!(
+            parse_summary_command(&trigger, PlatformKindConfig::Wx4py),
+            SummaryCommand {
+                target_platform: PlatformKindConfig::Wx4py,
+                range_minutes: None,
+                image_token_present: false,
+            }
+        );
+    }
+
+    #[test]
+    fn summary_command_defaults_to_source_platform() {
+        let command = parse_summary_command_args("2h", PlatformKindConfig::Discord);
+
+        assert_eq!(
+            command,
+            SummaryCommand {
+                target_platform: PlatformKindConfig::Discord,
+                range_minutes: Some(120),
+                image_token_present: false,
+            }
+        );
+    }
+
+    #[test]
+    fn summary_command_accepts_explicit_platform_and_time() {
+        let command = parse_summary_command_args("微信 1d", PlatformKindConfig::Discord);
+
+        assert_eq!(
+            command,
+            SummaryCommand {
+                target_platform: PlatformKindConfig::Wx4py,
+                range_minutes: Some(24 * 60),
+                image_token_present: false,
+            }
+        );
+    }
+
+    #[test]
+    fn summary_command_platform_aliases_are_case_insensitive() {
+        for value in ["wx", "WX", "微信", "wechat", "WeChat"] {
+            let command = parse_summary_command_args(value, PlatformKindConfig::Discord);
+            assert_eq!(command.target_platform, PlatformKindConfig::Wx4py);
+        }
+
+        for value in ["dc", "DC", "discord", "Discord"] {
+            let command = parse_summary_command_args(value, PlatformKindConfig::Wx4py);
+            assert_eq!(command.target_platform, PlatformKindConfig::Discord);
+        }
+    }
+
+    #[test]
+    fn summary_command_accepts_discord_alias_without_time() {
+        let command = parse_summary_command_args("dc", PlatformKindConfig::Wx4py);
+
+        assert_eq!(
+            command,
+            SummaryCommand {
+                target_platform: PlatformKindConfig::Discord,
+                range_minutes: None,
+                image_token_present: false,
+            }
+        );
+    }
+
+    #[test]
+    fn summary_command_accepts_image_aliases() {
+        for value in ["图片", "image", "IMAGE", "img", "IMG"] {
+            let command = parse_summary_command_args(value, PlatformKindConfig::Wx4py);
+            assert_eq!(
+                command,
+                SummaryCommand {
+                    target_platform: PlatformKindConfig::Wx4py,
+                    range_minutes: None,
+                    image_token_present: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn summary_command_accepts_platform_time_and_image() {
+        let command = parse_summary_command_args("wechat 1d img", PlatformKindConfig::Discord);
+
+        assert_eq!(
+            command,
+            SummaryCommand {
+                target_platform: PlatformKindConfig::Wx4py,
+                range_minutes: Some(24 * 60),
+                image_token_present: true,
+            }
+        );
+    }
+
+    #[test]
+    fn summary_command_accepts_image_before_time() {
+        let command = parse_summary_command_args("图片 1h", PlatformKindConfig::Discord);
+
+        assert_eq!(
+            command,
+            SummaryCommand {
+                target_platform: PlatformKindConfig::Discord,
+                range_minutes: Some(60),
+                image_token_present: true,
+            }
+        );
+    }
+
+    #[test]
+    fn recent_trigger_attempts_reject_same_trigger_inside_short_window() {
+        let mut attempts = RecentTriggerAttempts::default();
+        let trigger = TriggerMatch {
+            room_id: "room-a".into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结".into(),
+        };
+        let now = Utc.with_ymd_and_hms(2026, 5, 29, 12, 25, 38).unwrap();
+
+        assert!(!attempts.is_duplicate(&trigger, now));
+        assert!(attempts.is_duplicate(
+            &trigger,
+            now + Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS - 1)
+        ));
+        assert!(!attempts.is_duplicate(
+            &trigger,
+            now + Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS + 1)
+        ));
+    }
+
+    #[test]
+    fn recent_trigger_attempts_allows_different_room_or_content() {
+        let mut attempts = RecentTriggerAttempts::default();
+        let trigger = TriggerMatch {
+            room_id: "room-a".into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结".into(),
+        };
+        let different_room = TriggerMatch {
+            room_id: "room-b".into(),
+            ..trigger.clone()
+        };
+        let different_content = TriggerMatch {
+            trigger_content: "/总结 1h".into(),
+            ..trigger.clone()
+        };
+        let now = Utc.with_ymd_and_hms(2026, 5, 29, 12, 25, 38).unwrap();
+
+        assert!(!attempts.is_duplicate(&trigger, now));
+        assert!(!attempts.is_duplicate(&different_room, now + Duration::seconds(1)));
+        assert!(!attempts.is_duplicate(&different_content, now + Duration::seconds(1)));
     }
 
     #[test]
@@ -1040,6 +1598,26 @@ mod tests {
             scheduled_rooms(&config, &["平台群".to_string()]),
             vec!["定时群".to_string()]
         );
+    }
+
+    #[test]
+    fn manual_pipeline_image_argument_enables_when_default_off() {
+        let mut config = test_config();
+        config.image_gen.enabled = true;
+        config.manual_summary.image_by_default = false;
+
+        assert!(!PipelineOptions::manual(&config, false).image_gen_enabled);
+        assert!(PipelineOptions::manual(&config, true).image_gen_enabled);
+    }
+
+    #[test]
+    fn manual_pipeline_image_argument_disables_when_default_on() {
+        let mut config = test_config();
+        config.image_gen.enabled = true;
+        config.manual_summary.image_by_default = true;
+
+        assert!(PipelineOptions::manual(&config, false).image_gen_enabled);
+        assert!(!PipelineOptions::manual(&config, true).image_gen_enabled);
     }
 
     fn test_config() -> AgentConfig {

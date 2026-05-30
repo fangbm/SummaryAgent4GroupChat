@@ -1,82 +1,113 @@
-use std::time::Duration as StdDuration;
+use std::{
+    env,
+    sync::{
+        mpsc::{self, Receiver, RecvTimeoutError},
+        Arc,
+    },
+    time::Duration as StdDuration,
+};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as AnyhowContext, Result};
 use chrono::{DateTime, Utc};
+use serenity::{
+    all::{
+        ChannelId, CreateAttachment, CreateMessage, GatewayIntents, GetMessages, Message,
+        MessageId, UserId,
+    },
+    async_trait,
+    client::{Client, Context as SerenityContext, EventHandler},
+    http::Http,
+};
 use wechat_summary_core::{
     config::{ListenConfig, PlatformKindConfig},
     models::IncomingMessage,
     AgentConfig,
 };
-use wx4py_client::{Wx4pyClient, Wx4pyEvent, Wx4pyHistoryMessage};
+use wx4py_client::{Wx4pyClient, Wx4pyEvent, Wx4pyHistoryMessage, Wx4pySender};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum PlatformKind {
-    Wx4py,
-}
-
-impl PlatformKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Wx4py => "wx4py",
-        }
-    }
-}
+const DISCORD_TEXT_LIMIT: usize = 1_900;
 
 pub enum PlatformClient {
     Wx4py(Wx4pyPlatform),
+    Discord(DiscordPlatform),
+}
+
+#[derive(Clone)]
+pub enum PlatformSender {
+    Wx4py(Wx4pySender),
+    Discord(DiscordSender),
+}
+
+#[derive(Clone)]
+pub struct DiscordSender {
+    http: Arc<Http>,
 }
 
 pub struct Wx4pyPlatform {
     client: Wx4pyClient,
 }
 
+pub struct DiscordPlatform {
+    http: Arc<Http>,
+    receiver: Receiver<DiscordInbound>,
+    bot_user_id: UserId,
+    _gateway_task: tokio::task::JoinHandle<()>,
+}
+
+enum DiscordInbound {
+    Event(PlatformEvent),
+    Error(String),
+}
+
 impl PlatformClient {
-    pub fn start(config: &AgentConfig) -> Result<Self> {
+    pub async fn start(config: &AgentConfig) -> Result<Self> {
         match config.platform.kind {
             PlatformKindConfig::Wx4py => Ok(Self::Wx4py(Wx4pyPlatform {
                 client: Wx4pyClient::start(&config.wx4py, &config.listen, &config.wx_cli)?,
             })),
-            PlatformKindConfig::Discord => {
-                bail!("platform 'discord' is not implemented yet; add a Discord PlatformClient adapter")
-            }
+            PlatformKindConfig::Discord => Ok(Self::Discord(DiscordPlatform::start(config).await?)),
         }
     }
 
-    pub fn kind(&self) -> PlatformKind {
+    pub fn kind(&self) -> PlatformKindConfig {
         match self {
-            Self::Wx4py(_) => PlatformKind::Wx4py,
+            Self::Wx4py(_) => PlatformKindConfig::Wx4py,
+            Self::Discord(_) => PlatformKindConfig::Discord,
         }
+    }
+
+    pub fn supports(&self, kind: PlatformKindConfig) -> bool {
+        self.kind() == kind
     }
 
     pub fn configured_rooms(&self, config: &AgentConfig) -> Vec<String> {
         match self {
             Self::Wx4py(_) => wx4py_rooms(config),
+            Self::Discord(_) => discord_rooms(config),
         }
     }
 
     pub fn next_event_timeout(&self, timeout: StdDuration) -> Result<Option<PlatformEvent>> {
         match self {
             Self::Wx4py(platform) => platform.next_event_timeout(timeout),
+            Self::Discord(platform) => platform.next_event_timeout(timeout),
         }
     }
 
     pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
-        match self {
-            Self::Wx4py(platform) => platform
-                .client
-                .send_text(room_id, text)
-                .await
-                .map_err(Into::into),
-        }
+        self.sender().send_text(room_id, text).await
     }
 
     pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
+        self.sender().send_image(room_id, image_path).await
+    }
+
+    pub fn sender(&self) -> PlatformSender {
         match self {
-            Self::Wx4py(platform) => platform
-                .client
-                .send_image(room_id, image_path)
-                .await
-                .map_err(Into::into),
+            Self::Wx4py(platform) => PlatformSender::Wx4py(platform.client.sender()),
+            Self::Discord(platform) => PlatformSender::Discord(DiscordSender {
+                http: Arc::clone(&platform.http),
+            }),
         }
     }
 
@@ -95,6 +126,11 @@ impl PlatformClient {
                 .await
                 .map(|messages| messages.into_iter().map(Into::into).collect())
                 .map_err(Into::into),
+            Self::Discord(platform) => {
+                platform
+                    .query_text_messages(room_id, since, until, limit)
+                    .await
+            }
         }
     }
 }
@@ -105,6 +141,193 @@ impl Wx4pyPlatform {
             .client
             .next_event_timeout(timeout)?
             .and_then(PlatformEvent::from_wx4py))
+    }
+}
+
+impl DiscordPlatform {
+    async fn start(config: &AgentConfig) -> Result<Self> {
+        let token = discord_token(config)?;
+        let (sender, receiver) = mpsc::channel();
+        let handler = DiscordHandler {
+            sender: sender.clone(),
+        };
+        let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
+        let mut client = Client::builder(&token, intents)
+            .event_handler(handler)
+            .await
+            .context("building Discord gateway client")?;
+        let http = client.http.clone();
+        let current_user = http
+            .get_current_user()
+            .await
+            .context("fetching Discord bot user")?;
+        let bot_user_id = current_user.id;
+        let gateway_task = tokio::spawn(async move {
+            if let Err(error) = client.start().await {
+                let _ = sender.send(DiscordInbound::Error(format!(
+                    "Discord gateway stopped: {error}"
+                )));
+            }
+        });
+
+        Ok(Self {
+            http,
+            receiver,
+            bot_user_id,
+            _gateway_task: gateway_task,
+        })
+    }
+
+    fn next_event_timeout(&self, timeout: StdDuration) -> Result<Option<PlatformEvent>> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(DiscordInbound::Event(event)) => Ok(Some(event)),
+            Ok(DiscordInbound::Error(error)) => bail!(error),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => bail!("Discord gateway event channel closed"),
+        }
+    }
+
+    async fn query_text_messages(
+        &self,
+        room_id: &str,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<PlatformHistoryMessage>> {
+        let channel_id = parse_discord_channel_id(room_id)?;
+        let mut before: Option<MessageId> = None;
+        let mut collected = Vec::new();
+        let max_messages = limit as usize;
+
+        while collected.len() < max_messages {
+            let remaining = max_messages.saturating_sub(collected.len());
+            if remaining == 0 {
+                break;
+            }
+
+            let batch_limit = remaining.min(100) as u8;
+            let mut request = GetMessages::new().limit(batch_limit);
+            if let Some(before_id) = before {
+                request = request.before(before_id);
+            }
+
+            let messages = channel_id
+                .messages(&self.http, request)
+                .await
+                .with_context(|| format!("fetching Discord messages from channel {room_id}"))?;
+            if messages.is_empty() {
+                break;
+            }
+
+            let mut reached_before_range = false;
+            for message in &messages {
+                let timestamp = message.timestamp.to_utc();
+                if timestamp > until {
+                    continue;
+                }
+                if timestamp < since {
+                    reached_before_range = true;
+                    continue;
+                }
+
+                let content = discord_message_content(message);
+                if content.trim().is_empty() {
+                    continue;
+                }
+
+                collected.push(PlatformHistoryMessage {
+                    timestamp,
+                    sender_id: message.author.id.to_string(),
+                    sender_name: Some(message.author.name.clone()),
+                    content,
+                    msg_type: "text".to_string(),
+                    is_self: message.author.id == self.bot_user_id,
+                });
+            }
+
+            before = messages.last().map(|message| message.id);
+            if reached_before_range || messages.len() < batch_limit as usize {
+                break;
+            }
+        }
+
+        collected.sort_by_key(|message| message.timestamp);
+        Ok(collected)
+    }
+}
+
+impl PlatformSender {
+    pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
+        match self {
+            Self::Wx4py(sender) => sender.send_text(room_id, text).await.map_err(Into::into),
+            Self::Discord(sender) => sender.send_text(room_id, text).await,
+        }
+    }
+
+    pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
+        match self {
+            Self::Wx4py(sender) => sender
+                .send_image(room_id, image_path)
+                .await
+                .map_err(Into::into),
+            Self::Discord(sender) => sender.send_image(room_id, image_path).await,
+        }
+    }
+}
+
+impl DiscordSender {
+    async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
+        let channel_id = parse_discord_channel_id(room_id)?;
+        for chunk in discord_text_chunks(text) {
+            channel_id
+                .send_message(&self.http, CreateMessage::new().content(chunk))
+                .await
+                .with_context(|| format!("sending Discord text to channel {room_id}"))?;
+        }
+        Ok(())
+    }
+
+    async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
+        let channel_id = parse_discord_channel_id(room_id)?;
+        let attachment = CreateAttachment::path(image_path)
+            .await
+            .with_context(|| format!("loading image attachment {image_path}"))?;
+        channel_id
+            .send_files(&self.http, [attachment], CreateMessage::new())
+            .await
+            .with_context(|| format!("sending Discord image to channel {room_id}"))?;
+        Ok(())
+    }
+}
+
+struct DiscordHandler {
+    sender: mpsc::Sender<DiscordInbound>,
+}
+
+#[async_trait]
+impl EventHandler for DiscordHandler {
+    async fn message(&self, ctx: SerenityContext, message: Message) {
+        if message.author.bot {
+            return;
+        }
+
+        let content = discord_message_content(&message);
+        if content.trim().is_empty() {
+            return;
+        }
+
+        let room_name = message.channel_id.name(&ctx.http).await.ok();
+        let event = PlatformEvent {
+            room_id: message.channel_id.to_string(),
+            room_name,
+            sender_id: message.author.id.to_string(),
+            sender_name: Some(message.author.name),
+            content,
+            msg_type: "text".to_string(),
+            timestamp: message.timestamp.to_utc(),
+            is_self: false,
+        };
+        let _ = self.sender.send(DiscordInbound::Event(event));
     }
 }
 
@@ -174,8 +397,80 @@ impl From<Wx4pyHistoryMessage> for PlatformHistoryMessage {
     }
 }
 
+fn discord_token(config: &AgentConfig) -> Result<String> {
+    if let Some(token) = config
+        .discord
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        return Ok(token.to_string());
+    }
+
+    env::var(&config.discord.token_env).with_context(|| {
+        format!(
+            "missing Discord bot token; set [discord].token or environment variable {}",
+            config.discord.token_env
+        )
+    })
+}
+
+fn parse_discord_channel_id(room_id: &str) -> Result<ChannelId> {
+    let id = room_id.trim().parse::<u64>().with_context(|| {
+        format!("Discord channel id must be a numeric snowflake, got {room_id:?}")
+    })?;
+    Ok(ChannelId::new(id))
+}
+
+fn discord_message_content(message: &Message) -> String {
+    let content = message.content.trim();
+    let attachment_tags = message
+        .attachments
+        .iter()
+        .map(|attachment| format!("[附件:{}]", attachment.filename))
+        .collect::<Vec<_>>();
+
+    match (content.is_empty(), attachment_tags.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => content.to_string(),
+        (true, false) => attachment_tags.join(" "),
+        (false, false) => format!("{content}\n{}", attachment_tags.join(" ")),
+    }
+}
+
+fn discord_text_chunks(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+    for ch in text.chars() {
+        if current_len >= DISCORD_TEXT_LIMIT {
+            chunks.push(current);
+            current = String::new();
+            current_len = 0;
+        }
+        current.push(ch);
+        current_len += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 fn wx4py_rooms(config: &AgentConfig) -> Vec<String> {
     listen_groups(&config.wx4py.groups, &config.listen)
+}
+
+fn discord_rooms(config: &AgentConfig) -> Vec<String> {
+    listen_groups(&config.discord.channels, &config.listen)
+        .into_iter()
+        .filter(|room| room.trim().parse::<u64>().is_ok())
+        .collect()
 }
 
 fn listen_groups(platform_rooms: &[String], listen: &ListenConfig) -> Vec<String> {
@@ -241,6 +536,61 @@ mod tests {
         assert_eq!(
             listen_groups(&[], &listen),
             vec!["fallback-room".to_string()]
+        );
+    }
+
+    #[test]
+    fn discord_text_chunks_keep_chunks_under_limit() {
+        let text = "a".repeat(DISCORD_TEXT_LIMIT * 2 + 1);
+        let chunks = discord_text_chunks(&text);
+
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= DISCORD_TEXT_LIMIT));
+    }
+
+    #[test]
+    fn discord_rooms_only_keeps_channel_ids() {
+        let mut config = AgentConfig::from_toml_str(
+            r#"
+            [platform]
+            kind = "discord"
+
+            [listen]
+            triggers = ["/总结"]
+            whitelist_rooms = ["general", "123456789012345678"]
+
+            [time_range]
+
+            [storage]
+            sqlite_path = ":memory:"
+
+            [llm]
+            provider = "openai_compatible"
+            api_key_env = "LLM_API_KEY"
+
+            [image_gen]
+            enabled = false
+            provider = "openai"
+            api_key_env = "IMAGE_API_KEY"
+            size = "2:3"
+
+            [runtime]
+            output_dir = ".\\runtime\\test"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            discord_rooms(&config),
+            vec!["123456789012345678".to_string()]
+        );
+
+        config.discord.channels = vec!["not-a-channel".into(), "234567890123456789".into()];
+        assert_eq!(
+            discord_rooms(&config),
+            vec!["234567890123456789".to_string()]
         );
     }
 }

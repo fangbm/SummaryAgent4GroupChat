@@ -1,7 +1,7 @@
-# Windows 单机 Rust + wx4py + wx-cli 开发文档
+# Rust 群聊总结 Agent 开发文档
 
-> 目标平台: Windows 10/11 + Windows 微信客户端 + `wx4py` + `wx-cli`  
-> 分支目标: 在新分支中替换 wxhook 链路，不改动原分支产物  
+> 目标平台: Windows 10/11 + Windows 微信客户端 + `wx4py` + `wx-cli`，以及 Discord Bot  
+> 分支目标: 在新分支中替换 wxhook 链路，并抽象出可接入 Discord 的平台层  
 > 代码边界: `rust-agent/` 继续作为独立 Rust workspace
 
 ## 1. 目标
@@ -10,6 +10,7 @@
 
 - `wx4py`: 使用 Windows UI 自动化模拟操作微信，负责监听群消息、发送文本、发送图片。
 - `wx-cli`: 解密并导出本机微信数据库，负责按时间范围读取历史聊天记录。
+- Discord Bot: 通过 Gateway 接收频道消息，通过 REST 读取频道历史与发送总结。
 - Rust Agent: 负责触发匹配、时间范围、状态、LLM、图片生成和流程编排。
 
 废弃本分支默认链路中的内容：
@@ -29,18 +30,22 @@
 |                                                                 |
 | wx-cli export ---- decrypted chat history JSON ----> Rust Agent |
 +-----------------------------------------------------------------+
+
+Discord Gateway MESSAGE_CREATE ----> Rust Agent
+Discord REST channel messages -----> Rust Agent
+Rust Agent ---- Discord REST create message / attachment ----> Discord channel
 ```
 
 端到端流程：
 
 ```text
-微信群消息 -> wx4py sidecar -> Rust
-  -> 触发词匹配 -> SQLite 读取上次触发时间
-  -> wx-cli export 解密导出历史聊天
+微信群消息 / Discord 频道消息 -> 平台适配层 -> Rust
+  -> 触发词匹配 -> 解析 /总结 [platform] [time] [img] -> SQLite 读取上次触发时间
+  -> wx-cli export 或 Discord REST 读取历史聊天
   -> 格式化原文 + 用户发言统计 -> 可选隐私脱敏
   -> text_summary LLM 可选回发文字
   -> image_summary LLM -> image_prompt LLM -> Image API 可选生图
-  -> wx4py sidecar 模拟发送图片到同群
+  -> 平台适配层发送文字 / 图片到同群或同频道
 ```
 
 ## 3. Workspace
@@ -51,6 +56,7 @@ rust-agent/
 │   ├── app/            # CLI 入口和运行时编排
 │   ├── core/           # 配置、模型、触发、统计、隐私、时间范围
 │   ├── wx4py-client/   # wx4py sidecar + wx-cli 历史导出适配
+│   ├── app/src/platform.rs # wx4py / Discord 平台适配边界
 │   ├── ai/             # OpenAI-compatible LLM / Image API
 │   └── storage/        # SQLite 状态
 └── config/agent.toml
@@ -65,7 +71,7 @@ scripts/
 
 ```toml
 [platform]
-kind = "wx4py"
+kind = "wx"
 
 [wx4py]
 python_executable = "..\\.venv\\Scripts\\python.exe"
@@ -73,20 +79,43 @@ sidecar_script = "..\\scripts\\wx4py_sidecar.py"
 ready_timeout_seconds = 60
 groups = ["你的微信群显示名"]
 
+[discord]
+token_env = "DISCORD_BOT_TOKEN"
+channels = ["Discord 频道 ID"]
+
 [wx_cli]
 executable = "wx"
 export_format = "json"
 max_messages = 5000
+timeout_seconds = 20
+history_query_timeout_seconds = 45
 temp_dir = ".\\runtime\\wx-exports"
 group_name_map = {}
 ```
 
 注意：
 
-- `platform.kind = "wx4py"` 是当前已实现的平台；`discord` 作为后续接入保留值，当前启动会给出未实现错误。
+- `platform.kind` 大小写不敏感，支持 `wx` / `微信` / `wechat` / `dc` / `discord`；`wx` 走 wx4py/微信适配器，`dc` / `discord` 走 Discord Bot 适配器。
 - `wx4py.groups` 必须是微信里能搜索到的群显示名；wx4py 不能像 wxhook 一样按底层 `@chatroom` ID 全量监听。
 - 若 `wx4py.groups` 为空，Rust 会回退使用 `listen.whitelist_rooms`；两者都为空时启动失败。
 - `wx_cli.group_name_map` 可把触发事件里的群名映射到 `wx-cli export` 可识别的聊天名。
+- `wx_cli.history_query_timeout_seconds` 是整段历史查询的兜底超时，防止 wx-cli 或本地 cache 查询卡住后阻塞新请求。
+- `discord.token_env` 默认读取 `DISCORD_BOT_TOKEN`；也可以在 `[discord]` 中直接设置 `token`。
+- `discord.channels` 和 `scheduled_summary.rooms` 对 Discord 必须填写频道 ID；`listen.whitelist_rooms` 可填写频道 ID 或频道名用于触发过滤。
+- Discord 需要在 Developer Portal 开启 Message Content privileged intent，并给 Bot 授权 View Channel、Read Message History、Send Messages；若开启图片总结，还需要 Attach Files。
+
+手动总结命令格式：
+
+```text
+/总结 [platform] [time] [img]
+```
+
+- `platform` 可选；留空时默认总结发送命令的平台。
+- `platform` 大小写不敏感，支持 `wx` / `微信` / `wechat` / `dc` / `discord`。
+- `time` 可选；支持 `30min` / `1h` / `1d` / `30分钟` / `1小时` / `1天` 等。
+- `img` 可选；支持 `图片` / `image` / `img`。当 `[manual_summary].image_by_default = false` 时，只有带该参数的手动总结会生成图片。
+- `[image_gen].enabled` 是图片能力总开关；`[manual_summary].image_by_default` 只控制手动总结是否默认生图，定时总结仍由 `[scheduled_summary].send_image` 控制。
+- `wx` / `微信` / `wechat` 走 wx4py/微信适配器；`discord` / `dc` 走 Discord Bot 适配器。
 
 ## 5. Sidecar 协议
 

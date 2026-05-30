@@ -1,17 +1,25 @@
 [platform]
-kind = "wx4py"
+kind = "wx"
 
 [wx4py]
 # wx4py uses Windows UI automation, so groups must be WeChat display names.
 python_executable = "..\\.venv\\Scripts\\python.exe"
 sidecar_script = "..\\scripts\\wx4py_sidecar.py"
 ready_timeout_seconds = 60
-groups = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galgame用户群3"]
+groups = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galgame用户群3", "脑机2galgame"]
+
+[discord]
+# Set [platform].kind = "dc" or "discord" to run the Discord bot adapter.
+# Bot token is read from this environment variable unless token is set directly.
+token_env = "DISCORD_BOT_TOKEN"
+# Discord channels must be channel IDs, for example ["123456789012345678"].
+# Empty means scheduled summaries use numeric channel IDs from listen.whitelist_rooms.
+channels = []
 
 [listen]
 triggers = ["#总结", "/总结"]
 match_mode = "prefix"
-whitelist_rooms = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galgame用户群3"]
+whitelist_rooms = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galgame用户群3", "脑机2galgame"]
 blacklist_users = []
 content_types = ["text"]
 ignore_self = true
@@ -26,6 +34,11 @@ fixed_hours = 2
 enabled = true
 # Only one successful summary request is allowed per room within this window.
 successful_request_cooldown_seconds = 300
+
+[manual_summary]
+# false: /总结 only sends text; add 图片/image/img to generate an image for that request.
+# true: /总结 generates images by default; add 图片/image/img to skip image generation for that request.
+image_by_default = false
 
 [scheduled_summary]
 enabled = true
@@ -45,12 +58,15 @@ ignore_rate_limit = true
 sqlite_path = ".\\runtime\\rust-agent.sqlite3"
 
 [wx_cli]
-# wx-cli decrypts and exports the local WeChat database for history summaries.
-executable = "wx"
+# builtin uses the in-process wxdb reader instead of spawning the external wx command.
+executable = "builtin"
 export_format = "json"
 max_messages = 5000
-# wx-cli sometimes hangs while talking to its daemon; fall back to local cache after this.
+# Per wx-cli command timeout. Timed-out wx-cli processes are force-terminated.
 timeout_seconds = 20
+# Guard the whole history/export lookup so one stuck query cannot block the agent loop.
+# Keep this above 2 * timeout_seconds so history can time out and still try export.
+history_query_timeout_seconds = 60
 temp_dir = ".\\runtime\\wx-exports"
 group_name_map = {}
 

@@ -1,19 +1,17 @@
 use std::{
-    collections::HashMap,
-    env, fs,
+    fs::{self, File},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Output, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio},
     sync::{
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -25,8 +23,6 @@ pub enum Wx4pyError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     #[error("sidecar failed: {0}")]
     Sidecar(String),
     #[error("wx4py sidecar did not become ready within {0} seconds")]
@@ -37,8 +33,8 @@ pub enum Wx4pyError {
     WxCli(String),
     #[error("invalid wx-cli response: {0}")]
     InvalidWxCli(String),
-    #[error("wx-cli cache lookup failed: {0}")]
-    WxCliCache(String),
+    #[error("wx-cli history query did not finish within {0} seconds")]
+    HistoryQueryTimeout(u64),
 }
 
 pub type Result<T> = std::result::Result<T, Wx4pyError>;
@@ -51,6 +47,11 @@ pub struct Wx4pyClient {
     wx_cli: WxCliConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct Wx4pySender {
+    stdin: Arc<Mutex<ChildStdin>>,
+}
+
 impl Wx4pyClient {
     pub fn start(
         config: &Wx4pyConfig,
@@ -58,6 +59,7 @@ impl Wx4pyClient {
         wx_cli: &WxCliConfig,
     ) -> Result<Self> {
         let groups = listen_groups(config, listen)?;
+        stop_wx_cli_daemon_on_start(wx_cli);
         let mut child = Command::new(&config.python_executable)
             .arg(&config.sidecar_script)
             .arg("--ready-timeout-seconds")
@@ -160,17 +162,11 @@ impl Wx4pyClient {
     }
 
     pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
-        self.send_command(SidecarCommand::SendText {
-            room: room_id.to_string(),
-            text: text.to_string(),
-        })
+        self.sender().send_text(room_id, text).await
     }
 
     pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
-        self.send_command(SidecarCommand::SendImage {
-            room: room_id.to_string(),
-            path: image_path.to_string(),
-        })
+        self.sender().send_image(room_id, image_path).await
     }
 
     pub async fn query_text_messages(
@@ -183,100 +179,25 @@ impl Wx4pyClient {
     ) -> Result<Vec<Wx4pyHistoryMessage>> {
         let chat_name = self.chat_name(room_id, room_name);
         let output = self.temp_output_path(room_id);
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let cmd =
-            build_wx_cli_export_command(&self.wx_cli, &chat_name, since, until, limit, &output);
-        let output_result = match run_command_with_timeout(&cmd, self.wx_cli.timeout_seconds) {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match query_wx_cli_cache_messages(
-                    &chat_name,
-                    since,
-                    until,
-                    limit.min(self.wx_cli.max_messages),
-                ) {
-                    Ok(messages) => {
-                        eprintln!(
-                            "wx-cli executable not found ({}); using wx-cli cache fallback with {} messages",
-                            cmd[0],
-                            messages.len()
-                        );
-                        return Ok(messages);
-                    }
-                    Err(cache_error) => {
-                        return Err(Wx4pyError::WxCli(format!(
-                            "wx-cli executable not found: {}. Set [wx_cli].executable to the absolute path of wx.exe or add it to PATH. cache fallback failed: {}",
-                            cmd[0], cache_error
-                        )));
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                match query_wx_cli_cache_messages(
-                    &chat_name,
-                    since,
-                    until,
-                    limit.min(self.wx_cli.max_messages),
-                ) {
-                    Ok(messages) => {
-                        eprintln!(
-                            "wx-cli export timed out after {} seconds; using wx-cli cache fallback with {} messages",
-                            self.wx_cli.timeout_seconds,
-                            messages.len()
-                        );
-                        return Ok(messages);
-                    }
-                    Err(cache_error) => {
-                        return Err(Wx4pyError::WxCli(format!(
-                            "wx-cli export timed out after {} seconds; cache fallback failed: {}",
-                            self.wx_cli.timeout_seconds, cache_error
-                        )));
-                    }
-                }
-            }
-            Err(error) => return Err(Wx4pyError::Io(error)),
-        };
-        if !output_result.status.success() {
-            let cli_error = String::from_utf8_lossy(&output_result.stderr)
-                .trim()
-                .to_string();
-            if let Ok(messages) = query_wx_cli_cache_messages(
-                &chat_name,
-                since,
-                until,
-                limit.min(self.wx_cli.max_messages),
-            ) {
-                eprintln!(
-                    "wx-cli export failed; using cache fallback with {} messages: {}",
-                    messages.len(),
-                    cli_error
-                );
-                return Ok(messages);
-            }
-            return Err(Wx4pyError::WxCli(cli_error));
-        }
+        let wx_cli = self.wx_cli.clone();
+        let total_timeout_seconds = history_query_timeout_seconds(&wx_cli);
+        let (sender, receiver) = mpsc::channel();
 
-        let text = fs::read_to_string(&output)?;
-        let _ = fs::remove_file(&output);
-        let mut messages = normalize_wx_cli_messages(&text)?;
-        messages.retain(|message| message.timestamp >= since && message.timestamp <= until);
-        if messages.is_empty() {
-            if let Ok(cache_messages) = query_wx_cli_cache_messages(
-                &chat_name,
-                since,
-                until,
-                limit.min(self.wx_cli.max_messages),
-            ) {
-                eprintln!(
-                    "wx-cli export returned empty; using cache fallback with {} messages",
-                    cache_messages.len()
-                );
-                return Ok(cache_messages);
+        thread::spawn(move || {
+            let result =
+                query_text_messages_inner(&wx_cli, &chat_name, since, until, limit, &output);
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(StdDuration::from_secs(total_timeout_seconds)) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                Err(Wx4pyError::HistoryQueryTimeout(total_timeout_seconds))
             }
+            Err(RecvTimeoutError::Disconnected) => Err(Wx4pyError::WxCli(
+                "wx-cli history query worker exited before returning a result".to_string(),
+            )),
         }
-        Ok(messages)
     }
 
     fn wait_ready(&self, timeout_seconds: u64) -> Result<()> {
@@ -298,15 +219,10 @@ impl Wx4pyClient {
         }
     }
 
-    fn send_command(&self, command: SidecarCommand) -> Result<()> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| Wx4pyError::Sidecar("sidecar stdin mutex poisoned".into()))?;
-        serde_json::to_writer(&mut *stdin, &command)?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        Ok(())
+    pub fn sender(&self) -> Wx4pySender {
+        Wx4pySender {
+            stdin: Arc::clone(&self.stdin),
+        }
     }
 
     fn chat_name(&self, room_id: &str, room_name: Option<&str>) -> String {
@@ -330,6 +246,296 @@ impl Wx4pyClient {
             Utc::now().timestamp_millis()
         ))
     }
+}
+
+impl Wx4pySender {
+    pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
+        self.send_command(SidecarCommand::SendText {
+            room: room_id.to_string(),
+            text: text.to_string(),
+        })
+    }
+
+    pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
+        self.send_command(SidecarCommand::SendImage {
+            room: room_id.to_string(),
+            path: image_path.to_string(),
+        })
+    }
+
+    fn send_command(&self, command: SidecarCommand) -> Result<()> {
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| Wx4pyError::Sidecar("sidecar stdin mutex poisoned".into()))?;
+        serde_json::to_writer(&mut *stdin, &command)?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        Ok(())
+    }
+}
+
+fn query_text_messages_inner(
+    wx_cli: &WxCliConfig,
+    chat_name: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: u32,
+    output: &Path,
+) -> Result<Vec<Wx4pyHistoryMessage>> {
+    if should_use_builtin_wxdb(wx_cli) {
+        return query_text_messages_via_builtin_wxdb(chat_name, since, until, limit);
+    }
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    tracing::info!(
+        chat_name,
+        %since,
+        %until,
+        limit,
+        "querying wx-cli history"
+    );
+    match query_text_messages_via_history(wx_cli, chat_name, since, until, limit) {
+        Ok(messages) if !messages.is_empty() => return Ok(messages),
+        Ok(_) => {
+            tracing::warn!(
+                chat_name,
+                %since,
+                %until,
+                "wx-cli history returned no messages; falling back to wx-cli export"
+            );
+        }
+        Err(error) => {
+            if should_skip_export_after_history_error(&error) {
+                return Err(error);
+            }
+            tracing::warn!(
+                chat_name,
+                error = %error,
+                "wx-cli history query failed; falling back to wx-cli export"
+            );
+        }
+    }
+
+    query_text_messages_via_export(wx_cli, chat_name, since, until, limit, output)
+}
+
+fn should_use_builtin_wxdb(wx_cli: &WxCliConfig) -> bool {
+    matches!(
+        wx_cli.executable.trim().to_ascii_lowercase().as_str(),
+        "builtin" | "internal" | "wxdb-builtin"
+    )
+}
+
+fn query_text_messages_via_builtin_wxdb(
+    chat_name: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: u32,
+) -> Result<Vec<Wx4pyHistoryMessage>> {
+    tracing::info!(
+        chat_name,
+        %since,
+        %until,
+        limit,
+        "querying builtin wxdb history"
+    );
+    let result = wechat_summary_wxdb::query_history(wechat_summary_wxdb::HistoryQuery {
+        chat_name: chat_name.to_string(),
+        since: Some(since),
+        until: Some(until),
+        limit: limit as usize,
+        text_only: true,
+    })
+    .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb failed: {error:#}")))?;
+
+    for warning in &result.meta.warnings {
+        tracing::warn!(chat_name, warning = %warning, "builtin wxdb warning");
+    }
+    tracing::info!(
+        chat_name,
+        count = result.messages.len(),
+        db_dir = ?result.meta.db_dir,
+        shards_scanned = result.meta.shards_scanned,
+        shards_hit = result.meta.shards_hit,
+        unknown_shards = ?result.meta.unknown_shards,
+        "builtin wxdb history completed"
+    );
+
+    result
+        .messages
+        .into_iter()
+        .map(|message| {
+            let timestamp = Utc
+                .timestamp_opt(message.timestamp, 0)
+                .single()
+                .ok_or_else(|| {
+                    Wx4pyError::InvalidWxCli(format!(
+                        "invalid wxdb timestamp: {}",
+                        message.timestamp
+                    ))
+                })?;
+            Ok(Wx4pyHistoryMessage {
+                timestamp,
+                sender_id: message
+                    .sender_username
+                    .clone()
+                    .filter(|sender| !sender.is_empty())
+                    .unwrap_or_else(|| message.sender.clone()),
+                sender_name: (!message.sender.is_empty()).then_some(message.sender),
+                content: message.content,
+                msg_type: "text".into(),
+                is_self: false,
+            })
+        })
+        .collect()
+}
+
+fn should_skip_export_after_history_error(error: &Wx4pyError) -> bool {
+    let error = error.to_string();
+    error.contains("wx-daemon 启动超时")
+}
+
+fn query_text_messages_via_history(
+    wx_cli: &WxCliConfig,
+    chat_name: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: u32,
+) -> Result<Vec<Wx4pyHistoryMessage>> {
+    let mut last_error = None;
+    let mut empty_messages = None;
+    for candidate in wx_cli_chat_candidates(chat_name) {
+        let cmd = build_wx_cli_history_command(wx_cli, &candidate, since, until, limit);
+        let output_result = match run_wx_cli_command_with_timeout(&cmd, wx_cli.timeout_seconds) {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Wx4pyError::WxCli(format!(
+                        "wx-cli executable not found: {}. Set [wx_cli].executable to the absolute path of wx.exe or add it to PATH.",
+                        cmd[0]
+                    )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(Wx4pyError::WxCli(format!(
+                    "wx-cli history timed out after {} seconds",
+                    wx_cli.timeout_seconds
+                )));
+            }
+            Err(error) => return Err(Wx4pyError::Io(error)),
+        };
+
+        if !output_result.status.success() {
+            last_error = Some(format!(
+                "wx-cli history failed for {candidate}: {}",
+                command_error_text(&output_result)
+            ));
+            continue;
+        }
+
+        let text = String::from_utf8_lossy(&output_result.stdout);
+        let mut messages = match normalize_wx_cli_messages(&text) {
+            Ok(messages) => messages,
+            Err(error) => {
+                last_error = Some(format!(
+                    "wx-cli history returned invalid JSON for {candidate}: {error}"
+                ));
+                continue;
+            }
+        };
+        messages.retain(|message| message.timestamp >= since && message.timestamp <= until);
+        if messages.is_empty() {
+            empty_messages = Some(messages);
+            continue;
+        }
+        return Ok(messages);
+    }
+
+    if let Some(messages) = empty_messages {
+        return Ok(messages);
+    }
+
+    Err(Wx4pyError::WxCli(last_error.unwrap_or_else(|| {
+        "wx-cli history failed without output".to_string()
+    })))
+}
+
+fn query_text_messages_via_export(
+    wx_cli: &WxCliConfig,
+    chat_name: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: u32,
+    output: &Path,
+) -> Result<Vec<Wx4pyHistoryMessage>> {
+    let mut last_error = None;
+    let mut empty_messages = None;
+    for candidate in wx_cli_chat_candidates(chat_name) {
+        let _ = fs::remove_file(output);
+        let cmd = build_wx_cli_export_command(wx_cli, &candidate, since, until, limit, output);
+        let output_result = match run_wx_cli_command_with_timeout(&cmd, wx_cli.timeout_seconds) {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Wx4pyError::WxCli(format!(
+                        "wx-cli executable not found: {}. Set [wx_cli].executable to the absolute path of wx.exe or add it to PATH.",
+                        cmd[0]
+                    )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(Wx4pyError::WxCli(format!(
+                    "wx-cli export timed out after {} seconds",
+                    wx_cli.timeout_seconds
+                )));
+            }
+            Err(error) => return Err(Wx4pyError::Io(error)),
+        };
+        if !output_result.status.success() {
+            last_error = Some(format!(
+                "wx-cli export failed for {candidate}: {}",
+                command_error_text(&output_result)
+            ));
+            continue;
+        }
+
+        let text = fs::read_to_string(output)?;
+        let _ = fs::remove_file(output);
+        let mut messages = match normalize_wx_cli_messages(&text) {
+            Ok(messages) => messages,
+            Err(error) => {
+                last_error = Some(format!(
+                    "wx-cli export returned invalid JSON for {candidate}: {error}"
+                ));
+                continue;
+            }
+        };
+        messages.retain(|message| message.timestamp >= since && message.timestamp <= until);
+        if messages.is_empty() {
+            empty_messages = Some(messages);
+            continue;
+        }
+        return Ok(messages);
+    }
+
+    if let Some(messages) = empty_messages {
+        return Ok(messages);
+    }
+
+    Err(Wx4pyError::WxCli(last_error.unwrap_or_else(|| {
+        "wx-cli export failed without output".to_string()
+    })))
+}
+
+fn wx_cli_chat_candidates(chat_name: &str) -> Vec<String> {
+    vec![chat_name.to_string()]
+}
+
+fn history_query_timeout_seconds(config: &WxCliConfig) -> u64 {
+    config
+        .history_query_timeout_seconds
+        .max(config.timeout_seconds.saturating_mul(2).saturating_add(10))
+        .max(config.timeout_seconds.saturating_add(1))
+        .max(1)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -402,21 +608,115 @@ pub fn build_wx_cli_export_command(
     ]
 }
 
+pub fn build_wx_cli_history_command(
+    config: &WxCliConfig,
+    chat_name: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: u32,
+) -> Vec<String> {
+    vec![
+        config.executable.clone(),
+        "history".to_string(),
+        chat_name.to_string(),
+        "--since".to_string(),
+        format_beijing_date(since),
+        "--until".to_string(),
+        format_beijing_date(until),
+        "--type".to_string(),
+        "text".to_string(),
+        "--json".to_string(),
+        "-n".to_string(),
+        limit.min(config.max_messages).to_string(),
+    ]
+}
+
+pub fn build_wx_cli_daemon_stop_command(config: &WxCliConfig) -> Vec<String> {
+    vec![
+        config.executable.clone(),
+        "daemon".to_string(),
+        "stop".to_string(),
+    ]
+}
+
+static WX_CLI_COMMAND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const WX_CLI_DAEMON_STOP_TIMEOUT_SECONDS: u64 = 5;
+
+fn stop_wx_cli_daemon_on_start(wx_cli: &WxCliConfig) {
+    if should_use_builtin_wxdb(wx_cli) {
+        tracing::info!("builtin wxdb selected; no external wx-cli daemon to stop");
+        return;
+    }
+    let cmd = build_wx_cli_daemon_stop_command(wx_cli);
+    match run_wx_cli_command_with_timeout(&cmd, WX_CLI_DAEMON_STOP_TIMEOUT_SECONDS) {
+        Ok(output) if output.status.success() => {
+            tracing::info!("stopped wx-cli daemon before wx4py startup");
+        }
+        Ok(output) => {
+            tracing::warn!(
+                error = %command_error_text(&output),
+                "wx-cli daemon stop returned a non-success status before startup"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                executable = %wx_cli.executable,
+                "wx-cli executable not found while trying to stop stale daemon"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to stop wx-cli daemon before startup"
+            );
+        }
+    }
+}
+
+fn run_wx_cli_command_with_timeout(
+    cmd: &[String],
+    timeout_seconds: u64,
+) -> std::io::Result<Output> {
+    let _guard = WX_CLI_COMMAND_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| std::io::Error::other("wx-cli command lock poisoned"))?;
+    run_command_with_timeout(cmd, timeout_seconds)
+}
+
 fn run_command_with_timeout(cmd: &[String], timeout_seconds: u64) -> std::io::Result<Output> {
+    let stdout_path = command_output_temp_path("stdout");
+    let stderr_path = command_output_temp_path("stderr");
+    let stdout_file = File::create(&stdout_path)?;
+    let stderr_file = File::create(&stderr_path)?;
     let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()?;
+    let child_id = child.id();
+    tracing::debug!(
+        pid = child_id,
+        command = %command_for_log(cmd),
+        timeout_seconds,
+        "wx-cli command started"
+    );
     let timeout = StdDuration::from_secs(timeout_seconds.max(1));
     let started = Instant::now();
     loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
+        if let Some(status) = child.try_wait()? {
+            return output_from_temp_files(status, &stdout_path, &stderr_path);
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            tracing::warn!(
+                pid = child_id,
+                command = %command_for_log(cmd),
+                timeout_seconds = timeout.as_secs(),
+                "wx-cli command timed out; terminating process tree"
+            );
+            terminate_process_tree(&mut child);
+            remove_temp_file(&stdout_path);
+            remove_temp_file(&stderr_path);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
@@ -428,6 +728,92 @@ fn run_command_with_timeout(cmd: &[String], timeout_seconds: u64) -> std::io::Re
         }
         thread::sleep(StdDuration::from_millis(100));
     }
+}
+
+fn command_output_temp_path(stream_name: &str) -> PathBuf {
+    let suffix = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_micros());
+    std::env::temp_dir().join(format!(
+        "wx-summary-agent-{}-{suffix}-{stream_name}.tmp",
+        std::process::id()
+    ))
+}
+
+fn output_from_temp_files(
+    status: ExitStatus,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> std::io::Result<Output> {
+    let stdout = read_temp_output(stdout_path)?;
+    let stderr = read_temp_output(stderr_path)?;
+    remove_temp_file(stdout_path);
+    remove_temp_file(stderr_path);
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_temp_output(path: &Path) -> std::io::Result<Vec<u8>> {
+    let started = Instant::now();
+    loop {
+        match fs::read(path) {
+            Ok(output) => return Ok(output),
+            Err(error) if started.elapsed() < StdDuration::from_secs(2) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "wx-cli temp output read failed; retrying briefly"
+                );
+                thread::sleep(StdDuration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn remove_temp_file(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+fn terminate_process_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    let _ = child.kill();
+    let started = Instant::now();
+    while started.elapsed() < StdDuration::from_secs(2) {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(StdDuration::from_millis(50)),
+            Err(_) => return,
+        }
+    }
+}
+
+fn command_for_log(cmd: &[String]) -> String {
+    cmd.join(" ")
+}
+
+fn command_error_text(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("exit status {}", output.status)
 }
 
 pub fn normalize_wx_cli_messages(text: &str) -> Result<Vec<Wx4pyHistoryMessage>> {
@@ -463,7 +849,7 @@ fn normalize_wx_cli_message(value: Value) -> Result<Option<Wx4pyHistoryMessage>>
     }
 
     let msg_type = string_field(object, &["type", "msg_type"]).unwrap_or_else(|| "text".into());
-    if msg_type != "text" {
+    if !is_text_msg_type(&msg_type) {
         return Ok(None);
     }
 
@@ -473,7 +859,7 @@ fn normalize_wx_cli_message(value: Value) -> Result<Option<Wx4pyHistoryMessage>>
             .unwrap_or_else(|| "unknown".into()),
         sender_name: string_field(object, &["sender_name", "sender"]),
         content,
-        msg_type,
+        msg_type: "text".into(),
         is_self: bool_field(object, &["is_self", "isSender"]).unwrap_or(false),
     }))
 }
@@ -505,6 +891,11 @@ fn parse_timestamp(object: &serde_json::Map<String, Value>) -> Result<DateTime<U
         .or_else(|| object.get("CreateTime"))
         .and_then(Value::as_i64)
     {
+        let value = if value > 10_000_000_000 {
+            value / 1000
+        } else {
+            value
+        };
         return Utc
             .timestamp_opt(value, 0)
             .single()
@@ -523,202 +914,6 @@ fn parse_datetime_text(text: &str) -> Result<DateTime<Utc>> {
     let naive = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
         .map_err(|_| Wx4pyError::InvalidWxCli(format!("unsupported timestamp: {text}")))?;
     Ok(Utc.from_utc_datetime(&naive) - Duration::hours(8))
-}
-
-fn query_wx_cli_cache_messages(
-    chat_name: &str,
-    since: DateTime<Utc>,
-    until: DateTime<Utc>,
-    limit: u32,
-) -> Result<Vec<Wx4pyHistoryMessage>> {
-    let cache_dir = wx_cli_cache_dir()?;
-    let username = resolve_cache_username(&cache_dir, chat_name)?;
-    let message_table = format!("Msg_{:x}", md5::compute(username.as_bytes()));
-    let contact_names = load_contact_display_names(&cache_dir)?;
-
-    for db_path in cache_db_paths(&cache_dir)? {
-        let conn = match Connection::open(&db_path) {
-            Ok(conn) => conn,
-            Err(_) => continue,
-        };
-        if !table_exists(&conn, "Name2Id")? || !table_exists(&conn, &message_table)? {
-            continue;
-        }
-        let sender_map = load_sender_map(&conn)?;
-        let mut stmt = conn.prepare(&format!(
-            "select real_sender_id, create_time, message_content from [{message_table}]
-             where create_time >= ?1 and create_time <= ?2
-               and typeof(message_content) = 'text'
-             order by create_time asc
-             limit ?3"
-        ))?;
-        let rows = stmt.query_map(
-            params![since.timestamp(), until.timestamp(), limit as i64],
-            |row| {
-                let real_sender_id: i64 = row.get(0)?;
-                let create_time: i64 = row.get(1)?;
-                let raw_content: String = row.get(2)?;
-                Ok((real_sender_id, create_time, raw_content))
-            },
-        )?;
-
-        let mut messages = Vec::new();
-        for row in rows {
-            let (real_sender_id, create_time, raw_content) = row?;
-            let fallback_sender = sender_map
-                .get(&real_sender_id)
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string());
-            let (sender_id, content) =
-                split_group_sender(&raw_content).unwrap_or((fallback_sender, raw_content));
-            let sender_name = contact_names
-                .get(&sender_id)
-                .filter(|name| name.as_str() != sender_id)
-                .cloned();
-            if content.trim().is_empty() {
-                continue;
-            }
-            let Some(timestamp) = Utc.timestamp_opt(create_time, 0).single() else {
-                continue;
-            };
-            messages.push(Wx4pyHistoryMessage {
-                timestamp,
-                sender_id,
-                sender_name,
-                content,
-                msg_type: "text".into(),
-                is_self: false,
-            });
-        }
-        return Ok(messages);
-    }
-
-    Err(Wx4pyError::WxCliCache(format!(
-        "message table {message_table} for {username} not found in wx-cli cache"
-    )))
-}
-
-fn wx_cli_cache_dir() -> Result<PathBuf> {
-    let home = env::var("USERPROFILE")
-        .or_else(|_| env::var("HOME"))
-        .map_err(|_| Wx4pyError::WxCliCache("USERPROFILE/HOME is not set".into()))?;
-    let cache_dir = PathBuf::from(home).join(".wx-cli").join("cache");
-    if cache_dir.is_dir() {
-        Ok(cache_dir)
-    } else {
-        Err(Wx4pyError::WxCliCache(format!(
-            "cache directory does not exist: {}",
-            cache_dir.display()
-        )))
-    }
-}
-
-fn resolve_cache_username(cache_dir: &Path, chat_name: &str) -> Result<String> {
-    if chat_name.contains("@chatroom") || chat_name.starts_with("wxid_") {
-        return Ok(chat_name.to_string());
-    }
-
-    for db_path in cache_db_paths(cache_dir)? {
-        let conn = match Connection::open(&db_path) {
-            Ok(conn) => conn,
-            Err(_) => continue,
-        };
-        if !table_exists(&conn, "contact")? {
-            continue;
-        }
-        let mut stmt = conn.prepare(
-            "select username from contact
-             where username = ?1 or nick_name = ?1 or remark = ?1
-             limit 1",
-        )?;
-        let mut rows = stmt.query(params![chat_name])?;
-        if let Some(row) = rows.next()? {
-            return row.get(0).map_err(Into::into);
-        }
-    }
-
-    Err(Wx4pyError::WxCliCache(format!(
-        "chat {chat_name} not found in wx-cli contact cache"
-    )))
-}
-
-fn cache_db_paths(cache_dir: &Path) -> Result<Vec<PathBuf>> {
-    Ok(fs::read_dir(cache_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "db"))
-        .collect())
-}
-
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    let exists = conn.query_row(
-        "select exists(select 1 from sqlite_master where type='table' and name=?1)",
-        params![table],
-        |row| row.get::<_, i64>(0),
-    )?;
-    Ok(exists != 0)
-}
-
-fn load_sender_map(conn: &Connection) -> Result<HashMap<i64, String>> {
-    let mut stmt = conn.prepare("select rowid, user_name from Name2Id")?;
-    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (id, username): (i64, String) = row?;
-        map.insert(id, username);
-    }
-    Ok(map)
-}
-
-fn load_contact_display_names(cache_dir: &Path) -> Result<HashMap<String, String>> {
-    let mut names = HashMap::new();
-    for db_path in cache_db_paths(cache_dir)? {
-        let conn = match Connection::open(&db_path) {
-            Ok(conn) => conn,
-            Err(_) => continue,
-        };
-        if !table_exists(&conn, "contact")? {
-            continue;
-        }
-        let mut stmt = conn.prepare("select username, remark, nick_name, alias from contact")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (username, remark, nick_name, alias) = row?;
-            if let Some(display) =
-                display_name_from_contact_fields(&username, remark, nick_name, alias)
-            {
-                names.insert(username, display);
-            }
-        }
-    }
-    Ok(names)
-}
-
-fn display_name_from_contact_fields(
-    username: &str,
-    remark: Option<String>,
-    nick_name: Option<String>,
-    alias: Option<String>,
-) -> Option<String> {
-    [remark, nick_name, alias]
-        .into_iter()
-        .flatten()
-        .map(|value| value.trim().to_string())
-        .find(|value| !value.is_empty() && value != username)
-}
-
-fn split_group_sender(raw_content: &str) -> Option<(String, String)> {
-    let (sender, content) = raw_content.split_once(":\n")?;
-    if sender.trim().is_empty() || content.trim().is_empty() {
-        return None;
-    }
-    Some((sender.to_string(), content.to_string()))
 }
 
 fn string_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
@@ -746,6 +941,13 @@ fn bool_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<
     })
 }
 
+fn is_text_msg_type(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "text" | "1" | "文本" | "文字"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,9 +959,52 @@ mod tests {
             export_format: "json".into(),
             max_messages: 500,
             timeout_seconds: 20,
+            history_query_timeout_seconds: 45,
             temp_dir: ".\\runtime\\wx-exports".into(),
             group_name_map: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn builds_wx_cli_history_command_with_beijing_time_and_text_filter() {
+        let cmd = build_wx_cli_history_command(
+            &wx_cli_config(),
+            "测试群",
+            Utc.with_ymd_and_hms(2026, 5, 24, 1, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 5, 24, 2, 0, 0).unwrap(),
+            100,
+        );
+
+        assert_eq!(cmd[0], "wx");
+        assert_eq!(cmd[1], "history");
+        assert_eq!(cmd[2], "测试群");
+        assert!(cmd.contains(&"2026-05-24".to_string()));
+        assert!(cmd.contains(&"--json".to_string()));
+        assert!(cmd.contains(&"--type".to_string()));
+        assert!(cmd.contains(&"text".to_string()));
+    }
+
+    #[test]
+    fn builds_wx_cli_daemon_stop_command() {
+        let cmd = build_wx_cli_daemon_stop_command(&wx_cli_config());
+
+        assert_eq!(cmd, ["wx", "daemon", "stop"]);
+    }
+
+    #[test]
+    fn history_timeout_can_fall_back_to_export() {
+        let error = Wx4pyError::WxCli("wx-cli history timed out after 20 seconds".into());
+
+        assert!(!should_skip_export_after_history_error(&error));
+    }
+
+    #[test]
+    fn total_history_timeout_covers_history_and_export_commands() {
+        let mut config = wx_cli_config();
+        config.timeout_seconds = 20;
+        config.history_query_timeout_seconds = 45;
+
+        assert_eq!(history_query_timeout_seconds(&config), 50);
     }
 
     #[test]
@@ -774,6 +1019,7 @@ mod tests {
         );
 
         assert_eq!(cmd[0], "wx");
+        assert_eq!(cmd[1], "export");
         assert_eq!(cmd[2], "测试群");
         assert!(cmd.contains(&"2026-05-24".to_string()));
     }
@@ -799,6 +1045,26 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_wx_cli_chinese_text_type() {
+        let payload = r#"{
+            "messages": [
+                {
+                    "timestamp": 1780142448,
+                    "sender": "fbm",
+                    "content": "这段时间没有可总结的文本聊天记录。",
+                    "type": "文本"
+                }
+            ]
+        }"#;
+
+        let messages = normalize_wx_cli_messages(payload).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender_id, "fbm");
+        assert_eq!(messages[0].msg_type, "text");
+    }
+
+    #[test]
     fn parses_local_wx_cli_datetime_as_beijing_time() {
         let payload = r#"[{
             "time": "2026-05-24 09:00:00",
@@ -816,33 +1082,25 @@ mod tests {
     }
 
     #[test]
-    fn contact_display_name_prefers_remark_then_nickname_then_alias() {
+    fn parses_millisecond_timestamps_and_numeric_text_type() {
+        let payload = r#"[{
+            "timestamp": 1780057200000,
+            "sender": "Alice",
+            "content": "hello",
+            "type": 1
+        }]"#;
+
+        let messages = normalize_wx_cli_messages(payload).unwrap();
+
+        assert_eq!(messages.len(), 1);
         assert_eq!(
-            display_name_from_contact_fields(
-                "wxid_abc",
-                Some("  群友备注  ".to_string()),
-                Some("昵称".to_string()),
-                Some("alias".to_string()),
-            ),
-            Some("群友备注".to_string())
+            messages[0].timestamp,
+            Utc.with_ymd_and_hms(2026, 5, 29, 12, 20, 0).unwrap()
         );
-        assert_eq!(
-            display_name_from_contact_fields(
-                "wxid_abc",
-                Some("".to_string()),
-                Some("昵称".to_string()),
-                Some("alias".to_string()),
-            ),
-            Some("昵称".to_string())
-        );
-        assert_eq!(
-            display_name_from_contact_fields(
-                "wxid_abc",
-                Some("wxid_abc".to_string()),
-                None,
-                Some("alias".to_string()),
-            ),
-            Some("alias".to_string())
-        );
+    }
+
+    #[test]
+    fn wx_cli_chat_candidates_use_requested_chat_name_only() {
+        assert_eq!(wx_cli_chat_candidates("脑机2galgame"), vec!["脑机2galgame"]);
     }
 }

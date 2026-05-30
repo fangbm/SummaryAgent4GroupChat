@@ -20,7 +20,7 @@ impl ChatFormatter {
     pub fn format(messages: &[ChatMessage]) -> FormattedChat {
         let mut valid = messages
             .iter()
-            .filter(|msg| msg.msg_type == "text" && !msg.content.trim().is_empty())
+            .filter(|msg| is_text_message_type(&msg.msg_type) && !msg.content.trim().is_empty())
             .cloned()
             .collect::<Vec<_>>();
         valid.sort_by_key(|msg| msg.timestamp);
@@ -109,6 +109,13 @@ fn format_beijing_message_time(value: DateTime<Utc>) -> String {
         .to_string()
 }
 
+fn is_text_message_type(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "text" | "1" | "文本" | "文字"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
@@ -141,5 +148,16 @@ mod tests {
         assert_eq!(formatted.total_messages, 3);
         assert_eq!(formatted.user_stats[0].user, "Alice");
         assert_eq!(formatted.user_stats[0].count, 2);
+    }
+
+    #[test]
+    fn formats_chinese_text_message_type() {
+        let mut message = chat(1_716_464_700, "Alice", "中文文本类型也应该保留");
+        message.msg_type = "文本".into();
+
+        let formatted = ChatFormatter::format(&[message]);
+
+        assert_eq!(formatted.total_messages, 1);
+        assert!(formatted.chat_records.contains("中文文本类型也应该保留"));
     }
 }

@@ -21,6 +21,10 @@ sys.stdout = sys.stderr
 logging.raiseExceptions = False
 
 from wx4py import CallbackHandler, WeChatClient
+from wx4py.features.messaging import WeChatGroupProcessor
+
+
+GROUP_RETRY_SECONDS = 30.0
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -53,25 +57,29 @@ class Wx4pySidecar:
         self.send_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.command_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self.active_send_room: str | None = None
+        self.processors: dict[str, WeChatGroupProcessor] = {}
+        self.pending_groups: set[str] = set()
 
     def run(self) -> int:
         diag_log(f"starting groups={self.groups!r}")
         try:
             self.client.connect()
-            handler = CallbackHandler(self.on_message, auto_reply=False)
-            self.client.process_groups(
-                self.groups,
-                [handler],
-                ignore_client_sent=False,
-                block=False,
-            )
+            self.start_group_processors(self.groups)
         except Exception as exc:
             diag_log(f"startup failed: {type(exc).__name__}: {exc}")
             emit({"kind": "error", "message": f"wx4py startup failed: {type(exc).__name__}: {exc}"})
             return 2
 
+        if not self.processors:
+            message = "wx4py startup failed: no WeChat groups could be initialized"
+            diag_log(message)
+            emit({"kind": "error", "message": message})
+            return 2
+
         threading.Thread(target=self.read_commands, daemon=True).start()
         threading.Thread(target=self.run_commands, daemon=True).start()
+        threading.Thread(target=self.retry_pending_groups, daemon=True).start()
         diag_log("ready")
         emit({"kind": "ready", "ok": True})
 
@@ -81,11 +89,66 @@ class Wx4pySidecar:
         except KeyboardInterrupt:
             pass
         finally:
+            self.stop_processors()
             try:
                 self.client.disconnect()
             except Exception:
                 pass
         return 0
+
+    def start_group_processors(self, groups: list[str]) -> None:
+        for group in groups:
+            if group in self.processors:
+                continue
+            try:
+                self.start_group_processor(group)
+            except Exception as exc:
+                self.pending_groups.add(group)
+                diag_log(f"group listener start failed group={group!r}: {type(exc).__name__}: {exc}")
+
+    def start_group_processor(self, group: str) -> None:
+        handler = CallbackHandler(self.on_message, auto_reply=False)
+        processor = WeChatGroupProcessor(
+            self.client,
+            [group],
+            [handler],
+            ignore_client_sent=False,
+        )
+        try:
+            with self.send_lock:
+                processor.start(block=False)
+        except Exception:
+            try:
+                processor.stop()
+            except Exception:
+                pass
+            raise
+
+        self.processors[group] = processor
+        self.pending_groups.discard(group)
+        diag_log(f"group listener ready group={group!r}")
+
+    def retry_pending_groups(self) -> None:
+        while not self.stop_event.wait(GROUP_RETRY_SECONDS):
+            for group in list(self.pending_groups):
+                if group in self.processors:
+                    self.pending_groups.discard(group)
+                    continue
+                try:
+                    diag_log(f"retrying group listener group={group!r}")
+                    self.start_group_processor(group)
+                except Exception as exc:
+                    diag_log(
+                        f"group listener retry failed group={group!r}: {type(exc).__name__}: {exc}"
+                    )
+
+    def stop_processors(self) -> None:
+        for processor in list(self.processors.values()):
+            try:
+                processor.stop()
+            except Exception:
+                pass
+        self.processors.clear()
 
     def on_message(self, event: Any) -> None:
         group = str(getattr(event, "group", "") or "")
@@ -154,20 +217,182 @@ class Wx4pySidecar:
                 text = str(command.get("text") or "").strip()
                 if not text:
                     return
-                registry = getattr(self.client, "outgoing_registry", None)
-                if registry:
-                    registry.record(room, text)
-                ok = self.client.chat_window.send_to(room, text, target_type="group")
+                ok = self.send_text_guarded(room, text)
             elif cmd == "send_image":
                 path = Path(str(command.get("path") or "")).resolve()
                 if not path.exists():
                     raise FileNotFoundError(str(path))
-                ok = self.client.chat_window.send_file_to(room, str(path), target_type="group")
+                ok = self.send_image_guarded(room, path)
             else:
                 raise ValueError(f"unsupported command: {cmd}")
 
         if not ok:
             raise RuntimeError(f"wx4py returned false for {cmd} -> {room}")
+
+    def open_chat_guarded(self, room: str) -> bool:
+        # wx4py can report "chat opened" before the Qt view has actually switched.
+        # When changing rooms, prime the target twice and settle before pasting.
+        rounds = 2 if self.active_send_room != room else 1
+        for index in range(rounds):
+            diag_log(
+                f"open_guard target={room!r} previous={self.active_send_room!r} round={index + 1}/{rounds}"
+            )
+            if not self.open_chat_once_guarded(room):
+                self.active_send_room = None
+                return False
+            time.sleep(1.2)
+        self.active_send_room = room
+        return True
+
+    def open_chat_once_guarded(self, room: str) -> bool:
+        try:
+            ok = self.client.chat_window.open_chat(
+                room,
+                target_type="group",
+                raise_on_target_not_found=True,
+            )
+            if ok:
+                return True
+            diag_log(f"open_guard primary returned false target={room!r}")
+        except Exception as exc:
+            diag_log(
+                f"open_guard primary failed target={room!r}: {type(exc).__name__}: {exc}"
+            )
+
+        return self.open_chat_from_search_fallback(room)
+
+    def open_chat_from_search_fallback(self, room: str) -> bool:
+        try:
+            chat_window = self.client.chat_window
+            results = chat_window.search(room)
+            self.log_search_results(room, results)
+
+            for item in self.iter_matching_search_results(room, results):
+                group = str(getattr(item, "group", "") or "")
+                name = str(getattr(item, "name", "") or "")
+                diag_log(
+                    f"open_fallback clicking target={room!r} group={group!r} name={name!r}"
+                )
+                if not self.click_search_result(item):
+                    continue
+                time.sleep(1.0)
+                get_chat_input = getattr(chat_window, "_get_chat_input", None)
+                if callable(get_chat_input):
+                    try:
+                        if not get_chat_input():
+                            diag_log(
+                                f"open_fallback clicked but no chat input target={room!r} group={group!r} name={name!r}"
+                            )
+                            continue
+                    except Exception as exc:
+                        diag_log(
+                            f"open_fallback input check failed target={room!r}: {type(exc).__name__}: {exc}"
+                        )
+                        continue
+                diag_log(
+                    f"open_fallback succeeded target={room!r} group={group!r} name={name!r}"
+                )
+                return True
+        except Exception as exc:
+            diag_log(
+                f"open_fallback failed target={room!r}: {type(exc).__name__}: {exc}"
+            )
+
+        try:
+            clear_search = getattr(self.client.chat_window, "_clear_search", None)
+            if callable(clear_search):
+                clear_search()
+        except Exception:
+            pass
+        return False
+
+    def iter_matching_search_results(self, room: str, results: dict[str, Any]):
+        target = self.normalize_search_text(room)
+        preferred_groups = ["最常使用", "群聊", "聊天记录", "联系人", "未知"]
+        excluded_groups = {"功能", "搜索网络结果"}
+        ordered_groups = preferred_groups + [
+            group for group in results.keys() if group not in preferred_groups
+        ]
+
+        seen_ids: set[int] = set()
+        for exact_only in (True, False):
+            for group in ordered_groups:
+                if group in excluded_groups:
+                    continue
+                for item in results.get(group, []):
+                    item_id = id(item)
+                    if item_id in seen_ids:
+                        continue
+                    name = self.normalize_search_text(getattr(item, "name", ""))
+                    if not name:
+                        continue
+                    matched = name == target if exact_only else target in name
+                    if matched:
+                        seen_ids.add(item_id)
+                        yield item
+
+    def normalize_search_text(self, value: Any) -> str:
+        return " ".join(str(value or "").split()).strip()
+
+    def log_search_results(self, room: str, results: dict[str, Any]) -> None:
+        summary: dict[str, list[str]] = {}
+        for group, items in results.items():
+            names = []
+            for item in items[:5]:
+                name = self.normalize_search_text(getattr(item, "name", ""))
+                if name:
+                    names.append(name[:80])
+            summary[group] = names
+        diag_log(f"open_fallback search target={room!r} groups={summary!r}")
+
+    def click_search_result(self, item: Any) -> bool:
+        ctrl = getattr(item, "ctrl", None)
+        if ctrl is None:
+            return False
+        for method_name, kwargs in (
+            ("Click", {}),
+            ("Click", {"simulateMove": False}),
+            ("DoubleClick", {"simulateMove": False}),
+        ):
+            try:
+                getattr(ctrl, method_name)(**kwargs)
+                return True
+            except Exception as exc:
+                diag_log(
+                    f"open_fallback {method_name} failed name={getattr(item, 'name', '')!r}: {type(exc).__name__}: {exc}"
+                )
+        return False
+
+    def send_text_guarded(self, room: str, text: str) -> bool:
+        for attempt in range(1, 3):
+            try:
+                diag_log(f"send_text_guarded target={room!r} attempt={attempt}")
+                if not self.open_chat_guarded(room):
+                    continue
+                registry = getattr(self.client, "outgoing_registry", None)
+                if registry:
+                    registry.record(room, text)
+                if self.client.chat_window.send_message(text):
+                    return True
+            except Exception as exc:
+                diag_log(f"send_text_guarded failed target={room!r}: {type(exc).__name__}: {exc}")
+            self.active_send_room = None
+            time.sleep(1.0)
+        return False
+
+    def send_image_guarded(self, room: str, path: Path) -> bool:
+        for attempt in range(1, 3):
+            try:
+                diag_log(f"send_image_guarded target={room!r} attempt={attempt}")
+                if not self.open_chat_guarded(room):
+                    continue
+                if self.client.chat_window.send_file(str(path)):
+                    return True
+            except Exception as exc:
+                diag_log(f"send_image_guarded failed target={room!r}: {type(exc).__name__}: {exc}")
+            self.active_send_room = None
+            time.sleep(1.0)
+        return False
 
 
 def parse_args() -> argparse.Namespace:

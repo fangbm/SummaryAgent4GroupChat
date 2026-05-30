@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fs, path::Path};
 
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,11 +15,16 @@ pub enum ConfigError {
 pub struct AgentConfig {
     #[serde(default)]
     pub platform: PlatformConfig,
+    #[serde(default)]
     pub wx4py: Wx4pyConfig,
+    #[serde(default)]
+    pub discord: DiscordConfig,
     pub listen: ListenConfig,
     pub time_range: TimeRangeConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub manual_summary: ManualSummaryConfig,
     #[serde(default)]
     pub scheduled_summary: ScheduledSummaryConfig,
     pub storage: StorageConfig,
@@ -57,12 +62,42 @@ pub struct PlatformConfig {
     pub kind: PlatformKindConfig,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Default, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum PlatformKindConfig {
     #[default]
     Wx4py,
     Discord,
+}
+
+impl PlatformKindConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wx4py => "wx",
+            Self::Discord => "discord",
+        }
+    }
+
+    pub fn parse_alias(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "wx" | "微信" | "wechat" | "weixin" | "wx4py" => Some(Self::Wx4py),
+            "dc" | "discord" => Some(Self::Discord),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlatformKindConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse_alias(&value).ok_or_else(|| {
+            de::Error::custom(format!(
+                "unsupported platform kind {value:?}; expected one of wx, 微信, wechat, dc, discord"
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +110,37 @@ pub struct Wx4pyConfig {
     pub ready_timeout_seconds: u64,
     #[serde(default)]
     pub groups: Vec<String>,
+}
+
+impl Default for Wx4pyConfig {
+    fn default() -> Self {
+        Self {
+            python_executable: default_python_executable(),
+            sidecar_script: default_wx4py_sidecar_script(),
+            ready_timeout_seconds: default_wx4py_ready_timeout(),
+            groups: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscordConfig {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default = "default_discord_token_env")]
+    pub token_env: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        Self {
+            token: None,
+            token_env: default_discord_token_env(),
+            channels: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,6 +185,12 @@ pub struct RateLimitConfig {
     pub enabled: bool,
     #[serde(default = "default_successful_request_cooldown_seconds")]
     pub successful_request_cooldown_seconds: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ManualSummaryConfig {
+    #[serde(default)]
+    pub image_by_default: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -190,6 +262,8 @@ pub struct WxCliConfig {
     pub max_messages: u32,
     #[serde(default = "default_wx_cli_timeout_seconds")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_wx_cli_history_query_timeout_seconds")]
+    pub history_query_timeout_seconds: u64,
     #[serde(default = "default_wx_cli_temp_dir")]
     pub temp_dir: String,
     #[serde(default)]
@@ -203,6 +277,7 @@ impl Default for WxCliConfig {
             export_format: default_wx_cli_export_format(),
             max_messages: default_wx_cli_max_messages(),
             timeout_seconds: default_wx_cli_timeout_seconds(),
+            history_query_timeout_seconds: default_wx_cli_history_query_timeout_seconds(),
             temp_dir: default_wx_cli_temp_dir(),
             group_name_map: HashMap::new(),
         }
@@ -385,8 +460,12 @@ fn default_wx4py_ready_timeout() -> u64 {
     60
 }
 
+fn default_discord_token_env() -> String {
+    "DISCORD_BOT_TOKEN".to_string()
+}
+
 fn default_wx_cli_executable() -> String {
-    "wx".to_string()
+    "builtin".to_string()
 }
 
 fn default_wx_cli_export_format() -> String {
@@ -399,6 +478,10 @@ fn default_wx_cli_max_messages() -> u32 {
 
 fn default_wx_cli_timeout_seconds() -> u64 {
     20
+}
+
+fn default_wx_cli_history_query_timeout_seconds() -> u64 {
+    45
 }
 
 fn default_wx_cli_temp_dir() -> String {
@@ -535,10 +618,35 @@ mod tests {
     }
 
     #[test]
+    fn platform_kind_accepts_aliases_case_insensitively() {
+        for value in ["wx", "WX", "微信", "wechat", "WeChat"] {
+            let cfg: PlatformConfig = toml::from_str(&format!("kind = {value:?}")).unwrap();
+            assert_eq!(cfg.kind, PlatformKindConfig::Wx4py);
+        }
+
+        for value in ["dc", "DC", "discord", "Discord"] {
+            let cfg: PlatformConfig = toml::from_str(&format!("kind = {value:?}")).unwrap();
+            assert_eq!(cfg.kind, PlatformKindConfig::Discord);
+        }
+    }
+
+    #[test]
     fn rate_limit_defaults_to_five_minutes() {
         let cfg: RateLimitConfig = toml::from_str("").unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.successful_request_cooldown_seconds, 300);
+    }
+
+    #[test]
+    fn manual_summary_defaults_to_text_only() {
+        let cfg: ManualSummaryConfig = toml::from_str("").unwrap();
+        assert!(!cfg.image_by_default);
+    }
+
+    #[test]
+    fn manual_summary_can_enable_images_by_default() {
+        let cfg: ManualSummaryConfig = toml::from_str("image_by_default = true").unwrap();
+        assert!(cfg.image_by_default);
     }
 
     #[test]
@@ -573,11 +681,15 @@ mod tests {
     fn wx4py_and_wx_cli_configs_have_defaults() {
         let wx4py: Wx4pyConfig = toml::from_str("").unwrap();
         let wx_cli: WxCliConfig = toml::from_str("").unwrap();
+        let discord: DiscordConfig = toml::from_str("").unwrap();
 
         assert!(wx4py.python_executable.contains("python"));
         assert!(wx4py.sidecar_script.contains("wx4py_sidecar.py"));
-        assert_eq!(wx_cli.executable, "wx");
+        assert_eq!(discord.token_env, "DISCORD_BOT_TOKEN");
+        assert!(discord.channels.is_empty());
+        assert_eq!(wx_cli.executable, "builtin");
         assert_eq!(wx_cli.export_format, "json");
         assert_eq!(wx_cli.timeout_seconds, 20);
+        assert_eq!(wx_cli.history_query_timeout_seconds, 45);
     }
 }
