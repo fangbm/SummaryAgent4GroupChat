@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
+import os
 import queue
 import sys
 import threading
@@ -25,10 +27,23 @@ sys.stdout = sys.stderr
 logging.raiseExceptions = False
 
 from wx4py import CallbackHandler, WeChatClient
+from wx4py.core import uiautomation as uia
+from wx4py.core.uia_wrapper import UIAWrapper
 from wx4py.features.messaging import WeChatGroupProcessor
+
+try:
+    import win32con
+    import win32gui
+    import win32process
+except Exception:  # pragma: no cover - imported only on Windows with pywin32
+    win32con = None
+    win32gui = None
+    win32process = None
 
 
 GROUP_RETRY_SECONDS = 30.0
+MIN_UIA_TREE_NODES = 5
+UIA_READY_WAIT_SECONDS = 15.0
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -69,6 +84,8 @@ class Wx4pySidecar:
         diag_log(f"starting groups={self.groups!r}")
         try:
             self.client.connect()
+            self.restore_main_window()
+            self.ensure_uia_ready()
             self.start_group_processors(self.groups)
         except Exception as exc:
             diag_log(f"startup failed: {type(exc).__name__}: {exc}")
@@ -109,6 +126,8 @@ class Wx4pySidecar:
                 diag_log(f"group listener start failed group={group!r}: {type(exc).__name__}: {exc}")
 
     def start_group_processor(self, group: str) -> None:
+        self.restore_main_window()
+        self.restore_existing_chat_window(group)
         handler = CallbackHandler(self.on_message, auto_reply=False)
         processor = WeChatGroupProcessor(
             self.client,
@@ -129,6 +148,164 @@ class Wx4pySidecar:
         self.processors[group] = processor
         self.pending_groups.discard(group)
         diag_log(f"group listener ready group={group!r}")
+
+    def restore_main_window(self) -> None:
+        window = getattr(self.client, "window", None)
+        hwnd = getattr(window, "hwnd", None)
+        if hwnd:
+            self.restore_window(hwnd, "main")
+        try:
+            if window:
+                window.activate()
+        except Exception as exc:
+            diag_log(f"restore main activate failed: {type(exc).__name__}: {exc}")
+
+    def ensure_uia_ready(self) -> None:
+        deadline = time.time() + UIA_READY_WAIT_SECONDS
+        node_count = 0
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            self.restore_main_window()
+            node_count = self.count_uia_nodes()
+            diag_log(f"uia health check attempt={attempt} nodes={node_count}")
+            if node_count >= MIN_UIA_TREE_NODES:
+                return
+            time.sleep(1.0)
+
+        if os.environ.get("SUMMARY_AGENT_AUTO_RESTART_WECHAT") != "1":
+            raise RuntimeError(
+                "微信 UIAutomation 控件树不可用。请完全退出并重新打开微信，"
+                "或以管理员身份运行 SummaryAgent4GroupChat 后再启动监听。"
+            )
+
+        hwnd = getattr(getattr(self.client, "window", None), "hwnd", None)
+        if hwnd and not self.can_restart_wechat_process(hwnd):
+            raise RuntimeError(
+                "微信 UIAutomation 控件树不可用，且当前进程没有权限重启微信。"
+                "请完全退出并重新打开微信，或以管理员身份运行 SummaryAgent4GroupChat。"
+            )
+
+        restart = getattr(getattr(self.client, "window", None), "_restart_and_reconnect", None)
+        if not callable(restart):
+            diag_log("uia tree too small but wx4py restart hook is unavailable")
+            return
+
+        diag_log(
+            f"uia tree too small ({node_count} nodes); restarting WeChat to reload accessibility"
+        )
+        restart()
+        self.restore_main_window()
+        node_count = self.count_uia_nodes()
+        diag_log(f"uia health check after restart nodes={node_count}")
+
+    def can_restart_wechat_process(self, hwnd: int) -> bool:
+        if not win32gui or not win32process:
+            return False
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception as exc:
+            diag_log(f"uia restart permission check failed hwnd={hwnd}: {type(exc).__name__}: {exc}")
+            return False
+        if not pid:
+            return False
+
+        PROCESS_TERMINATE = 0x0001
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE, 0, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+
+        error_code = ctypes.get_last_error()
+        diag_log(f"uia restart permission denied pid={pid} error={error_code}")
+        return False
+
+    def count_uia_nodes(self, max_depth: int = 4, limit: int = 20) -> int:
+        root = self.refresh_uia_root()
+        if root is None:
+            return 0
+
+        count = 0
+        stack = [(root, 0)]
+        while stack:
+            node, depth = stack.pop()
+            count += 1
+            if count >= limit:
+                return count
+            if depth >= max_depth:
+                continue
+            try:
+                stack.extend((child, depth + 1) for child in node.GetChildren())
+            except Exception:
+                pass
+        return count
+
+    def refresh_uia_root(self):
+        window = getattr(self.client, "window", None)
+        hwnd = getattr(window, "hwnd", None)
+        if not window or not hwnd:
+            return None
+        try:
+            wrapper = UIAWrapper(hwnd)
+            setattr(window, "_uia", wrapper)
+            return wrapper.root
+        except Exception as exc:
+            diag_log(f"uia refresh failed hwnd={hwnd}: {type(exc).__name__}: {exc}")
+            return None
+
+    def restore_existing_chat_window(self, group: str) -> None:
+        for hwnd in self.find_windows_by_title(group):
+            self.restore_window(hwnd, group)
+
+    def find_windows_by_title(self, title: str) -> list[int]:
+        if not win32gui:
+            return []
+        matches: list[int] = []
+
+        def callback(hwnd: int, _lparam: int) -> bool:
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                window_title = win32gui.GetWindowText(hwnd) or ""
+                if window_title == title or title in window_title:
+                    matches.append(hwnd)
+            except Exception:
+                return True
+            return True
+
+        try:
+            win32gui.EnumWindows(callback, 0)
+        except Exception as exc:
+            diag_log(f"restore enum windows failed title={title!r}: {type(exc).__name__}: {exc}")
+        return matches
+
+    def restore_window(self, hwnd: int, label: str) -> None:
+        if not win32gui or not win32con:
+            return
+        try:
+            was_iconic = bool(win32gui.IsIconic(hwnd))
+            rect = win32gui.GetWindowRect(hwnd)
+            if was_iconic:
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.4)
+            else:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            if win32gui.IsIconic(hwnd):
+                control = uia.ControlFromHandle(hwnd)
+                switch_to_window = getattr(control, "SwitchToThisWindow", None)
+                if callable(switch_to_window):
+                    switch_to_window()
+                    time.sleep(0.4)
+            diag_log(
+                f"restore_window label={label!r} hwnd={hwnd} was_iconic={was_iconic} "
+                f"rect={rect!r} now_iconic={bool(win32gui.IsIconic(hwnd))} "
+                f"now_rect={win32gui.GetWindowRect(hwnd)!r}"
+            )
+        except Exception as exc:
+            diag_log(
+                f"restore_window failed label={label!r} hwnd={hwnd}: {type(exc).__name__}: {exc}"
+            )
 
     def retry_pending_groups(self) -> None:
         while not self.stop_event.wait(GROUP_RETRY_SECONDS):
