@@ -7,6 +7,7 @@ __pycache__/
 .coverage
 htmlcov/
 runtime/
+dist/
 rust-agent/runtime/
 rust-agent/wx4py_send_audit.jsonl
 *.sqlite3
