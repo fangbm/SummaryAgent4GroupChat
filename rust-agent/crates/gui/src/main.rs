@@ -59,8 +59,8 @@ struct ConfigView {
     scheduled_rooms: String,
     scheduled_send_text: bool,
     scheduled_send_image: bool,
+    history_max_messages: u32,
     wx_cli_executable: String,
-    wx_cli_max_messages: u32,
     wx_cli_timeout: u64,
     wx_cli_history_timeout: u64,
     wx_cli_temp_dir: String,
@@ -707,6 +707,7 @@ fn listen_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             multiline_field(ui, "触发词", &mut view.triggers, 5);
             ui.checkbox(&mut view.ignore_self, "忽略自己发送的消息");
             ui.checkbox(&mut view.manual_image_by_default, "手动总结默认生成图片");
+            number_u32(ui, "历史读取最大条数", &mut view.history_max_messages);
         },
         |ui| {
             multiline_field(ui, "监听白名单", &mut view.whitelist_rooms, 5);
@@ -786,7 +787,6 @@ fn runtime_tab(
         ui,
         |ui| {
             text_field(ui, "wxdb 命令", &mut view.wx_cli_executable);
-            number_u32(ui, "最大消息数", &mut view.wx_cli_max_messages);
             number_u64(ui, "wxdb 命令超时秒数", &mut view.wx_cli_timeout);
             number_u64(ui, "历史查询总超时秒数", &mut view.wx_cli_history_timeout);
             text_field(ui, "wxdb 临时目录", &mut view.wx_cli_temp_dir);
@@ -920,6 +920,7 @@ fn load_config_view(state: &AppState) -> Result<(ConfigView, String)> {
 
 fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
     if let Ok(config) = AgentConfig::from_toml_str(text) {
+        let history_max_messages = config.history_message_limit().min(u32::MAX as usize) as u32;
         return ConfigView {
             platform_kind: config.platform.kind.as_str().to_string(),
             wx_groups: join_lines(&config.wx4py.groups),
@@ -940,8 +941,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             scheduled_rooms: join_lines(&config.scheduled_summary.rooms),
             scheduled_send_text: config.scheduled_summary.send_text,
             scheduled_send_image: config.scheduled_summary.send_image,
+            history_max_messages,
             wx_cli_executable: config.wx_cli.executable,
-            wx_cli_max_messages: config.wx_cli.max_messages,
             wx_cli_timeout: config.wx_cli.timeout_seconds,
             wx_cli_history_timeout: config.wx_cli.history_query_timeout_seconds,
             wx_cli_temp_dir: config.wx_cli.temp_dir,
@@ -995,8 +996,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         scheduled_rooms: join_lines(&get_array(doc, "scheduled_summary", "rooms")),
         scheduled_send_text: get_bool(doc, "scheduled_summary", "send_text", true),
         scheduled_send_image: get_bool(doc, "scheduled_summary", "send_image", true),
+        history_max_messages: get_history_max_messages(doc).min(u32::MAX as u64) as u32,
         wx_cli_executable: get_str(doc, "wx_cli", "executable", "builtin"),
-        wx_cli_max_messages: get_u64(doc, "wx_cli", "max_messages", 5000) as u32,
         wx_cli_timeout: get_u64(doc, "wx_cli", "timeout_seconds", 20),
         wx_cli_history_timeout: get_u64(doc, "wx_cli", "history_query_timeout_seconds", 60),
         wx_cli_temp_dir: get_str(doc, "wx_cli", "temp_dir", ".\\runtime\\wx-exports"),
@@ -1070,9 +1071,12 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     set_bool(scheduled, "send_text", update.scheduled_send_text);
     set_bool(scheduled, "send_image", update.scheduled_send_image);
 
+    let history = table_mut(&mut doc, "history");
+    set_int(history, "max_messages", update.history_max_messages as i64);
+
     let wx_cli = table_mut(&mut doc, "wx_cli");
     set_str(wx_cli, "executable", &update.wx_cli_executable);
-    set_int(wx_cli, "max_messages", update.wx_cli_max_messages as i64);
+    remove_key(wx_cli, "max_messages");
     set_int(wx_cli, "timeout_seconds", update.wx_cli_timeout as i64);
     set_int(
         wx_cli,
@@ -1080,6 +1084,8 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         update.wx_cli_history_timeout as i64,
     );
     set_str(wx_cli, "temp_dir", &update.wx_cli_temp_dir);
+
+    remove_key(table_mut(&mut doc, "privacy"), "max_messages_to_llm");
 
     let llm = table_mut(&mut doc, "llm");
     set_str(llm, "provider", &update.llm_provider);
@@ -1152,6 +1158,20 @@ fn get_u64(doc: &DocumentMut, table_name: &str, key: &str, default: u64) -> u64 
     get_i64(doc, table_name, key, default as i64).max(0) as u64
 }
 
+fn get_u64_opt(doc: &DocumentMut, table_name: &str, key: &str) -> Option<u64> {
+    table(doc, table_name)
+        .and_then(|table| table.get(key))
+        .and_then(Item::as_integer)
+        .map(|value| value.max(0) as u64)
+}
+
+fn get_history_max_messages(doc: &DocumentMut) -> u64 {
+    get_u64_opt(doc, "history", "max_messages")
+        .or_else(|| get_u64_opt(doc, "privacy", "max_messages_to_llm"))
+        .or_else(|| get_u64_opt(doc, "wx_cli", "max_messages"))
+        .unwrap_or(10_000)
+}
+
 fn get_array(doc: &DocumentMut, table_name: &str, key: &str) -> Vec<String> {
     table(doc, table_name)
         .and_then(|table| table.get(key))
@@ -1175,6 +1195,10 @@ fn set_bool(table: &mut Table, key: &str, new_value: bool) {
 
 fn set_int(table: &mut Table, key: &str, new_value: i64) {
     table[key] = value(new_value);
+}
+
+fn remove_key(table: &mut Table, key: &str) {
+    table.remove(key);
 }
 
 fn set_array(table: &mut Table, key: &str, values: &[String]) {

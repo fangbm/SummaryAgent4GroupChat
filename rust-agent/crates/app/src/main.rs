@@ -525,18 +525,20 @@ async fn run_summary_pipeline(
         return Ok(());
     }
 
+    let history_message_limit = config.history_message_limit();
+    let history_query_limit = history_message_limit.min(u32::MAX as usize) as u32;
     info!(
         room_id = %trigger.room_id,
         since = %range.since,
         until = %range.until,
-        limit = config.privacy.max_messages_to_llm,
+        limit = history_message_limit,
         "querying platform history"
     );
     append_runtime_log(
         config,
         &format!(
             "history query started room={} since={} until={} limit={}",
-            trigger.room_id, range.since, range.until, config.privacy.max_messages_to_llm
+            trigger.room_id, range.since, range.until, history_message_limit
         ),
     );
     let mut history = client
@@ -545,7 +547,7 @@ async fn run_summary_pipeline(
             incoming.room_name.as_deref(),
             range.since,
             range.until,
-            config.privacy.max_messages_to_llm as u32,
+            history_query_limit,
         )
         .await
         .context("querying platform chat history")?;

@@ -27,6 +27,8 @@ pub struct AgentConfig {
     pub manual_summary: ManualSummaryConfig,
     #[serde(default)]
     pub scheduled_summary: ScheduledSummaryConfig,
+    #[serde(default)]
+    pub history: HistoryConfig,
     pub storage: StorageConfig,
     #[serde(default)]
     pub wx_cli: WxCliConfig,
@@ -53,6 +55,14 @@ impl AgentConfig {
 
     pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
+    }
+
+    pub fn history_message_limit(&self) -> usize {
+        self.history
+            .max_messages
+            .or(self.privacy.max_messages_to_llm)
+            .or_else(|| self.wx_cli.max_messages.map(|value| value as usize))
+            .unwrap_or_else(default_history_max_messages)
     }
 }
 
@@ -228,6 +238,12 @@ impl Default for ScheduledSummaryConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HistoryConfig {
+    #[serde(default)]
+    pub max_messages: Option<usize>,
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
@@ -258,8 +274,8 @@ pub struct WxCliConfig {
     pub executable: String,
     #[serde(default = "default_wx_cli_export_format")]
     pub export_format: String,
-    #[serde(default = "default_wx_cli_max_messages")]
-    pub max_messages: u32,
+    #[serde(default)]
+    pub max_messages: Option<u32>,
     #[serde(default = "default_wx_cli_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_wx_cli_history_query_timeout_seconds")]
@@ -275,7 +291,7 @@ impl Default for WxCliConfig {
         Self {
             executable: default_wx_cli_executable(),
             export_format: default_wx_cli_export_format(),
-            max_messages: default_wx_cli_max_messages(),
+            max_messages: None,
             timeout_seconds: default_wx_cli_timeout_seconds(),
             history_query_timeout_seconds: default_wx_cli_history_query_timeout_seconds(),
             temp_dir: default_wx_cli_temp_dir(),
@@ -288,8 +304,8 @@ impl Default for WxCliConfig {
 pub struct PrivacyConfig {
     #[serde(default)]
     pub redact_enabled: bool,
-    #[serde(default = "default_max_messages")]
-    pub max_messages_to_llm: usize,
+    #[serde(default)]
+    pub max_messages_to_llm: Option<usize>,
     #[serde(default = "default_max_chars")]
     pub max_chars_to_llm: usize,
     #[serde(default = "default_true")]
@@ -302,7 +318,7 @@ impl Default for PrivacyConfig {
     fn default() -> Self {
         Self {
             redact_enabled: false,
-            max_messages_to_llm: default_max_messages(),
+            max_messages_to_llm: None,
             max_chars_to_llm: default_max_chars(),
             cloud_allowed: true,
             sensitive_rooms: Vec::new(),
@@ -472,10 +488,6 @@ fn default_wx_cli_export_format() -> String {
     "json".to_string()
 }
 
-fn default_wx_cli_max_messages() -> u32 {
-    5_000
-}
-
 fn default_wx_cli_timeout_seconds() -> u64 {
     20
 }
@@ -508,8 +520,8 @@ fn default_scheduled_range_hours() -> i64 {
     24
 }
 
-fn default_max_messages() -> usize {
-    800
+fn default_history_max_messages() -> usize {
+    10_000
 }
 
 fn default_max_chars() -> usize {
@@ -612,6 +624,16 @@ mod tests {
     }
 
     #[test]
+    fn history_limit_defaults_to_read_cap() {
+        let cfg: HistoryConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.max_messages
+                .unwrap_or_else(default_history_max_messages),
+            10_000
+        );
+    }
+
+    #[test]
     fn platform_defaults_to_wx4py() {
         let cfg: PlatformConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.kind, PlatformKindConfig::Wx4py);
@@ -689,6 +711,7 @@ mod tests {
         assert!(discord.channels.is_empty());
         assert_eq!(wx_cli.executable, "builtin");
         assert_eq!(wx_cli.export_format, "json");
+        assert_eq!(wx_cli.max_messages, None);
         assert_eq!(wx_cli.timeout_seconds, 20);
         assert_eq!(wx_cli.history_query_timeout_seconds, 45);
     }

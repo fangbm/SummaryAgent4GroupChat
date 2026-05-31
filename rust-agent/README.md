@@ -82,6 +82,10 @@ unless the image argument is present. When it is `true`, manual commands generat
 images by default and the image argument skips image generation for that request.
 Scheduled summaries still use `scheduled_summary.send_image`.
 
+`history.max_messages` limits how many messages are read from any platform before
+formatting. LLM input is not capped by message count; it is capped only by
+`privacy.max_chars_to_llm`.
+
 The text and image paths use separate prompts:
 
 - `text_summary.system_prompt`: direct text summary sent back to the group.

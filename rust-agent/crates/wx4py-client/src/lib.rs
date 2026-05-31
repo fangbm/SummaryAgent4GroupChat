@@ -629,7 +629,7 @@ pub fn build_wx_cli_export_command(
         "-o".to_string(),
         output.to_string_lossy().to_string(),
         "-n".to_string(),
-        limit.min(config.max_messages).to_string(),
+        limit.to_string(),
     ]
 }
 
@@ -652,7 +652,7 @@ pub fn build_wx_cli_history_command(
         "text".to_string(),
         "--json".to_string(),
         "-n".to_string(),
-        limit.min(config.max_messages).to_string(),
+        limit.to_string(),
     ]
 }
 
@@ -982,7 +982,7 @@ mod tests {
         WxCliConfig {
             executable: "wx".into(),
             export_format: "json".into(),
-            max_messages: 500,
+            max_messages: None,
             timeout_seconds: 20,
             history_query_timeout_seconds: 45,
             temp_dir: ".\\runtime\\wx-exports".into(),
