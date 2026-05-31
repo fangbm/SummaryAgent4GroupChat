@@ -781,43 +781,65 @@ fn runtime_tab(
         },
     );
     ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("GUI 终端");
-        ui.small(if agent_running {
-            "主程序运行中"
-        } else {
-            "主程序未托管运行"
+    two_columns(
+        ui,
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.label("GUI 终端");
+                ui.small(if agent_running {
+                    "主程序运行中"
+                } else {
+                    "主程序未托管运行"
+                });
+            });
+            readonly_scroll_text(
+                ui,
+                "gui-terminal-scroll",
+                "gui-terminal-text",
+                terminal_output,
+                310.0,
+                true,
+            );
+        },
+        |ui| {
+            ui.label("日志文件尾部");
+            readonly_scroll_text(
+                ui,
+                "log-tail-scroll",
+                "log-tail-text",
+                log_tail,
+                310.0,
+                false,
+            );
+        },
+    );
+}
+
+fn readonly_scroll_text(
+    ui: &mut egui::Ui,
+    scroll_id: &'static str,
+    label_id: &'static str,
+    text: &str,
+    height: f32,
+    stick_to_bottom: bool,
+) {
+    let scroll_area = egui::ScrollArea::vertical()
+        .id_salt(scroll_id)
+        .auto_shrink([false, false])
+        .max_height(height)
+        .stick_to_bottom(stick_to_bottom);
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_height(height);
+        scroll_area.show(ui, |ui| {
+            ui.push_id(label_id, |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(text).monospace())
+                        .wrap()
+                        .selectable(true),
+                );
+            });
         });
     });
-    egui::ScrollArea::vertical()
-        .id_salt("gui-terminal-scroll")
-        .stick_to_bottom(true)
-        .max_height(250.0)
-        .show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(terminal_output)
-                    .id_salt("gui-terminal-text")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(11)
-                    .interactive(false),
-            );
-        });
-    ui.separator();
-    ui.label("日志文件尾部");
-    egui::ScrollArea::vertical()
-        .id_salt("log-tail-scroll")
-        .max_height(180.0)
-        .show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(log_tail)
-                    .id_salt("log-tail-text")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(10)
-                    .interactive(false),
-            );
-        });
 }
 
 fn two_columns(
