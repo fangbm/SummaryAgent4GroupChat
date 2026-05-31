@@ -282,14 +282,16 @@ impl GuiApp {
         };
         let output_dir = resolve_working_path(&self.state, &self.view.runtime_output_dir);
         let log_path = output_dir.join("wechat-summary-app.log");
-        self.log_tail = tail_file(&log_path, 16 * 1024).unwrap_or_else(|_| "暂无日志".to_string());
+        self.log_tail = tail_file(&log_path, 16 * 1024)
+            .map(|text| redact_secret_like_tokens(&text))
+            .unwrap_or_else(|_| "暂无日志".to_string());
         self.status = StatusView {
             targets,
             app_ready: find_exe("wechat-summary-app").exists(),
             wxdb_ready: find_exe("wxdb").exists(),
             python_ready: resolve_working_path(&self.state, &self.view.wx_python).exists(),
-            llm_key_present: env_present(&self.view.llm_api_key_env),
-            image_key_present: env_present(&self.view.image_api_key_env),
+            llm_key_present: env_or_direct_value_present(&self.view.llm_api_key_env),
+            image_key_present: env_or_direct_value_present(&self.view.image_api_key_env),
             discord_token_present: env_present(&self.view.discord_token_env),
         };
     }
@@ -439,7 +441,8 @@ impl GuiApp {
     }
 
     fn append_terminal_line(&mut self, line: String) {
-        self.terminal_output.push_str(&line);
+        self.terminal_output
+            .push_str(&redact_secret_like_tokens(&line));
         if self.terminal_output.len() > TERMINAL_MAX_CHARS {
             let overflow = self.terminal_output.len() - TERMINAL_MAX_CHARS;
             let split_at = self
@@ -739,17 +742,25 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         ui,
         |ui| {
             text_field(ui, "LLM Provider", &mut view.llm_provider);
-            text_field(ui, "LLM API Key 环境变量", &mut view.llm_api_key_env);
-            text_field(ui, "LLM Base URL 环境变量", &mut view.llm_base_url_env);
-            text_field(ui, "LLM Model 环境变量", &mut view.llm_model_env);
+            text_field(ui, "LLM API Key 环境变量/直接值", &mut view.llm_api_key_env);
+            text_field(
+                ui,
+                "LLM Base URL 环境变量/直接值",
+                &mut view.llm_base_url_env,
+            );
+            text_field(ui, "LLM Model 环境变量/直接值", &mut view.llm_model_env);
             number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
             number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
         },
         |ui| {
             ui.checkbox(&mut view.image_enabled, "启用图片生成");
             text_field(ui, "图片 Provider", &mut view.image_provider);
-            text_field(ui, "图片 API Key 环境变量", &mut view.image_api_key_env);
-            text_field(ui, "图片 Model 环境变量", &mut view.image_model_env);
+            text_field(
+                ui,
+                "图片 API Key 环境变量/直接值",
+                &mut view.image_api_key_env,
+            );
+            text_field(ui, "图片 Model 环境变量/直接值", &mut view.image_model_env);
             text_field(ui, "图片尺寸", &mut view.image_size);
             text_field(ui, "图片分辨率", &mut view.image_resolution);
             number_u64(ui, "图片超时秒数", &mut view.image_timeout);
@@ -1476,6 +1487,51 @@ fn format_bytes(bytes: u64) -> String {
 
 fn env_present(name: &str) -> bool {
     env::var(name).is_ok_and(|value| !value.trim().is_empty())
+}
+
+fn env_or_direct_value_present(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        false
+    } else if is_safe_env_var_name(trimmed) {
+        env_present(trimmed)
+    } else {
+        true
+    }
+}
+
+fn is_safe_env_var_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn redact_secret_like_tokens(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while let Some(relative) = input[index..].find("sk-") {
+        let start = index + relative;
+        output.push_str(&input[index..start]);
+        let mut end = start + 3;
+        for (offset, ch) in input[end..].char_indices() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                end = start + 3 + offset + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end - start >= 12 {
+            output.push_str("<redacted-secret>");
+        } else {
+            output.push_str(&input[start..end]);
+        }
+        index = end;
+    }
+    output.push_str(&input[index..]);
+    output
 }
 
 fn yes_no(value: bool) -> &'static str {

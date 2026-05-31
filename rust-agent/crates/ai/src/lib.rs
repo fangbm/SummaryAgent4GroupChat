@@ -15,8 +15,8 @@ use wechat_summary_core::{
 
 #[derive(Debug, Error)]
 pub enum AiError {
-    #[error("missing API key environment variable {0}")]
-    MissingApiKey(String),
+    #[error("missing API key; set environment variable {env_var} or configure api_key directly")]
+    MissingApiKey { env_var: String },
     #[error("missing environment variable {name} for {purpose}")]
     MissingEnv { name: String, purpose: &'static str },
     #[error("http error: {0}")]
@@ -48,7 +48,7 @@ impl OpenAiCompatibleLlm {
             &config.api_key_env,
             "LLM API key",
         )
-        .map_err(|_| AiError::MissingApiKey(config.api_key_env.clone()))?;
+        .map_err(|_| missing_api_key(&config.api_key_env))?;
         let base_url = config_value_or_env(
             config.base_url.as_deref(),
             &config.base_url_env,
@@ -173,7 +173,7 @@ impl OpenAiImageClient {
             &config.api_key_env,
             "image API key",
         )
-        .map_err(|_| AiError::MissingApiKey(config.api_key_env.clone()))?;
+        .map_err(|_| missing_api_key(&config.api_key_env))?;
         let base_url = config_value_or_env(
             config.base_url.as_deref(),
             &config.base_url_env,
@@ -474,7 +474,7 @@ fn http_client(timeout_seconds: u64, proxy: &ProxyConfig) -> Result<reqwest::Cli
 
 fn env_var(name: &str, purpose: &'static str) -> Result<String, AiError> {
     env::var(name).map_err(|_| AiError::MissingEnv {
-        name: name.to_string(),
+        name: safe_env_name_for_error(name),
         purpose,
     })
 }
@@ -486,9 +486,48 @@ fn config_value_or_env(
 ) -> Result<String, AiError> {
     if let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) {
         Ok(value.to_string())
+    } else if let Some(value) = direct_value_in_env_field(env_name, purpose) {
+        warn!(
+            purpose,
+            "configuration *_env field appears to contain a direct value; using it without logging the value"
+        );
+        Ok(value)
     } else {
         env_var(env_name, purpose)
     }
+}
+
+fn missing_api_key(env_name: &str) -> AiError {
+    AiError::MissingApiKey {
+        env_var: safe_env_name_for_error(env_name),
+    }
+}
+
+fn direct_value_in_env_field(value: &str, _purpose: &'static str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || is_safe_env_var_name(trimmed) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn safe_env_name_for_error(name: &str) -> String {
+    let trimmed = name.trim();
+    if is_safe_env_var_name(trimmed) {
+        trimmed.to_string()
+    } else {
+        "<redacted>".to_string()
+    }
+}
+
+fn is_safe_env_var_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 #[derive(Debug, Deserialize)]
@@ -676,10 +715,36 @@ fn redacted_url_source(url: &str) -> String {
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
-    let mut output = input.chars().take(max_chars).collect::<String>();
-    if input.chars().count() > max_chars {
+    let redacted = redact_secret_like_tokens(input);
+    let mut output = redacted.chars().take(max_chars).collect::<String>();
+    if redacted.chars().count() > max_chars {
         output.push_str("...");
     }
+    output
+}
+
+fn redact_secret_like_tokens(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while let Some(relative) = input[index..].find("sk-") {
+        let start = index + relative;
+        output.push_str(&input[index..start]);
+        let mut end = start + 3;
+        for (offset, ch) in input[end..].char_indices() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                end = start + 3 + offset + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end - start >= 12 {
+            output.push_str("<redacted-secret>");
+        } else {
+            output.push_str(&input[start..end]);
+        }
+        index = end;
+    }
+    output.push_str(&input[index..]);
     output
 }
 
@@ -791,6 +856,42 @@ mod tests {
         assert_eq!(client.api_key, "persisted-key");
         assert_eq!(client.base_url, "https://api.apimart.ai/v1");
         assert_eq!(client.model, "gpt-image-2");
+    }
+
+    #[test]
+    fn env_fields_accept_direct_values_without_logging_secret_names() {
+        let direct_key = "sk-test-direct-value-1234567890";
+        let mut config = image_config();
+        config.api_key_env = direct_key.into();
+        config.base_url_env = "https://api.apimart.ai/v1".into();
+        config.model_env = "gpt-image-2".into();
+
+        let proxy = ProxyConfig {
+            enabled: false,
+            http: None,
+            https: None,
+        };
+        let client = OpenAiImageClient::new(config, &proxy).unwrap();
+
+        assert_eq!(client.api_key, direct_key);
+        assert_eq!(client.base_url, "https://api.apimart.ai/v1");
+        assert_eq!(client.model, "gpt-image-2");
+    }
+
+    #[test]
+    fn missing_api_key_error_redacts_secret_like_env_field() {
+        let error = missing_api_key("sk-test-direct-value-1234567890").to_string();
+
+        assert!(!error.contains("sk-test"));
+        assert!(error.contains("<redacted>"));
+    }
+
+    #[test]
+    fn log_truncation_redacts_secret_like_tokens() {
+        let text = truncate_for_log("bad sk-test-direct-value-1234567890 here", 200);
+
+        assert!(!text.contains("sk-test"));
+        assert!(text.contains("<redacted-secret>"));
     }
 
     #[test]
