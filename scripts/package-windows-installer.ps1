@@ -127,7 +127,7 @@ OutputBaseFilename=$InstallerBaseName
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 UninstallDisplayIcon={app}\SummaryAgent4GroupChat.exe
 SetupLogging=yes
@@ -149,6 +149,24 @@ Name: "{autodesktop}\SummaryAgent4GroupChat"; Filename: "{app}\SummaryAgent4Grou
 
 [Run]
 Filename: "{app}\SummaryAgent4GroupChat.exe"; Parameters: "--config ""{app}\config\agent.toml"""; Description: "Launch SummaryAgent4GroupChat"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure StopExistingProcess(ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM "' + ImageName + '" /T /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+  begin
+    StopExistingProcess('wechat-summary-app.exe');
+    StopExistingProcess('wechat-summary-gui.exe');
+    StopExistingProcess('SummaryAgent4GroupChat.exe');
+  end;
+end;
 "@
 
 Write-Utf8BomFile -Path $ScriptPath -Content $InnoScript
