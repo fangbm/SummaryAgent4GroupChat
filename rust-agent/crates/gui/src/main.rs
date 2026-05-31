@@ -73,6 +73,7 @@ struct ConfigView {
     image_enabled: bool,
     image_provider: String,
     image_api_key_env: String,
+    image_base_url_env: String,
     image_model_env: String,
     image_size: String,
     image_resolution: String,
@@ -760,6 +761,11 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
                 "图片 API Key 环境变量/直接值",
                 &mut view.image_api_key_env,
             );
+            text_field(
+                ui,
+                "图片 Base URL 环境变量/直接值",
+                &mut view.image_base_url_env,
+            );
             text_field(ui, "图片 Model 环境变量/直接值", &mut view.image_model_env);
             text_field(ui, "图片尺寸", &mut view.image_size);
             text_field(ui, "图片分辨率", &mut view.image_resolution);
@@ -948,6 +954,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             image_enabled: config.image_gen.enabled,
             image_provider: config.image_gen.provider,
             image_api_key_env: config.image_gen.api_key_env,
+            image_base_url_env: config.image_gen.base_url_env,
             image_model_env: config.image_gen.model_env,
             image_size: config.image_gen.size,
             image_resolution: config.image_gen.resolution.unwrap_or_default(),
@@ -1002,6 +1009,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         image_enabled: get_bool(doc, "image_gen", "enabled", true),
         image_provider: get_str(doc, "image_gen", "provider", "openai"),
         image_api_key_env: get_str(doc, "image_gen", "api_key_env", "IMAGE_API_KEY"),
+        image_base_url_env: get_str(doc, "image_gen", "base_url_env", "IMAGE_BASE_URL"),
         image_model_env: get_str(doc, "image_gen", "model_env", "IMAGE_MODEL"),
         image_size: get_str(doc, "image_gen", "size", "2:3"),
         image_resolution: get_str(doc, "image_gen", "resolution", "1k"),
@@ -1085,6 +1093,7 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     set_bool(image_gen, "enabled", update.image_enabled);
     set_str(image_gen, "provider", &update.image_provider);
     set_str(image_gen, "api_key_env", &update.image_api_key_env);
+    set_str(image_gen, "base_url_env", &update.image_base_url_env);
     set_str(image_gen, "model_env", &update.image_model_env);
     set_str(image_gen, "size", &update.image_size);
     set_str(image_gen, "resolution", &update.image_resolution);
