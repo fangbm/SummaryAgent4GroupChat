@@ -2,10 +2,16 @@
 
 use std::{
     env, fs,
-    io::{BufReader, Read},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::Duration,
 };
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -14,6 +20,9 @@ use toml_edit::{value, Array, DocumentMut, Item, Table};
 use wechat_summary_core::AgentConfig;
 
 const APP_NAME: &str = "SummaryAgent4GroupChat";
+const TERMINAL_MAX_CHARS: usize = 128 * 1024;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Parser)]
 #[command(name = "wechat-summary-gui")]
@@ -87,9 +96,17 @@ struct GuiApp {
     view: ConfigView,
     validation: String,
     log_tail: String,
+    terminal_output: String,
+    agent: Option<AgentProcess>,
     status: StatusView,
     tab: Tab,
     message: Option<String>,
+}
+
+struct AgentProcess {
+    child: Child,
+    output: Receiver<String>,
+    pid: u32,
 }
 
 #[derive(Default)]
@@ -215,6 +232,8 @@ impl GuiApp {
             view,
             validation,
             log_tail: String::new(),
+            terminal_output: "GUI 已就绪，主程序终端输出会显示在这里。\n".to_string(),
+            agent: None,
             status: StatusView::default(),
             tab: Tab::Platform,
             message: None,
@@ -298,6 +317,12 @@ impl GuiApp {
     }
 
     fn start_agent(&mut self) {
+        self.poll_agent_output();
+        if self.agent.is_some() {
+            self.message = Some("主程序已在 GUI 中运行".to_string());
+            return;
+        }
+
         if self.view.platform_kind.eq_ignore_ascii_case("wx") {
             let python = resolve_working_path(&self.state, &self.view.wx_python);
             if !python.exists() {
@@ -310,7 +335,14 @@ impl GuiApp {
         }
 
         match start_agent(&self.state) {
-            Ok(_) => self.message = Some("主程序已启动".to_string()),
+            Ok(agent) => {
+                self.append_terminal_line(format!(
+                    "[gui] 主程序已启动 pid={}，命令行窗口已隐藏\n",
+                    agent.pid
+                ));
+                self.agent = Some(agent);
+                self.message = Some("主程序已启动，终端输出已合并到 GUI".to_string());
+            }
             Err(error) => self.message = Some(format!("启动失败：{error:#}")),
         }
     }
@@ -328,14 +360,80 @@ impl GuiApp {
         }
 
         match start_agent_elevated(&self.state) {
-            Ok(_) => self.message = Some("已请求管理员权限启动主程序，请确认 UAC 弹窗".to_string()),
+            Ok(_) => {
+                self.append_terminal_line(
+                    "[gui] 已请求管理员权限启动主程序；UAC 提权进程输出请查看日志尾部。\n"
+                        .to_string(),
+                );
+                self.message = Some("已请求管理员权限启动主程序，请确认 UAC 弹窗".to_string());
+            }
             Err(error) => self.message = Some(format!("管理员启动失败：{error:#}")),
+        }
+    }
+
+    fn stop_agent(&mut self) {
+        let Some(mut agent) = self.agent.take() else {
+            self.message = Some("当前没有由 GUI 托管的主程序".to_string());
+            return;
+        };
+        let pid = agent.pid;
+        match agent.child.kill() {
+            Ok(_) => {
+                let _ = agent.child.wait();
+                self.append_terminal_line(format!("[gui] 已停止主程序 pid={pid}\n"));
+                self.message = Some("主程序已停止".to_string());
+            }
+            Err(error) => {
+                self.append_terminal_line(format!("[gui] 停止主程序失败 pid={pid}: {error}\n"));
+                self.message = Some(format!("停止失败：{error}"));
+                self.agent = Some(agent);
+            }
+        }
+    }
+
+    fn poll_agent_output(&mut self) {
+        let mut lines = Vec::new();
+        let mut exit_status = None;
+        if let Some(agent) = &mut self.agent {
+            lines.extend(agent.output.try_iter());
+            match agent.child.try_wait() {
+                Ok(Some(status)) => exit_status = Some(format!("{status}")),
+                Ok(None) => {}
+                Err(error) => exit_status = Some(format!("检查进程状态失败：{error}")),
+            }
+        }
+
+        for line in lines {
+            self.append_terminal_line(line);
+        }
+
+        if let Some(status) = exit_status {
+            self.append_terminal_line(format!("[gui] 主程序已退出：{status}\n"));
+            self.agent = None;
+        }
+    }
+
+    fn append_terminal_line(&mut self, line: String) {
+        self.terminal_output.push_str(&line);
+        if self.terminal_output.len() > TERMINAL_MAX_CHARS {
+            let overflow = self.terminal_output.len() - TERMINAL_MAX_CHARS;
+            let split_at = self
+                .terminal_output
+                .char_indices()
+                .find_map(|(index, _)| (index >= overflow).then_some(index))
+                .unwrap_or(overflow);
+            self.terminal_output.drain(..split_at);
         }
     }
 }
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_agent_output();
+        if self.agent.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+
         egui::SidePanel::left("nav")
             .exact_width(220.0)
             .show(ctx, |ui| {
@@ -370,6 +468,9 @@ impl eframe::App for GuiApp {
                 if ui.button("管理员启动主程序").clicked() {
                     self.start_agent_elevated();
                 }
+                if ui.button("停止托管主程序").clicked() {
+                    self.stop_agent();
+                }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -388,7 +489,13 @@ impl eframe::App for GuiApp {
                 Tab::Listen => listen_tab(ui, &mut self.view),
                 Tab::Schedule => schedule_tab(ui, &mut self.view),
                 Tab::Model => model_tab(ui, &mut self.view),
-                Tab::Runtime => runtime_tab(ui, &mut self.view, &mut self.log_tail),
+                Tab::Runtime => runtime_tab(
+                    ui,
+                    &mut self.view,
+                    &mut self.log_tail,
+                    &mut self.terminal_output,
+                    self.agent.is_some(),
+                ),
             });
         });
     }
@@ -557,7 +664,13 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
     );
 }
 
-fn runtime_tab(ui: &mut egui::Ui, view: &mut ConfigView, log_tail: &mut String) {
+fn runtime_tab(
+    ui: &mut egui::Ui,
+    view: &mut ConfigView,
+    log_tail: &mut String,
+    terminal_output: &mut String,
+    agent_running: bool,
+) {
     ui.heading("运行信息");
     two_columns(
         ui,
@@ -575,9 +688,30 @@ fn runtime_tab(ui: &mut egui::Ui, view: &mut ConfigView, log_tail: &mut String) 
         },
     );
     ui.separator();
-    ui.label("日志尾部");
+    ui.horizontal(|ui| {
+        ui.label("GUI 终端");
+        ui.small(if agent_running {
+            "主程序运行中"
+        } else {
+            "主程序未托管运行"
+        });
+    });
     egui::ScrollArea::vertical()
-        .max_height(230.0)
+        .stick_to_bottom(true)
+        .max_height(250.0)
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(terminal_output)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(11)
+                    .interactive(false),
+            );
+        });
+    ui.separator();
+    ui.label("日志文件尾部");
+    egui::ScrollArea::vertical()
+        .max_height(180.0)
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(log_tail)
@@ -953,18 +1087,71 @@ fn open_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn start_agent(state: &AppState) -> Result<()> {
+fn start_agent(state: &AppState) -> Result<AgentProcess> {
     let app = find_exe("wechat-summary-app");
     if !app.exists() {
         return Err(anyhow!("主程序不存在: {}", app.display()));
     }
-    Command::new(app)
+    let mut command = Command::new(app);
+    command
         .arg("--config")
         .arg(&state.config_path)
         .current_dir(&state.working_dir)
-        .spawn()
-        .context("starting wechat-summary-app")?;
-    Ok(())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_command_window(&mut command);
+
+    let mut child = command.spawn().context("starting wechat-summary-app")?;
+    let pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .context("capturing wechat-summary-app stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capturing wechat-summary-app stderr")?;
+    let (sender, output) = mpsc::channel();
+    spawn_output_reader("stdout", stdout, sender.clone());
+    spawn_output_reader("stderr", stderr, sender);
+
+    Ok(AgentProcess { child, output, pid })
+}
+
+fn spawn_output_reader<R>(label: &'static str, reader: R, sender: mpsc::Sender<String>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let text = line.trim_end_matches(&['\r', '\n'][..]);
+                    let _ = sender.send(format!("[{label}] {text}\n"));
+                }
+                Err(error) => {
+                    let _ = sender.send(format!("[gui] 读取 {label} 失败：{error}\n"));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn hide_command_window(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
 }
 
 fn start_agent_elevated(state: &AppState) -> Result<()> {
@@ -975,17 +1162,20 @@ fn start_agent_elevated(state: &AppState) -> Result<()> {
 
     #[cfg(windows)]
     {
-        Command::new("powershell.exe")
+        let mut command = Command::new("powershell.exe");
+        command
             .arg("-NoProfile")
             .arg("-ExecutionPolicy")
             .arg("Bypass")
             .arg("-Command")
             .arg(
-                "Start-Process -FilePath $args[0] -ArgumentList @('--config', $args[1]) -WorkingDirectory $args[2] -Verb RunAs",
+                "Start-Process -FilePath $args[0] -ArgumentList @('--config', $args[1]) -WorkingDirectory $args[2] -WindowStyle Hidden -Verb RunAs",
             )
             .arg(&app)
             .arg(&state.config_path)
-            .arg(&state.working_dir)
+            .arg(&state.working_dir);
+        hide_command_window(&mut command);
+        command
             .spawn()
             .context("starting wechat-summary-app as administrator")?;
         return Ok(());
@@ -993,7 +1183,8 @@ fn start_agent_elevated(state: &AppState) -> Result<()> {
 
     #[cfg(not(windows))]
     {
-        start_agent(state)
+        let _agent = start_agent(state)?;
+        Ok(())
     }
 }
 
@@ -1002,15 +1193,16 @@ fn install_runtime(state: &AppState) -> Result<()> {
     if !script.exists() {
         return Err(anyhow!("安装脚本不存在: {}", script.display()));
     }
-    Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-File")
         .arg(&script)
-        .current_dir(&state.working_dir)
-        .spawn()
-        .context("starting install.ps1")?;
+        .current_dir(&state.working_dir);
+    hide_command_window(&mut command);
+    command.spawn().context("starting install.ps1")?;
     Ok(())
 }
 
