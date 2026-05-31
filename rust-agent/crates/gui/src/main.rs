@@ -335,6 +335,15 @@ impl GuiApp {
             }
         }
 
+        match stop_existing_agent_processes() {
+            Ok(Some(summary)) => self.append_terminal_line(format!("[gui] {summary}\n")),
+            Ok(None) => {}
+            Err(error) => {
+                self.message = Some(format!("清理旧主程序失败：{error:#}"));
+                return;
+            }
+        }
+
         match start_agent(&self.state) {
             Ok(agent) => {
                 self.append_terminal_line(format!(
@@ -349,6 +358,12 @@ impl GuiApp {
     }
 
     fn start_agent_elevated(&mut self) {
+        self.poll_agent_output();
+        if self.agent.is_some() {
+            self.message = Some("主程序已在 GUI 中运行".to_string());
+            return;
+        }
+
         if self.view.platform_kind.eq_ignore_ascii_case("wx") {
             let python = resolve_working_path(&self.state, &self.view.wx_python);
             if !python.exists() {
@@ -356,6 +371,15 @@ impl GuiApp {
                     "Python 运行时不存在：{}。请先运行安装目录里的 install.ps1 或开始菜单里的 Install Python Runtime。",
                     python.display()
                 ));
+                return;
+            }
+        }
+
+        match stop_existing_agent_processes() {
+            Ok(Some(summary)) => self.append_terminal_line(format!("[gui] {summary}\n")),
+            Ok(None) => {}
+            Err(error) => {
+                self.message = Some(format!("清理旧主程序失败：{error:#}"));
                 return;
             }
         }
@@ -766,25 +790,28 @@ fn runtime_tab(
         });
     });
     egui::ScrollArea::vertical()
+        .id_salt("gui-terminal-scroll")
         .stick_to_bottom(true)
         .max_height(250.0)
         .show(ui, |ui| {
-            let response = ui.add(
+            ui.add(
                 egui::TextEdit::multiline(terminal_output)
+                    .id_salt("gui-terminal-text")
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
                     .desired_rows(11)
                     .interactive(false),
             );
-            ui.scroll_to_rect(response.rect, Some(egui::Align::BOTTOM));
         });
     ui.separator();
     ui.label("日志文件尾部");
     egui::ScrollArea::vertical()
+        .id_salt("log-tail-scroll")
         .max_height(180.0)
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(log_tail)
+                    .id_salt("log-tail-text")
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
                     .desired_rows(10)
@@ -1211,6 +1238,52 @@ where
             }
         }
     });
+}
+
+fn command_output_text(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!("{stdout}{stderr}").trim().to_string()
+}
+
+fn stop_existing_agent_processes() -> Result<Option<String>> {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill.exe");
+        command
+            .args(["/IM", "wechat-summary-app.exe", "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_command_window(&mut command);
+        let output = command
+            .output()
+            .context("stopping existing wechat-summary-app.exe processes")?;
+        let text = command_output_text(&output);
+        if output.status.success() {
+            return Ok(Some("已清理旧主程序实例，避免重复监听".to_string()));
+        }
+        if text.contains("not found")
+            || text.contains("not running")
+            || text.contains("没有找到")
+            || text.contains("找不到")
+        {
+            return Ok(None);
+        }
+        bail!("taskkill 返回失败：{text}");
+    }
+
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("pkill")
+            .args(["-f", "wechat-summary-app"])
+            .output()
+            .context("stopping existing wechat-summary-app processes")?;
+        if output.status.success() {
+            return Ok(Some("已清理旧主程序实例，避免重复监听".to_string()));
+        }
+        Ok(None)
+    }
 }
 
 fn hide_command_window(command: &mut Command) {

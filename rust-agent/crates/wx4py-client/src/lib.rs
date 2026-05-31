@@ -348,14 +348,17 @@ fn query_text_messages_via_builtin_wxdb(
         limit,
         "querying builtin wxdb history"
     );
-    let result = wechat_summary_wxdb::query_history(wechat_summary_wxdb::HistoryQuery {
-        chat_name: chat_name.to_string(),
-        since: Some(since),
-        until: Some(until),
-        limit: limit as usize,
-        text_only: true,
-    })
-    .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb failed: {error:#}")))?;
+    let mut result = query_builtin_wxdb_history(chat_name, since, until, limit)?;
+    if result.messages.is_empty() && until.signed_duration_since(since) >= Duration::minutes(5) {
+        tracing::warn!(
+            chat_name,
+            %since,
+            %until,
+            "builtin wxdb returned no messages; retrying once after a short delay"
+        );
+        thread::sleep(StdDuration::from_millis(800));
+        result = query_builtin_wxdb_history(chat_name, since, until, limit)?;
+    }
 
     for warning in &result.meta.warnings {
         tracing::warn!(chat_name, warning = %warning, "builtin wxdb warning");
@@ -397,6 +400,22 @@ fn query_text_messages_via_builtin_wxdb(
             })
         })
         .collect()
+}
+
+fn query_builtin_wxdb_history(
+    chat_name: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: u32,
+) -> Result<wechat_summary_wxdb::HistoryResult> {
+    wechat_summary_wxdb::query_history(wechat_summary_wxdb::HistoryQuery {
+        chat_name: chat_name.to_string(),
+        since: Some(since),
+        until: Some(until),
+        limit: limit as usize,
+        text_only: true,
+    })
+    .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb failed: {error:#}")))
 }
 
 fn should_skip_export_after_history_error(error: &Wx4pyError) -> bool {

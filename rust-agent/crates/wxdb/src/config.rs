@@ -301,8 +301,8 @@ fn is_db_dir(path: &Path) -> bool {
         && !message_db_keys(path).is_empty()
 }
 
-fn store_score(path: &Path) -> (usize, Option<u64>) {
-    (message_db_keys(path).len(), latest_mtime_secs(path))
+fn store_score(path: &Path) -> (Option<u64>, usize) {
+    (latest_mtime_secs(path), message_db_keys(path).len())
 }
 
 fn encrypted_db_count(db_dir: &Path) -> usize {
