@@ -314,6 +314,24 @@ impl GuiApp {
             Err(error) => self.message = Some(format!("启动失败：{error:#}")),
         }
     }
+
+    fn start_agent_elevated(&mut self) {
+        if self.view.platform_kind.eq_ignore_ascii_case("wx") {
+            let python = resolve_working_path(&self.state, &self.view.wx_python);
+            if !python.exists() {
+                self.message = Some(format!(
+                    "Python 运行时不存在：{}。请先运行安装目录里的 install.ps1 或开始菜单里的 Install Python Runtime。",
+                    python.display()
+                ));
+                return;
+            }
+        }
+
+        match start_agent_elevated(&self.state) {
+            Ok(_) => self.message = Some("已请求管理员权限启动主程序，请确认 UAC 弹窗".to_string()),
+            Err(error) => self.message = Some(format!("管理员启动失败：{error:#}")),
+        }
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -348,6 +366,9 @@ impl eframe::App for GuiApp {
                 }
                 if ui.button("启动主程序").clicked() {
                     self.start_agent();
+                }
+                if ui.button("管理员启动主程序").clicked() {
+                    self.start_agent_elevated();
                 }
             });
 
@@ -944,6 +965,36 @@ fn start_agent(state: &AppState) -> Result<()> {
         .spawn()
         .context("starting wechat-summary-app")?;
     Ok(())
+}
+
+fn start_agent_elevated(state: &AppState) -> Result<()> {
+    let app = find_exe("wechat-summary-app");
+    if !app.exists() {
+        return Err(anyhow!("主程序不存在: {}", app.display()));
+    }
+
+    #[cfg(windows)]
+    {
+        Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(
+                "Start-Process -FilePath $args[0] -ArgumentList @('--config', $args[1]) -WorkingDirectory $args[2] -Verb RunAs",
+            )
+            .arg(&app)
+            .arg(&state.config_path)
+            .arg(&state.working_dir)
+            .spawn()
+            .context("starting wechat-summary-app as administrator")?;
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        start_agent(state)
+    }
 }
 
 fn install_runtime(state: &AppState) -> Result<()> {
