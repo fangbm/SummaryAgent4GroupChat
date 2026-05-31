@@ -1,5 +1,6 @@
 [package]
 name = "wechat-summary-gui"
+build = "build.rs"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
