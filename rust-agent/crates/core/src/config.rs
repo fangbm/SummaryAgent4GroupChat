@@ -30,7 +30,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub history: HistoryConfig,
     pub storage: StorageConfig,
-    #[serde(default)]
+    #[serde(default, alias = "wxdb")]
     pub wx_cli: WxCliConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
@@ -700,19 +700,26 @@ mod tests {
     }
 
     #[test]
-    fn wx4py_and_wx_cli_configs_have_defaults() {
+    fn wx4py_and_wxdb_configs_have_defaults() {
         let wx4py: Wx4pyConfig = toml::from_str("").unwrap();
-        let wx_cli: WxCliConfig = toml::from_str("").unwrap();
+        let wxdb: WxCliConfig = toml::from_str("").unwrap();
         let discord: DiscordConfig = toml::from_str("").unwrap();
 
         assert!(wx4py.python_executable.contains("python"));
         assert!(wx4py.sidecar_script.contains("wx4py_sidecar.py"));
         assert_eq!(discord.token_env, "DISCORD_BOT_TOKEN");
         assert!(discord.channels.is_empty());
-        assert_eq!(wx_cli.executable, "builtin");
-        assert_eq!(wx_cli.export_format, "json");
-        assert_eq!(wx_cli.max_messages, None);
-        assert_eq!(wx_cli.timeout_seconds, 20);
-        assert_eq!(wx_cli.history_query_timeout_seconds, 45);
+        assert_eq!(wxdb.executable, "builtin");
+        assert_eq!(wxdb.export_format, "json");
+        assert_eq!(wxdb.max_messages, None);
+        assert_eq!(wxdb.timeout_seconds, 20);
+        assert_eq!(wxdb.history_query_timeout_seconds, 45);
+    }
+
+    #[test]
+    fn default_agent_config_accepts_wxdb_section() {
+        let cfg = AgentConfig::from_toml_str(include_str!("../../../config/agent.toml")).unwrap();
+        assert_eq!(cfg.wx_cli.executable, "builtin");
+        assert_eq!(cfg.history_message_limit(), 10_000);
     }
 }

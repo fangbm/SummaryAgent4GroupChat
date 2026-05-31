@@ -10,7 +10,7 @@ crates/app/          # CLI entrypoint and runtime wiring
 crates/app/src/platform.rs
                     # platform adapter boundary; wx4py and Discord implementations
 crates/core/         # config, models, trigger matching, formatting, privacy switches
-crates/wx4py-client/# wx4py sidecar and wx-cli history adapter
+crates/wx4py-client/# wx4py sidecar and wxdb history adapter
 crates/ai/           # OpenAI-compatible LLM and image clients
 crates/storage/      # SQLite state store for per-room trigger timestamps
 config/agent.toml    # default local config
@@ -114,4 +114,4 @@ cargo run -p wechat-summary-app -- --config config\agent.toml
 ```
 
 The real wx4py runtime requires Windows WeChat to be logged in. Configure `[wx4py].groups`
-with WeChat group display names, and configure `[wx_cli].executable` if `wx` is not on `PATH`.
+with WeChat group display names. History reads use the built-in `wxdb` reader by default.

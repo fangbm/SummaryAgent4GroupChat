@@ -28,7 +28,7 @@ wechat:
     fallback_minutes: 30
     fixed_minutes: 30
     fixed_hours: 2
-  # Optional display-name -> wxid/roomid overrides for sending and wx-cli export.
+  # Optional display-name -> wxid/roomid overrides for sending and history reads.
   receiver_map: {}
 
 security:

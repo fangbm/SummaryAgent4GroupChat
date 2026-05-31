@@ -997,10 +997,16 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         scheduled_send_text: get_bool(doc, "scheduled_summary", "send_text", true),
         scheduled_send_image: get_bool(doc, "scheduled_summary", "send_image", true),
         history_max_messages: get_history_max_messages(doc).min(u32::MAX as u64) as u32,
-        wx_cli_executable: get_str(doc, "wx_cli", "executable", "builtin"),
-        wx_cli_timeout: get_u64(doc, "wx_cli", "timeout_seconds", 20),
-        wx_cli_history_timeout: get_u64(doc, "wx_cli", "history_query_timeout_seconds", 60),
-        wx_cli_temp_dir: get_str(doc, "wx_cli", "temp_dir", ".\\runtime\\wx-exports"),
+        wx_cli_executable: get_str_alias(doc, "wxdb", "wx_cli", "executable", "builtin"),
+        wx_cli_timeout: get_u64_alias(doc, "wxdb", "wx_cli", "timeout_seconds", 20),
+        wx_cli_history_timeout: get_u64_alias(
+            doc,
+            "wxdb",
+            "wx_cli",
+            "history_query_timeout_seconds",
+            60,
+        ),
+        wx_cli_temp_dir: get_str_alias(doc, "wxdb", "wx_cli", "temp_dir", ".\\runtime\\wx-exports"),
         llm_provider: get_str(doc, "llm", "provider", "openai_compatible"),
         llm_api_key_env: get_str(doc, "llm", "api_key_env", "LLM_API_KEY"),
         llm_base_url_env: get_str(doc, "llm", "base_url_env", "LLM_BASE_URL"),
@@ -1074,16 +1080,18 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     let history = table_mut(&mut doc, "history");
     set_int(history, "max_messages", update.history_max_messages as i64);
 
-    let wx_cli = table_mut(&mut doc, "wx_cli");
-    set_str(wx_cli, "executable", &update.wx_cli_executable);
-    remove_key(wx_cli, "max_messages");
-    set_int(wx_cli, "timeout_seconds", update.wx_cli_timeout as i64);
+    migrate_legacy_table(&mut doc, "wx_cli", "wxdb");
+    let wxdb = table_mut(&mut doc, "wxdb");
+    set_str(wxdb, "executable", &update.wx_cli_executable);
+    remove_key(wxdb, "max_messages");
+    set_int(wxdb, "timeout_seconds", update.wx_cli_timeout as i64);
     set_int(
-        wx_cli,
+        wxdb,
         "history_query_timeout_seconds",
         update.wx_cli_history_timeout as i64,
     );
-    set_str(wx_cli, "temp_dir", &update.wx_cli_temp_dir);
+    set_str(wxdb, "temp_dir", &update.wx_cli_temp_dir);
+    remove_table(&mut doc, "wx_cli");
 
     remove_key(table_mut(&mut doc, "privacy"), "max_messages_to_llm");
 
@@ -1158,6 +1166,37 @@ fn get_u64(doc: &DocumentMut, table_name: &str, key: &str, default: u64) -> u64 
     get_i64(doc, table_name, key, default as i64).max(0) as u64
 }
 
+fn get_str_alias(
+    doc: &DocumentMut,
+    preferred_table: &str,
+    legacy_table: &str,
+    key: &str,
+    default: &str,
+) -> String {
+    table(doc, preferred_table)
+        .and_then(|table| table.get(key))
+        .and_then(Item::as_str)
+        .or_else(|| {
+            table(doc, legacy_table)
+                .and_then(|table| table.get(key))
+                .and_then(Item::as_str)
+        })
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn get_u64_alias(
+    doc: &DocumentMut,
+    preferred_table: &str,
+    legacy_table: &str,
+    key: &str,
+    default: u64,
+) -> u64 {
+    get_u64_opt(doc, preferred_table, key)
+        .or_else(|| get_u64_opt(doc, legacy_table, key))
+        .unwrap_or(default)
+}
+
 fn get_u64_opt(doc: &DocumentMut, table_name: &str, key: &str) -> Option<u64> {
     table(doc, table_name)
         .and_then(|table| table.get(key))
@@ -1168,6 +1207,7 @@ fn get_u64_opt(doc: &DocumentMut, table_name: &str, key: &str) -> Option<u64> {
 fn get_history_max_messages(doc: &DocumentMut) -> u64 {
     get_u64_opt(doc, "history", "max_messages")
         .or_else(|| get_u64_opt(doc, "privacy", "max_messages_to_llm"))
+        .or_else(|| get_u64_opt(doc, "wxdb", "max_messages"))
         .or_else(|| get_u64_opt(doc, "wx_cli", "max_messages"))
         .unwrap_or(10_000)
 }
@@ -1199,6 +1239,18 @@ fn set_int(table: &mut Table, key: &str, new_value: i64) {
 
 fn remove_key(table: &mut Table, key: &str) {
     table.remove(key);
+}
+
+fn migrate_legacy_table(doc: &mut DocumentMut, legacy: &str, current: &str) {
+    if !matches!(doc.get(current), Some(Item::Table(_))) {
+        if let Some(item) = doc.get(legacy).cloned() {
+            doc[current] = item;
+        }
+    }
+}
+
+fn remove_table(doc: &mut DocumentMut, name: &str) {
+    doc.remove(name);
 }
 
 fn set_array(table: &mut Table, key: &str, values: &[String]) {

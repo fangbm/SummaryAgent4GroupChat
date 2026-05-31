@@ -61,11 +61,11 @@ sqlite_path = ".\\runtime\\rust-agent.sqlite3"
 # Cross-platform history read limit. LLM input is only limited by [privacy].max_chars_to_llm.
 max_messages = 10000
 
-[wx_cli]
-# builtin uses the in-process wxdb reader instead of spawning the external wx command.
+[wxdb]
+# builtin uses the in-process wxdb reader.
 executable = "builtin"
 export_format = "json"
-# Per wx-cli command timeout. Timed-out wx-cli processes are force-terminated.
+# Per history read command timeout. Timed-out external commands are force-terminated.
 timeout_seconds = 20
 # Guard the whole history/export lookup so one stuck query cannot block the agent loop.
 # Keep this above 2 * timeout_seconds so history can time out and still try export.

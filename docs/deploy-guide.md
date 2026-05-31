@@ -2,10 +2,9 @@
 
 ## Windows Single-Host Worker
 
-1. 安装 Python 3.11+、Windows 微信客户端、`wx-cli`。
-   当前 Rust 分支使用 `wx4py` UI 自动化监听/回发，并用 `wx-cli` 解密读取历史。
-2. 执行 `wx init`，确认 `wx sessions --json` 与 `wx export` 能正常工作。
-3. 创建虚拟环境并安装依赖。生产监听和回发默认使用 `wx4py`：
+1. 安装 Python 3.11+、Windows 微信客户端。
+   当前 Rust 分支使用 `wx4py` UI 自动化监听/回发，并用内置 `wxdb` 解密读取历史。
+2. 创建虚拟环境并安装依赖。生产监听和回发默认使用 `wx4py`：
 
 ```powershell
 python -m venv C:\wechat-pipeline\venv
@@ -14,13 +13,13 @@ python -m pip install -e ".[windows]"
 python -m pip install wx4py
 ```
 
-4. 配置 `.env`、`rust-agent\config\agent.toml`：
+3. 配置 `.env`、`rust-agent\config\agent.toml`：
 
 - `[wx4py].groups`: 微信群显示名
-- `[wx_cli].group_name_map`: 群名到 `wx-cli export` 可识别名称
+- `[wxdb].group_name_map`: 群名到 wxdb 可识别名称
 - `privacy.sensitive_groups`: 禁止云端 LLM 的敏感群
 
-5. 启动 Rust 单机服务：
+4. 启动 Rust 单机服务：
 
 ```powershell
 cd rust-agent

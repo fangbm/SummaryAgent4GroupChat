@@ -5,7 +5,7 @@ from windows_worker.config import WxCliSettings
 from windows_worker.wx_cli_adapter import CliWxClient
 
 
-def test_wx_cli_export_command_matches_upstream_date_format(tmp_path) -> None:
+def test_wxdb_export_command_matches_upstream_date_format(tmp_path) -> None:
     client = CliWxClient(WxCliSettings(executable="wx", max_messages=123))
     cmd = client.build_export_command(
         "AI群",
@@ -19,7 +19,7 @@ def test_wx_cli_export_command_matches_upstream_date_format(tmp_path) -> None:
     assert cmd[-2:] == ["-n", "123"]
 
 
-def test_wx_cli_normalizes_upstream_message_shape() -> None:
+def test_wxdb_normalizes_upstream_message_shape() -> None:
     message = CliWxClient.normalize_message(
         {
             "timestamp": 123,

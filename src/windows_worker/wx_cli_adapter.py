@@ -47,8 +47,8 @@ class CliWxClient:
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise PipelineError(
-                ErrorCode.WX_CLI_DECRYPT_FAILED,
-                stderr.decode("utf-8", errors="replace") or "wx-cli export failed",
+                ErrorCode.WXDB_DECRYPT_FAILED,
+                stderr.decode("utf-8", errors="replace") or "wxdb export failed",
                 retryable=False,
             )
         try:
@@ -57,7 +57,7 @@ class CliWxClient:
             output.unlink(missing_ok=True)
         messages = data.get("messages", data if isinstance(data, list) else [])
         if not isinstance(messages, list):
-            raise PipelineError(ErrorCode.WX_CLI_DECRYPT_FAILED, "wx-cli JSON format is invalid")
+            raise PipelineError(ErrorCode.WXDB_DECRYPT_FAILED, "wxdb JSON format is invalid")
         return [self.normalize_message(msg) for msg in messages if isinstance(msg, dict)]
 
     def build_export_command(
@@ -67,7 +67,7 @@ class CliWxClient:
         until: datetime,
         output: Path,
     ) -> list[str]:
-        # jackwener/wx-cli currently parses local time with a space separator.
+        # The legacy external history command parses local time with a space separator.
         cmd = [
             self.settings.executable,
             "export",

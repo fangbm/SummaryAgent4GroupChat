@@ -101,7 +101,7 @@ class TaskProcessor:
             )
             if not messages:
                 raise PipelineError(
-                    ErrorCode.WX_CLI_NO_HISTORY,
+                    ErrorCode.WXDB_NO_HISTORY,
                     "该时间段无聊天记录",
                     retryable=False,
                 )

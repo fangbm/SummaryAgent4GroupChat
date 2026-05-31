@@ -16,9 +16,9 @@ Validated on 2026-05-24:
   - `client.chat_window.send_file_to(group, image_path, target_type="group")`
 
 Conclusion: this branch uses `wx4py` for Windows-side UI automation:
-listening, text sends, and image/file sends. It is paired with `wx-cli` for
-decrypted history export because wx4py's UIA history reader cannot reliably
-expose full sender metadata.
+listening, text sends, and image/file sends. It is paired with the built-in
+`wxdb` reader for decrypted history because wx4py's UIA history reader cannot
+reliably expose full sender metadata.
 
 ## miloira/wxhook
 
@@ -54,7 +54,7 @@ approach, but this branch does not use it as the default runtime path.
   - `Wcf.query_sql(db, sql)`
 
 Conclusion: WCFerry is kept as a legacy-compatible provider only. This branch's
-default Windows provider is `wx4py` + `wx-cli`.
+default Windows provider is `wx4py` + built-in `wxdb`.
 
 ## cluic/wxauto
 
@@ -73,7 +73,7 @@ listening is more fragile because it depends on the desktop WeChat UI state.
 - Binary name: `wx`
 - Relevant command: `wx export <chat> --since "YYYY-MM-DD HH:MM:SS" --until "YYYY-MM-DD HH:MM:SS" --format json -o <file> -n <limit>`
 - JSON messages include fields such as `timestamp`, `time`, `sender`, `sender_username`, `content`, and `type`.
-- Rust toolchain is installed in this environment; this branch uses `wx-cli` for decrypted history export while `wx4py` handles live UI automation.
+- This is retained only as historical compatibility context. The default branch now uses the built-in `wxdb` reader for decrypted history while `wx4py` handles live UI automation.
 
 ## AirboZH/wx-bot-cli
 

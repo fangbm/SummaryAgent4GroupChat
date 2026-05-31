@@ -4,8 +4,8 @@ from enum import StrEnum
 
 
 class ErrorCode(StrEnum):
-    WX_CLI_DECRYPT_FAILED = "WX_CLI_DECRYPT_FAILED"
-    WX_CLI_NO_HISTORY = "WX_CLI_NO_HISTORY"
+    WXDB_DECRYPT_FAILED = "WXDB_DECRYPT_FAILED"
+    WXDB_NO_HISTORY = "WXDB_NO_HISTORY"
     LLM_TIMEOUT = "LLM_TIMEOUT"
     LLM_RATE_LIMIT = "LLM_RATE_LIMIT"
     IMAGE_GEN_FAILED = "IMAGE_GEN_FAILED"
@@ -43,4 +43,3 @@ class PipelineError(Exception):
 class PrivacyBlockedError(PipelineError):
     def __init__(self, message: str):
         super().__init__(ErrorCode.PRIVACY_BLOCKED, message, retryable=False)
-

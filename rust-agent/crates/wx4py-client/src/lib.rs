@@ -29,11 +29,11 @@ pub enum Wx4pyError {
     ReadyTimeout(u64),
     #[error("wx4py requires at least one group name in [wx4py].groups or listen.whitelist_rooms")]
     MissingGroups,
-    #[error("wx-cli failed: {0}")]
+    #[error("wxdb failed: {0}")]
     WxCli(String),
-    #[error("invalid wx-cli response: {0}")]
+    #[error("invalid wxdb response: {0}")]
     InvalidWxCli(String),
-    #[error("wx-cli history query did not finish within {0} seconds")]
+    #[error("wxdb history query did not finish within {0} seconds")]
     HistoryQueryTimeout(u64),
 }
 
@@ -201,7 +201,7 @@ impl Wx4pyClient {
                 Err(Wx4pyError::HistoryQueryTimeout(total_timeout_seconds))
             }
             Err(RecvTimeoutError::Disconnected) => Err(Wx4pyError::WxCli(
-                "wx-cli history query worker exited before returning a result".to_string(),
+                "wxdb history query worker exited before returning a result".to_string(),
             )),
         }
     }
@@ -247,7 +247,7 @@ impl Wx4pyClient {
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
             .collect::<String>();
         PathBuf::from(&self.wx_cli.temp_dir).join(format!(
-            "wx4py-wxcli-{}-{}.json",
+            "wx4py-wxdb-{}-{}.json",
             safe_room,
             Utc::now().timestamp_millis()
         ))
@@ -301,7 +301,7 @@ fn query_text_messages_inner(
         %since,
         %until,
         limit,
-        "querying wx-cli history"
+        "querying wxdb history"
     );
     match query_text_messages_via_history(wx_cli, chat_name, since, until, limit) {
         Ok(messages) if !messages.is_empty() => return Ok(messages),
@@ -310,7 +310,7 @@ fn query_text_messages_inner(
                 chat_name,
                 %since,
                 %until,
-                "wx-cli history returned no messages; falling back to wx-cli export"
+                "wxdb history returned no messages; falling back to wxdb export"
             );
         }
         Err(error) => {
@@ -320,7 +320,7 @@ fn query_text_messages_inner(
             tracing::warn!(
                 chat_name,
                 error = %error,
-                "wx-cli history query failed; falling back to wx-cli export"
+                "wxdb history query failed; falling back to wxdb export"
             );
         }
     }
@@ -438,13 +438,13 @@ fn query_text_messages_via_history(
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Wx4pyError::WxCli(format!(
-                        "wx-cli executable not found: {}. Set [wx_cli].executable to the absolute path of wx.exe or add it to PATH.",
+                        "wxdb executable not found: {}. Set [wxdb].executable to builtin, wxdb.exe, or an external history command.",
                         cmd[0]
                     )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                 return Err(Wx4pyError::WxCli(format!(
-                    "wx-cli history timed out after {} seconds",
+                    "wxdb history timed out after {} seconds",
                     wx_cli.timeout_seconds
                 )));
             }
@@ -453,7 +453,7 @@ fn query_text_messages_via_history(
 
         if !output_result.status.success() {
             last_error = Some(format!(
-                "wx-cli history failed for {candidate}: {}",
+                "wxdb history failed for {candidate}: {}",
                 command_error_text(&output_result)
             ));
             continue;
@@ -464,7 +464,7 @@ fn query_text_messages_via_history(
             Ok(messages) => messages,
             Err(error) => {
                 last_error = Some(format!(
-                    "wx-cli history returned invalid JSON for {candidate}: {error}"
+                    "wxdb history returned invalid JSON for {candidate}: {error}"
                 ));
                 continue;
             }
@@ -482,7 +482,7 @@ fn query_text_messages_via_history(
     }
 
     Err(Wx4pyError::WxCli(last_error.unwrap_or_else(|| {
-        "wx-cli history failed without output".to_string()
+        "wxdb history failed without output".to_string()
     })))
 }
 
@@ -503,13 +503,13 @@ fn query_text_messages_via_export(
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Wx4pyError::WxCli(format!(
-                        "wx-cli executable not found: {}. Set [wx_cli].executable to the absolute path of wx.exe or add it to PATH.",
+                        "wxdb executable not found: {}. Set [wxdb].executable to builtin, wxdb.exe, or an external history command.",
                         cmd[0]
                     )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                 return Err(Wx4pyError::WxCli(format!(
-                    "wx-cli export timed out after {} seconds",
+                    "wxdb export timed out after {} seconds",
                     wx_cli.timeout_seconds
                 )));
             }
@@ -517,7 +517,7 @@ fn query_text_messages_via_export(
         };
         if !output_result.status.success() {
             last_error = Some(format!(
-                "wx-cli export failed for {candidate}: {}",
+                "wxdb export failed for {candidate}: {}",
                 command_error_text(&output_result)
             ));
             continue;
@@ -529,7 +529,7 @@ fn query_text_messages_via_export(
             Ok(messages) => messages,
             Err(error) => {
                 last_error = Some(format!(
-                    "wx-cli export returned invalid JSON for {candidate}: {error}"
+                    "wxdb export returned invalid JSON for {candidate}: {error}"
                 ));
                 continue;
             }
@@ -547,7 +547,7 @@ fn query_text_messages_via_export(
     }
 
     Err(Wx4pyError::WxCli(last_error.unwrap_or_else(|| {
-        "wx-cli export failed without output".to_string()
+        "wxdb export failed without output".to_string()
     })))
 }
 
@@ -669,30 +669,30 @@ const WX_CLI_DAEMON_STOP_TIMEOUT_SECONDS: u64 = 5;
 
 fn stop_wx_cli_daemon_on_start(wx_cli: &WxCliConfig) {
     if should_use_builtin_wxdb(wx_cli) {
-        tracing::info!("builtin wxdb selected; no external wx-cli daemon to stop");
+        tracing::info!("builtin wxdb selected; no external wxdb daemon to stop");
         return;
     }
     let cmd = build_wx_cli_daemon_stop_command(wx_cli);
     match run_wx_cli_command_with_timeout(&cmd, WX_CLI_DAEMON_STOP_TIMEOUT_SECONDS) {
         Ok(output) if output.status.success() => {
-            tracing::info!("stopped wx-cli daemon before wx4py startup");
+            tracing::info!("stopped wxdb daemon before wx4py startup");
         }
         Ok(output) => {
             tracing::warn!(
                 error = %command_error_text(&output),
-                "wx-cli daemon stop returned a non-success status before startup"
+                "wxdb daemon stop returned a non-success status before startup"
             );
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
                 executable = %wx_cli.executable,
-                "wx-cli executable not found while trying to stop stale daemon"
+                "wxdb executable not found while trying to stop stale daemon"
             );
         }
         Err(error) => {
             tracing::warn!(
                 error = %error,
-                "failed to stop wx-cli daemon before startup"
+                "failed to stop wxdb daemon before startup"
             );
         }
     }
@@ -705,7 +705,7 @@ fn run_wx_cli_command_with_timeout(
     let _guard = WX_CLI_COMMAND_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .map_err(|_| std::io::Error::other("wx-cli command lock poisoned"))?;
+        .map_err(|_| std::io::Error::other("wxdb command lock poisoned"))?;
     run_command_with_timeout(cmd, timeout_seconds)
 }
 
@@ -724,7 +724,7 @@ fn run_command_with_timeout(cmd: &[String], timeout_seconds: u64) -> std::io::Re
         pid = child_id,
         command = %command_for_log(cmd),
         timeout_seconds,
-        "wx-cli command started"
+        "wxdb command started"
     );
     let timeout = StdDuration::from_secs(timeout_seconds.max(1));
     let started = Instant::now();
@@ -737,7 +737,7 @@ fn run_command_with_timeout(cmd: &[String], timeout_seconds: u64) -> std::io::Re
                 pid = child_id,
                 command = %command_for_log(cmd),
                 timeout_seconds = timeout.as_secs(),
-                "wx-cli command timed out; terminating process tree"
+                "wxdb command timed out; terminating process tree"
             );
             terminate_process_tree(&mut child);
             remove_temp_file(&stdout_path);
@@ -790,7 +790,7 @@ fn read_temp_output(path: &Path) -> std::io::Result<Vec<u8>> {
                 tracing::warn!(
                     path = %path.display(),
                     error = %error,
-                    "wx-cli temp output read failed; retrying briefly"
+                    "wxdb temp output read failed; retrying briefly"
                 );
                 thread::sleep(StdDuration::from_millis(50));
             }
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn history_timeout_can_fall_back_to_export() {
-        let error = Wx4pyError::WxCli("wx-cli history timed out after 20 seconds".into());
+        let error = Wx4pyError::WxCli("wxdb history timed out after 20 seconds".into());
 
         assert!(!should_skip_export_after_history_error(&error));
     }
