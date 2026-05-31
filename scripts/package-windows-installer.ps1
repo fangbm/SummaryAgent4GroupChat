@@ -296,6 +296,13 @@ fn write_start_menu_entries(install_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(&start_menu)?;
 
     write_cmd(
+        &start_menu.join("Manage SummaryAgent4GroupChat.cmd"),
+        &format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -File {}",
+            cmd_quote(&install_dir.join("start-gui.ps1"))
+        ),
+    )?;
+    write_cmd(
         &start_menu.join("Start SummaryAgent4GroupChat.cmd"),
         &format!(
             "powershell.exe -NoProfile -ExecutionPolicy Bypass -File {}",

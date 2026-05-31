@@ -14,7 +14,7 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 if (-not $SkipBuild) {
     Push-Location $RustRoot
     try {
-        cargo build --release -p wechat-summary-app -p wechat-summary-wxdb
+        cargo build --release -p wechat-summary-app -p wechat-summary-wxdb -p wechat-summary-gui
     }
     finally {
         Pop-Location
@@ -25,8 +25,9 @@ $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Pa
 $ReleaseDir = Join-Path $TargetDir "release"
 $AppExe = Join-Path $ReleaseDir "wechat-summary-app.exe"
 $WxdbExe = Join-Path $ReleaseDir "wxdb.exe"
+$GuiExe = Join-Path $ReleaseDir "wechat-summary-gui.exe"
 
-foreach ($required in @($AppExe, $WxdbExe)) {
+foreach ($required in @($AppExe, $WxdbExe, $GuiExe)) {
     if (-not (Test-Path $required)) {
         throw "Missing build artifact: $required"
     }
@@ -54,6 +55,8 @@ New-Item -ItemType Directory -Force -Path `
 
 Copy-Item -LiteralPath $AppExe -Destination (Join-Path $PackageDir "bin\wechat-summary-app.exe")
 Copy-Item -LiteralPath $WxdbExe -Destination (Join-Path $PackageDir "bin\wxdb.exe")
+Copy-Item -LiteralPath $GuiExe -Destination (Join-Path $PackageDir "bin\wechat-summary-gui.exe")
+Copy-Item -LiteralPath $GuiExe -Destination (Join-Path $PackageDir "SummaryAgent4GroupChat.exe")
 Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\wx4py_sidecar.py") -Destination (Join-Path $PackageDir "scripts\wx4py_sidecar.py")
 Copy-Item -LiteralPath (Join-Path $RepoRoot ".env.example") -Destination (Join-Path $PackageDir ".env.example")
 Copy-Item -LiteralPath (Join-Path $RepoRoot "README.md") -Destination (Join-Path $PackageDir "README-project.md")
@@ -94,6 +97,15 @@ $env:PATH = "$Root\bin;$env:PATH"
 & "$Root\bin\wechat-summary-app.exe" --config "$Root\config\agent.toml"
 '@ | Set-Content -LiteralPath (Join-Path $PackageDir "start.ps1") -Encoding UTF8
 
+@'
+$ErrorActionPreference = "Stop"
+$Root = $PSScriptRoot
+Set-Location $Root
+$env:PATH = "$Root\bin;$env:PATH"
+
+& "$Root\SummaryAgent4GroupChat.exe" --config "$Root\config\agent.toml"
+'@ | Set-Content -LiteralPath (Join-Path $PackageDir "start-gui.ps1") -Encoding UTF8
+
 @"
 # SummaryAgent4GroupChat Windows Package
 
@@ -109,7 +121,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ## Configure
 
-Edit `config\agent.toml`.
+Double-click `SummaryAgent4GroupChat.exe` to open the native management UI, or edit `config\agent.toml` directly.
 
 Set these environment variables before launch when the corresponding feature is enabled:
 
@@ -125,6 +137,12 @@ Set these environment variables before launch when the corresponding feature is 
 
 ~~~powershell
 .\start.ps1
+~~~
+
+## Manage
+
+~~~powershell
+.\start-gui.ps1
 ~~~
 
 The package uses the built-in `wxdb` reader by default, so it does not spawn the external `wx` CLI.
