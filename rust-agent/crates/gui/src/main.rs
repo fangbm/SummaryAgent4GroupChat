@@ -123,8 +123,87 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(APP_NAME, native_options, Box::new(|_| Ok(Box::new(app))))
-        .map_err(|error| anyhow!("{error}"))
+    eframe::run_native(
+        APP_NAME,
+        native_options,
+        Box::new(|cc| {
+            configure_fonts(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|error| anyhow!("{error}"))
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let Some((font_name, font_bytes)) = load_cjk_font() else {
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        font_name.clone(),
+        egui::FontData::from_owned(font_bytes).into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, font_name.clone());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, font_name);
+    ctx.set_fonts(fonts);
+}
+
+fn load_cjk_font() -> Option<(String, Vec<u8>)> {
+    let font_names = [
+        "NotoSansSC-VF.ttf",
+        "Noto Sans SC (TrueType).otf",
+        "simhei.ttf",
+        "Deng.ttf",
+        "Dengb.ttf",
+        "msyh.ttc",
+        "msyhbd.ttc",
+        "simsun.ttc",
+    ];
+
+    #[cfg(windows)]
+    {
+        let mut font_dirs = Vec::new();
+        if let Some(windir) = env::var_os("WINDIR").map(PathBuf::from) {
+            font_dirs.push(windir.join("Fonts"));
+        }
+        font_dirs.push(PathBuf::from(r"C:\Windows\Fonts"));
+
+        for dir in font_dirs {
+            for font_name in font_names {
+                let path = dir.join(font_name);
+                if let Ok(bytes) = fs::read(&path) {
+                    return Some(("summary-agent-cjk".to_string(), bytes));
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let font_dirs = [
+            PathBuf::from("/usr/share/fonts"),
+            PathBuf::from("/usr/local/share/fonts"),
+        ];
+        for dir in font_dirs {
+            for font_name in font_names {
+                let path = dir.join(font_name);
+                if let Ok(bytes) = fs::read(&path) {
+                    return Some(("summary-agent-cjk".to_string(), bytes));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 impl GuiApp {
