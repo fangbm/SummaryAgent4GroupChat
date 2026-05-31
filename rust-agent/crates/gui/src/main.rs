@@ -1273,18 +1273,17 @@ where
     });
 }
 
-fn command_output_text(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    format!("{stdout}{stderr}").trim().to_string()
-}
-
 fn stop_existing_agent_processes() -> Result<Option<String>> {
     #[cfg(windows)]
     {
+        let image_name = "wechat-summary-app.exe";
+        if !windows_process_exists(image_name) {
+            return Ok(None);
+        }
+
         let mut command = Command::new("taskkill.exe");
         command
-            .args(["/IM", "wechat-summary-app.exe", "/T", "/F"])
+            .args(["/IM", image_name, "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1292,18 +1291,21 @@ fn stop_existing_agent_processes() -> Result<Option<String>> {
         let output = command
             .output()
             .context("stopping existing wechat-summary-app.exe processes")?;
-        let text = command_output_text(&output);
         if output.status.success() {
             return Ok(Some("已清理旧主程序实例，避免重复监听".to_string()));
         }
-        if text.contains("not found")
-            || text.contains("not running")
-            || text.contains("没有找到")
-            || text.contains("找不到")
-        {
+
+        if !windows_process_exists(image_name) {
             return Ok(None);
         }
-        bail!("taskkill 返回失败：{text}");
+
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "unknown".to_string(), |code| code.to_string());
+        bail!(
+            "无法停止旧主程序 {image_name}，taskkill 退出码 {code}；请确认 GUI 已以管理员身份运行"
+        );
     }
 
     #[cfg(not(windows))]
@@ -1317,6 +1319,32 @@ fn stop_existing_agent_processes() -> Result<Option<String>> {
         }
         Ok(None)
     }
+}
+
+#[cfg(windows)]
+fn windows_process_exists(image_name: &str) -> bool {
+    let mut command = Command::new("tasklist.exe");
+    command
+        .args([
+            "/FI",
+            &format!("IMAGENAME eq {image_name}"),
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hide_command_window(&mut command);
+    let Ok(output) = command.output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .to_ascii_lowercase()
+        .contains(&image_name.to_ascii_lowercase())
 }
 
 fn hide_command_window(command: &mut Command) {
