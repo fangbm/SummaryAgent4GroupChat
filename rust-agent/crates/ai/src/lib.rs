@@ -77,7 +77,7 @@ impl OpenAiCompatibleLlm {
         user_content: &str,
     ) -> Result<String, AiError> {
         let endpoint = chat_completions_endpoint(&self.base_url);
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -86,6 +86,7 @@ impl OpenAiCompatibleLlm {
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_output_tokens,
         });
+        apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
         let started = Instant::now();
         info!(
@@ -155,6 +156,24 @@ impl OpenAiCompatibleLlm {
             "LLM chat completion response parsed"
         );
         Ok(content)
+    }
+}
+
+fn apply_request_body_overrides(
+    payload: &mut Value,
+    overrides: &std::collections::BTreeMap<String, toml::Value>,
+) {
+    if overrides.is_empty() {
+        return;
+    }
+    let Some(payload_object) = payload.as_object_mut() else {
+        return;
+    };
+    let Ok(Value::Object(override_object)) = serde_json::to_value(overrides) else {
+        return;
+    };
+    for (key, value) in override_object {
+        payload_object.insert(key, value);
     }
 }
 
@@ -940,6 +959,30 @@ mod tests {
             extract_chat_completion_content(&response).as_deref(),
             Some("fallback text")
         );
+    }
+
+    #[test]
+    fn request_body_overrides_replace_and_extend_payload() {
+        let overrides = toml::from_str(
+            r#"
+temperature = 0
+enable_thinking = false
+reasoning_effort = "none"
+"#,
+        )
+        .unwrap();
+        let mut payload = json!({
+            "model": "base-model",
+            "temperature": 0.3,
+            "max_tokens": 2000,
+        });
+
+        apply_request_body_overrides(&mut payload, &overrides);
+
+        assert_eq!(payload["temperature"], json!(0));
+        assert_eq!(payload["enable_thinking"], json!(false));
+        assert_eq!(payload["reasoning_effort"], json!("none"));
+        assert_eq!(payload["max_tokens"], json!(2000));
     }
 
     #[test]

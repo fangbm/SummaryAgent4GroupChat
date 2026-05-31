@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    path::Path,
+};
 
 use serde::{de, Deserialize, Deserializer};
 use thiserror::Error;
@@ -348,6 +352,8 @@ pub struct LlmConfig {
     pub temperature: f32,
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default)]
+    pub request_body_overrides: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -721,5 +727,35 @@ mod tests {
         let cfg = AgentConfig::from_toml_str(include_str!("../../../config/agent.toml")).unwrap();
         assert_eq!(cfg.wx_cli.executable, "builtin");
         assert_eq!(cfg.history_message_limit(), 10_000);
+    }
+
+    #[test]
+    fn llm_config_accepts_request_body_overrides() {
+        let cfg: LlmConfig = toml::from_str(
+            r#"
+provider = "openai_compatible"
+api_key_env = "LLM_API_KEY"
+base_url_env = "LLM_BASE_URL"
+model_env = "LLM_MODEL"
+
+[request_body_overrides]
+enable_thinking = false
+reasoning_effort = "none"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.request_body_overrides
+                .get("enable_thinking")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            cfg.request_body_overrides
+                .get("reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("none")
+        );
     }
 }

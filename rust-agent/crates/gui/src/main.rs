@@ -16,7 +16,8 @@ use std::os::windows::process::CommandExt;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use eframe::egui;
-use toml_edit::{value, Array, DocumentMut, Item, Table};
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, Value as TomlValue};
 use wechat_summary_core::AgentConfig;
 
 const APP_NAME: &str = "SummaryAgent4GroupChat";
@@ -70,6 +71,7 @@ struct ConfigView {
     llm_model_env: String,
     llm_timeout: u64,
     llm_max_tokens: u32,
+    llm_request_body_overrides: String,
     image_enabled: bool,
     image_provider: String,
     image_api_key_env: String,
@@ -753,6 +755,12 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             text_field(ui, "LLM Model 环境变量/直接值", &mut view.llm_model_env);
             number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
             number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
+            multiline_field(
+                ui,
+                "LLM 请求体覆盖(JSON)",
+                &mut view.llm_request_body_overrides,
+                7,
+            );
         },
         |ui| {
             ui.checkbox(&mut view.image_enabled, "启用图片生成");
@@ -921,6 +929,8 @@ fn load_config_view(state: &AppState) -> Result<(ConfigView, String)> {
 fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
     if let Ok(config) = AgentConfig::from_toml_str(text) {
         let history_max_messages = config.history_message_limit().min(u32::MAX as usize) as u32;
+        let llm_request_body_overrides =
+            request_body_overrides_to_json(&config.llm.request_body_overrides);
         return ConfigView {
             platform_kind: config.platform.kind.as_str().to_string(),
             wx_groups: join_lines(&config.wx4py.groups),
@@ -952,6 +962,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             llm_model_env: config.llm.model_env,
             llm_timeout: config.llm.timeout_seconds,
             llm_max_tokens: config.llm.max_output_tokens,
+            llm_request_body_overrides,
             image_enabled: config.image_gen.enabled,
             image_provider: config.image_gen.provider,
             image_api_key_env: config.image_gen.api_key_env,
@@ -1013,6 +1024,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         llm_model_env: get_str(doc, "llm", "model_env", "LLM_MODEL"),
         llm_timeout: get_u64(doc, "llm", "timeout_seconds", 120),
         llm_max_tokens: get_u64(doc, "llm", "max_output_tokens", 2000) as u32,
+        llm_request_body_overrides: request_body_overrides_from_doc(doc),
         image_enabled: get_bool(doc, "image_gen", "enabled", true),
         image_provider: get_str(doc, "image_gen", "provider", "openai"),
         image_api_key_env: get_str(doc, "image_gen", "api_key_env", "IMAGE_API_KEY"),
@@ -1102,6 +1114,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     set_str(llm, "model_env", &update.llm_model_env);
     set_int(llm, "timeout_seconds", update.llm_timeout as i64);
     set_int(llm, "max_output_tokens", update.llm_max_tokens as i64);
+    set_json_object_table(
+        llm,
+        "request_body_overrides",
+        &update.llm_request_body_overrides,
+    )?;
 
     let image_gen = table_mut(&mut doc, "image_gen");
     set_bool(image_gen, "enabled", update.image_enabled);
@@ -1212,6 +1229,68 @@ fn get_history_max_messages(doc: &DocumentMut) -> u64 {
         .unwrap_or(10_000)
 }
 
+fn request_body_overrides_to_json(overrides: &impl serde::Serialize) -> String {
+    match serde_json::to_value(overrides) {
+        Ok(JsonValue::Object(object)) if object.is_empty() => "{}".to_string(),
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()),
+        Err(_) => "{}".to_string(),
+    }
+}
+
+fn request_body_overrides_from_doc(doc: &DocumentMut) -> String {
+    let Some(item) = table(doc, "llm").and_then(|table| table.get("request_body_overrides")) else {
+        return "{}".to_string();
+    };
+    toml_item_to_json(item)
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| "{}".to_string())
+}
+
+fn toml_item_to_json(item: &Item) -> Option<JsonValue> {
+    match item {
+        Item::Table(table) => Some(JsonValue::Object(toml_table_to_json_map(table))),
+        Item::Value(value) => toml_value_to_json(value),
+        _ => None,
+    }
+}
+
+fn toml_table_to_json_map(table: &Table) -> JsonMap<String, JsonValue> {
+    table
+        .iter()
+        .filter_map(|(key, item)| toml_item_to_json(item).map(|value| (key.to_string(), value)))
+        .collect()
+}
+
+fn toml_value_to_json(value: &TomlValue) -> Option<JsonValue> {
+    if let Some(value) = value.as_bool() {
+        return Some(JsonValue::Bool(value));
+    }
+    if let Some(value) = value.as_integer() {
+        return Some(JsonValue::Number(value.into()));
+    }
+    if let Some(value) = value.as_float() {
+        return serde_json::Number::from_f64(value).map(JsonValue::Number);
+    }
+    if let Some(value) = value.as_str() {
+        return Some(JsonValue::String(value.to_string()));
+    }
+    if let Some(array) = value.as_array() {
+        return Some(JsonValue::Array(
+            array.iter().filter_map(toml_value_to_json).collect(),
+        ));
+    }
+    if let Some(table) = value.as_inline_table() {
+        let object = table
+            .iter()
+            .filter_map(|(key, value)| {
+                toml_value_to_json(value).map(|value| (key.to_string(), value))
+            })
+            .collect();
+        return Some(JsonValue::Object(object));
+    }
+    None
+}
+
 fn get_array(doc: &DocumentMut, table_name: &str, key: &str) -> Vec<String> {
     table(doc, table_name)
         .and_then(|table| table.get(key))
@@ -1263,6 +1342,80 @@ fn set_array(table: &mut Table, key: &str, values: &[String]) {
         array.push(item);
     }
     table[key] = value(array);
+}
+
+fn set_json_object_table(table: &mut Table, key: &str, json_text: &str) -> Result<()> {
+    let trimmed = json_text.trim();
+    if trimmed.is_empty() {
+        table.remove(key);
+        return Ok(());
+    }
+    let json = serde_json::from_str::<JsonValue>(trimmed)
+        .with_context(|| format!("parsing {key} JSON object"))?;
+    let JsonValue::Object(object) = json else {
+        bail!("{key} must be a JSON object");
+    };
+    if object.is_empty() {
+        table.remove(key);
+        return Ok(());
+    }
+
+    let mut toml_table = Table::new();
+    for (field, value) in &object {
+        toml_table[field] = json_to_toml_item(value)
+            .with_context(|| format!("converting request body override field {field:?}"))?;
+    }
+    table[key] = Item::Table(toml_table);
+    Ok(())
+}
+
+fn json_to_toml_item(value: &JsonValue) -> Result<Item> {
+    match value {
+        JsonValue::Object(object) => {
+            let mut table = Table::new();
+            for (key, value) in object {
+                table[key] = json_to_toml_item(value)
+                    .with_context(|| format!("converting nested JSON field {key:?}"))?;
+            }
+            Ok(Item::Table(table))
+        }
+        _ => json_to_toml_value(value).map(Item::Value),
+    }
+}
+
+fn json_to_toml_value(value: &JsonValue) -> Result<TomlValue> {
+    match value {
+        JsonValue::Null => bail!("JSON null is not supported in TOML request body overrides"),
+        JsonValue::Bool(value) => Ok(TomlValue::from(*value)),
+        JsonValue::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(TomlValue::from(value))
+            } else if let Some(value) = value.as_u64() {
+                let value = i64::try_from(value)
+                    .context("unsigned integer exceeds TOML signed integer range")?;
+                Ok(TomlValue::from(value))
+            } else if let Some(value) = value.as_f64() {
+                Ok(TomlValue::from(value))
+            } else {
+                bail!("unsupported JSON number")
+            }
+        }
+        JsonValue::String(value) => Ok(TomlValue::from(value.as_str())),
+        JsonValue::Array(values) => {
+            let mut array = Array::new();
+            for value in values {
+                array.push(json_to_toml_value(value)?);
+            }
+            Ok(TomlValue::Array(array))
+        }
+        JsonValue::Object(object) => {
+            let mut table = InlineTable::new();
+            for (key, value) in object {
+                table.insert(key, json_to_toml_value(value)?);
+            }
+            Ok(TomlValue::InlineTable(table))
+        }
+    }
 }
 
 fn join_lines(values: &[String]) -> String {

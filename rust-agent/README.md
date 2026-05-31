@@ -86,6 +86,9 @@ Scheduled summaries still use `scheduled_summary.send_image`.
 formatting. LLM input is not capped by message count; it is capped only by
 `privacy.max_chars_to_llm`.
 
+Provider-specific chat completion request fields can be added or overridden through
+`llm.request_body_overrides`, for example `enable_thinking = false`.
+
 The text and image paths use separate prompts:
 
 - `text_summary.system_prompt`: direct text summary sent back to the group.

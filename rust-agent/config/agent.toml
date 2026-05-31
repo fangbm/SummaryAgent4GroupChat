@@ -100,6 +100,12 @@ timeout_seconds = 120
 max_output_tokens = 2000
 temperature = 0.3
 
+[llm.request_body_overrides]
+# Extra JSON fields merged into the chat completion request body.
+# Values here override the generated defaults, for provider-specific options.
+# enable_thinking = false
+# reasoning_effort = "none"
+
 [image_summary]
 user_prompt_template = "{chat_input}"
 system_prompt = """
