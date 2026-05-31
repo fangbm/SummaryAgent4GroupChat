@@ -84,6 +84,7 @@ struct ConfigView {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Tab {
+    Dashboard,
     Platform,
     Listen,
     Schedule,
@@ -235,7 +236,7 @@ impl GuiApp {
             terminal_output: "GUI 已就绪，主程序终端输出会显示在这里。\n".to_string(),
             agent: None,
             status: StatusView::default(),
-            tab: Tab::Platform,
+            tab: Tab::Dashboard,
             message: None,
         };
         app.refresh_status();
@@ -441,6 +442,7 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 ui.label("原生管理界面");
                 ui.separator();
+                nav_button(ui, &mut self.tab, Tab::Dashboard, "仪表盘");
                 nav_button(ui, &mut self.tab, Tab::Platform, "接入平台");
                 nav_button(ui, &mut self.tab, Tab::Listen, "监听与命令");
                 nav_button(ui, &mut self.tab, Tab::Schedule, "定时总结");
@@ -473,30 +475,31 @@ impl eframe::App for GuiApp {
                 }
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SummaryAgent4GroupChat");
-            ui.label(format!("配置：{}", self.state.config_path.display()));
-            ui.label(format!("工作目录：{}", self.state.working_dir.display()));
-            if let Some(message) = &self.message {
-                ui.add_space(4.0);
-                ui.colored_label(egui::Color32::from_rgb(37, 99, 235), message);
+        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+            Tab::Dashboard => dashboard_tab(ui, self),
+            Tab::Platform => {
+                egui::Frame::group(ui.style()).show(ui, |ui| platform_tab(ui, &mut self.view));
             }
-            ui.add_space(8.0);
-            status_cards(ui, self);
-            ui.add_space(8.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| match self.tab {
-                Tab::Platform => platform_tab(ui, &mut self.view),
-                Tab::Listen => listen_tab(ui, &mut self.view),
-                Tab::Schedule => schedule_tab(ui, &mut self.view),
-                Tab::Model => model_tab(ui, &mut self.view),
-                Tab::Runtime => runtime_tab(
-                    ui,
-                    &mut self.view,
-                    &mut self.log_tail,
-                    &mut self.terminal_output,
-                    self.agent.is_some(),
-                ),
-            });
+            Tab::Listen => {
+                egui::Frame::group(ui.style()).show(ui, |ui| listen_tab(ui, &mut self.view));
+            }
+            Tab::Schedule => {
+                egui::Frame::group(ui.style()).show(ui, |ui| schedule_tab(ui, &mut self.view));
+            }
+            Tab::Model => {
+                egui::Frame::group(ui.style()).show(ui, |ui| model_tab(ui, &mut self.view));
+            }
+            Tab::Runtime => {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    runtime_tab(
+                        ui,
+                        &mut self.view,
+                        &mut self.log_tail,
+                        &mut self.terminal_output,
+                        self.agent.is_some(),
+                    )
+                });
+            }
         });
     }
 }
@@ -505,6 +508,72 @@ fn nav_button(ui: &mut egui::Ui, tab: &mut Tab, value: Tab, label: &str) {
     if ui.selectable_label(*tab == value, label).clicked() {
         *tab = value;
     }
+}
+
+fn dashboard_tab(ui: &mut egui::Ui, app: &GuiApp) {
+    ui.heading("SummaryAgent4GroupChat");
+    ui.label(format!("配置：{}", app.state.config_path.display()));
+    ui.label(format!("工作目录：{}", app.state.working_dir.display()));
+    if let Some(message) = &app.message {
+        ui.add_space(4.0);
+        ui.colored_label(egui::Color32::from_rgb(37, 99, 235), message);
+    }
+    ui.add_space(8.0);
+    status_cards(ui, app);
+    ui.add_space(10.0);
+    dashboard_statistics(ui, app);
+}
+
+fn dashboard_statistics(ui: &mut egui::Ui, app: &GuiApp) {
+    ui.heading("统计信息");
+    let triggers = split_lines(&app.view.triggers).len();
+    let whitelist_rooms = split_lines(&app.view.whitelist_rooms).len();
+    let scheduled_rooms = split_lines(&app.view.scheduled_rooms).len();
+    let terminal_lines = app.terminal_output.lines().count();
+    let output_dir = resolve_working_path(&app.state, &app.view.runtime_output_dir);
+    let log_size = fs::metadata(output_dir.join("wechat-summary-app.log"))
+        .map(|metadata| format_bytes(metadata.len()))
+        .unwrap_or_else(|_| "暂无".to_string());
+
+    egui::Grid::new("dashboard-stats-grid")
+        .num_columns(4)
+        .spacing([10.0, 8.0])
+        .show(ui, |ui| {
+            card(
+                ui,
+                "运行状态",
+                if app.agent.is_some() {
+                    "GUI 托管中"
+                } else {
+                    "未托管"
+                },
+            );
+            card(ui, "触发词", &format!("{} 个", triggers));
+            card(ui, "白名单", &format!("{} 个", whitelist_rooms));
+            card(ui, "定时目标", &format!("{} 个", scheduled_rooms));
+            ui.end_row();
+            card(ui, "终端行数", &format!("{} 行", terminal_lines));
+            card(ui, "日志文件", &log_size);
+            card(
+                ui,
+                "图片生成",
+                if app.view.image_enabled {
+                    "已启用"
+                } else {
+                    "已关闭"
+                },
+            );
+            card(
+                ui,
+                "手动图片",
+                if app.view.manual_image_by_default {
+                    "默认生成"
+                } else {
+                    "按参数生成"
+                },
+            );
+            ui.end_row();
+        });
 }
 
 fn status_cards(ui: &mut egui::Ui, app: &GuiApp) {
@@ -700,13 +769,14 @@ fn runtime_tab(
         .stick_to_bottom(true)
         .max_height(250.0)
         .show(ui, |ui| {
-            ui.add(
+            let response = ui.add(
                 egui::TextEdit::multiline(terminal_output)
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
                     .desired_rows(11)
                     .interactive(false),
             );
+            ui.scroll_to_rect(response.rect, Some(egui::Align::BOTTOM));
         });
     ui.separator();
     ui.label("日志文件尾部");
@@ -1292,6 +1362,21 @@ fn tail_file(path: &Path, max_bytes: u64) -> Result<String> {
     let mut text = String::new();
     reader.read_to_string(&mut text)?;
     Ok(text)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn env_present(name: &str) -> bool {
