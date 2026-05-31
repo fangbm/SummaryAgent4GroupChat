@@ -13,7 +13,11 @@ from typing import Any
 PROTOCOL_STDOUT = sys.stdout
 PROTOCOL_STDOUT_BUFFER = sys.stdout.buffer
 EMIT_LOCK = threading.Lock()
-DIAG_LOG_PATH = Path(__file__).resolve().parent.parent / "rust-agent" / "runtime" / "wx4py-sidecar.log"
+APP_ROOT = Path(__file__).resolve().parent.parent
+if (APP_ROOT / "rust-agent" / "config").exists():
+    DIAG_LOG_PATH = APP_ROOT / "rust-agent" / "runtime" / "wx4py-sidecar.log"
+else:
+    DIAG_LOG_PATH = APP_ROOT / "runtime" / "wx4py-sidecar.log"
 
 # wx4py configures loggers with StreamHandler(sys.stdout). Keep stdout reserved
 # for the JSON-lines protocol and send all library logs to stderr instead.
@@ -72,10 +76,8 @@ class Wx4pySidecar:
             return 2
 
         if not self.processors:
-            message = "wx4py startup failed: no WeChat groups could be initialized"
+            message = "no WeChat groups initialized at startup; will keep retrying in background"
             diag_log(message)
-            emit({"kind": "error", "message": message})
-            return 2
 
         threading.Thread(target=self.read_commands, daemon=True).start()
         threading.Thread(target=self.run_commands, daemon=True).start()

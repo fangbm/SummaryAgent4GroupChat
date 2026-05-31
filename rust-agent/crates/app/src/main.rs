@@ -28,16 +28,29 @@ const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_path = config_path_from_args();
-    let config = AgentConfig::from_path(&config_path)
+    if let Err(error) = run_agent(&config_path).await {
+        append_startup_error(&config_path, &format!("fatal startup error: {error:#}"));
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn run_agent(config_path: &str) -> Result<()> {
+    let config = AgentConfig::from_path(config_path)
         .with_context(|| format!("loading config {}", config_path))?;
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&config.runtime.log_level))
         .init();
 
-    let store = SqliteStateStore::open(&config.storage.sqlite_path)?;
-    let matcher = TriggerMatcher::new(config.listen.clone())?;
-    let client = PlatformClient::start(&config).await?;
+    append_runtime_log(&config, "agent startup started");
+
+    let store = SqliteStateStore::open(&config.storage.sqlite_path)
+        .with_context(|| format!("opening state store {}", config.storage.sqlite_path))?;
+    let matcher = TriggerMatcher::new(config.listen.clone()).context("building trigger matcher")?;
+    let client = PlatformClient::start(&config)
+        .await
+        .with_context(|| format!("starting {} platform client", config.platform.kind.as_str()))?;
     let platform_rooms = client.configured_rooms(&config);
     let mut recent_trigger_attempts = RecentTriggerAttempts::default();
 
@@ -115,6 +128,22 @@ fn config_path_from_args() -> String {
 fn append_runtime_log(config: &AgentConfig, message: &str) {
     let output_dir = std::path::Path::new(&config.runtime.output_dir);
     if fs::create_dir_all(output_dir).is_err() {
+        return;
+    }
+    let path = output_dir.join("wechat-summary-app.log");
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{} {}", Utc::now().to_rfc3339(), message);
+    }
+}
+
+fn append_startup_error(config_path: &str, message: &str) {
+    if let Ok(config) = AgentConfig::from_path(config_path) {
+        append_runtime_log(&config, message);
+        return;
+    }
+
+    let output_dir = std::path::Path::new("runtime").join("rust-output");
+    if fs::create_dir_all(&output_dir).is_err() {
         return;
     }
     let path = output_dir.join("wechat-summary-app.log");

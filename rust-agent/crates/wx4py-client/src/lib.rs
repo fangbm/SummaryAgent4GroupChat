@@ -70,7 +70,13 @@ impl Wx4pyClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()?;
+            .spawn()
+            .map_err(|error| {
+                Wx4pyError::Sidecar(format!(
+                    "failed to spawn wx4py sidecar python={} script={}: {error}",
+                    config.python_executable, config.sidecar_script
+                ))
+            })?;
 
         let stdin =
             Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {

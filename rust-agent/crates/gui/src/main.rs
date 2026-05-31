@@ -97,6 +97,7 @@ struct StatusView {
     targets: usize,
     app_ready: bool,
     wxdb_ready: bool,
+    python_ready: bool,
     llm_key_present: bool,
     image_key_present: bool,
     discord_token_present: bool,
@@ -266,6 +267,7 @@ impl GuiApp {
             targets,
             app_ready: find_exe("wechat-summary-app").exists(),
             wxdb_ready: find_exe("wxdb").exists(),
+            python_ready: resolve_working_path(&self.state, &self.view.wx_python).exists(),
             llm_key_present: env_present(&self.view.llm_api_key_env),
             image_key_present: env_present(&self.view.image_api_key_env),
             discord_token_present: env_present(&self.view.discord_token_env),
@@ -288,7 +290,25 @@ impl GuiApp {
         }
     }
 
+    fn install_runtime(&mut self) {
+        match install_runtime(&self.state) {
+            Ok(_) => self.message = Some("已启动 Python Runtime 安装脚本".to_string()),
+            Err(error) => self.message = Some(format!("安装运行时失败：{error:#}")),
+        }
+    }
+
     fn start_agent(&mut self) {
+        if self.view.platform_kind.eq_ignore_ascii_case("wx") {
+            let python = resolve_working_path(&self.state, &self.view.wx_python);
+            if !python.exists() {
+                self.message = Some(format!(
+                    "Python 运行时不存在：{}。请先运行安装目录里的 install.ps1 或开始菜单里的 Install Python Runtime。",
+                    python.display()
+                ));
+                return;
+            }
+        }
+
         match start_agent(&self.state) {
             Ok(_) => self.message = Some("主程序已启动".to_string()),
             Err(error) => self.message = Some(format!("启动失败：{error:#}")),
@@ -322,6 +342,9 @@ impl eframe::App for GuiApp {
                 }
                 if ui.button("打开输出目录").clicked() {
                     self.open_output();
+                }
+                if ui.button("安装 Python Runtime").clicked() {
+                    self.install_runtime();
                 }
                 if ui.button("启动主程序").clicked() {
                     self.start_agent();
@@ -385,9 +408,10 @@ fn status_cards(ui: &mut egui::Ui, app: &GuiApp) {
             ui.end_row();
             card(ui, "主程序", yes_no(app.status.app_ready));
             card(ui, "wxdb", yes_no(app.status.wxdb_ready));
+            card(ui, "Python Runtime", yes_no(app.status.python_ready));
             card(ui, "LLM Key", yes_no(app.status.llm_key_present));
-            card(ui, "Image Key", yes_no(app.status.image_key_present));
             ui.end_row();
+            card(ui, "Image Key", yes_no(app.status.image_key_present));
             card(
                 ui,
                 "Discord Token",
@@ -919,6 +943,23 @@ fn start_agent(state: &AppState) -> Result<()> {
         .current_dir(&state.working_dir)
         .spawn()
         .context("starting wechat-summary-app")?;
+    Ok(())
+}
+
+fn install_runtime(state: &AppState) -> Result<()> {
+    let script = state.working_dir.join("install.ps1");
+    if !script.exists() {
+        return Err(anyhow!("安装脚本不存在: {}", script.display()));
+    }
+    Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&script)
+        .current_dir(&state.working_dir)
+        .spawn()
+        .context("starting install.ps1")?;
     Ok(())
 }
 
