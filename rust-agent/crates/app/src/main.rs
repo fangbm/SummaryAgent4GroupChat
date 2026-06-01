@@ -754,10 +754,37 @@ async fn run_summary_pipeline(
                 image_summary_request.chars().count()
             ),
         );
-        let image_summary = llm
+        let image_summary = match llm
             .complete(&config.image_summary.system_prompt, &image_summary_request)
             .await
-            .context("calling LLM for image summary")?;
+            .context("calling LLM for image summary")
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                let error_message = format_error_chain(&error);
+                warn!(
+                    room_id = %trigger.room_id,
+                    error = %error_message,
+                    "image summary failed after text summary"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "image summary failed after text summary room={} error={}",
+                        trigger.room_id, error_message
+                    ),
+                );
+                send_deferred_summary_text(
+                    config,
+                    client,
+                    &trigger.room_id,
+                    &mut pending_text_reply,
+                    "after image summary failure",
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         info!(
             room_id = %trigger.room_id,
             output_chars = image_summary.chars().count(),
@@ -790,10 +817,37 @@ async fn run_summary_pipeline(
                 image_prompt_request.chars().count()
             ),
         );
-        let image_prompt = llm
+        let image_prompt = match llm
             .complete(&config.image_prompt.system_prompt, &image_prompt_request)
             .await
-            .context("calling LLM for image prompt")?;
+            .context("calling LLM for image prompt")
+        {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                let error_message = format_error_chain(&error);
+                warn!(
+                    room_id = %trigger.room_id,
+                    error = %error_message,
+                    "image prompt failed after text summary"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "image prompt failed after text summary room={} error={}",
+                        trigger.room_id, error_message
+                    ),
+                );
+                send_deferred_summary_text(
+                    config,
+                    client,
+                    &trigger.room_id,
+                    &mut pending_text_reply,
+                    "after image prompt failure",
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         info!(
             room_id = %trigger.room_id,
             output_chars = image_prompt.chars().count(),
@@ -810,17 +864,14 @@ async fn run_summary_pipeline(
 
         match generate_summary_image(config, &trigger.room_id, &image_prompt).await {
             Ok(artifact) => {
-                if let Some(reply) = pending_text_reply.take() {
-                    client
-                        .send_text(&trigger.room_id, &reply)
-                        .await
-                        .context("sending deferred summary text")?;
-                    info!(room_id = %trigger.room_id, "deferred summary text sent");
-                    append_runtime_log(
-                        config,
-                        &format!("deferred summary text sent room={}", trigger.room_id),
-                    );
-                }
+                send_deferred_summary_text(
+                    config,
+                    client,
+                    &trigger.room_id,
+                    &mut pending_text_reply,
+                    "before image send",
+                )
+                .await?;
                 send_summary_image(config, client, &trigger.room_id, &artifact).await?;
             }
             Err(error) => {
@@ -833,20 +884,14 @@ async fn run_summary_pipeline(
                         trigger.room_id, error_message
                     ),
                 );
-                if let Some(reply) = pending_text_reply.take() {
-                    client
-                        .send_text(&trigger.room_id, &reply)
-                        .await
-                        .context("sending deferred summary text after image failure")?;
-                    info!(room_id = %trigger.room_id, "deferred summary text sent after image failure");
-                    append_runtime_log(
-                        config,
-                        &format!(
-                            "deferred summary text sent after image failure room={}",
-                            trigger.room_id
-                        ),
-                    );
-                }
+                send_deferred_summary_text(
+                    config,
+                    client,
+                    &trigger.room_id,
+                    &mut pending_text_reply,
+                    "after image generation failure",
+                )
+                .await?;
                 let prefix = if options.text_summary_enabled {
                     "文字总结已完成，但"
                 } else {
@@ -863,13 +908,14 @@ async fn run_summary_pipeline(
         }
     }
 
-    if let Some(reply) = pending_text_reply.take() {
-        client
-            .send_text(&trigger.room_id, &reply)
-            .await
-            .context("sending deferred summary text without image")?;
-        info!(room_id = %trigger.room_id, "deferred summary text sent without image");
-    }
+    send_deferred_summary_text(
+        config,
+        client,
+        &trigger.room_id,
+        &mut pending_text_reply,
+        "without image",
+    )
+    .await?;
 
     Ok(())
 }
@@ -1084,6 +1130,36 @@ async fn send_summary_image(
     info!(room_id = %room_id, "summary image sent");
     append_runtime_log(config, &format!("summary image sent room={}", room_id));
     Ok(())
+}
+
+async fn send_deferred_summary_text(
+    config: &AgentConfig,
+    client: &PlatformClient,
+    room_id: &str,
+    pending_text_reply: &mut Option<String>,
+    reason: &str,
+) -> Result<bool> {
+    let Some(reply) = pending_text_reply.take() else {
+        return Ok(false);
+    };
+
+    client
+        .send_text(room_id, &reply)
+        .await
+        .with_context(|| format!("sending deferred summary text {reason}"))?;
+    info!(
+        room_id = %room_id,
+        reason = %reason,
+        "deferred summary text sent"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "deferred summary text sent room={} reason={}",
+            room_id, reason
+        ),
+    );
+    Ok(true)
 }
 
 fn progress_message(options: PipelineOptions) -> &'static str {
