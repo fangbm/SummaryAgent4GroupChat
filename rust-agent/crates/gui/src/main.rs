@@ -806,37 +806,33 @@ fn runtime_tab(
         },
     );
     ui.separator();
-    two_columns(
+    let remaining_height = ui.available_height().max(420.0);
+    let pane_height = ((remaining_height - 42.0) / 2.0).clamp(190.0, 340.0);
+    ui.horizontal(|ui| {
+        ui.label("GUI 终端");
+        ui.small(if agent_running {
+            "主程序运行中"
+        } else {
+            "主程序未托管运行"
+        });
+    });
+    readonly_scroll_text(
         ui,
-        |ui| {
-            ui.horizontal(|ui| {
-                ui.label("GUI 终端");
-                ui.small(if agent_running {
-                    "主程序运行中"
-                } else {
-                    "主程序未托管运行"
-                });
-            });
-            readonly_scroll_text(
-                ui,
-                "gui-terminal-scroll",
-                "gui-terminal-text",
-                terminal_output,
-                310.0,
-                true,
-            );
-        },
-        |ui| {
-            ui.label("日志文件尾部");
-            readonly_scroll_text(
-                ui,
-                "log-tail-scroll",
-                "log-tail-text",
-                log_tail,
-                310.0,
-                false,
-            );
-        },
+        "gui-terminal-scroll",
+        "gui-terminal-text",
+        terminal_output,
+        pane_height,
+        true,
+    );
+    ui.add_space(8.0);
+    ui.label("日志文件尾部");
+    readonly_scroll_text(
+        ui,
+        "log-tail-scroll",
+        "log-tail-text",
+        log_tail,
+        pane_height,
+        false,
     );
 }
 
