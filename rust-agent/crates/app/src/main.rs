@@ -818,7 +818,7 @@ async fn run_summary_pipeline(
             ),
         );
         let image_prompt = match llm
-            .complete(&config.image_prompt.system_prompt, &image_prompt_request)
+            .complete_without_max_tokens(&config.image_prompt.system_prompt, &image_prompt_request)
             .await
             .context("calling LLM for image prompt")
         {
@@ -1034,7 +1034,7 @@ async fn run_background_image_pipeline_inner(
         ),
     );
     let image_prompt = llm
-        .complete(&config.image_prompt.system_prompt, &image_prompt_request)
+        .complete_without_max_tokens(&config.image_prompt.system_prompt, &image_prompt_request)
         .await
         .context("calling LLM for background image prompt")?;
     info!(

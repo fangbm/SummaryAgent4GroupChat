@@ -76,16 +76,37 @@ impl OpenAiCompatibleLlm {
         system_prompt: &str,
         user_content: &str,
     ) -> Result<String, AiError> {
+        self.complete_with_max_tokens(
+            system_prompt,
+            user_content,
+            Some(self.config.max_output_tokens),
+        )
+        .await
+    }
+
+    pub async fn complete_without_max_tokens(
+        &self,
+        system_prompt: &str,
+        user_content: &str,
+    ) -> Result<String, AiError> {
+        self.complete_with_max_tokens(system_prompt, user_content, None)
+            .await
+    }
+
+    async fn complete_with_max_tokens(
+        &self,
+        system_prompt: &str,
+        user_content: &str,
+        max_tokens: Option<u32>,
+    ) -> Result<String, AiError> {
         let endpoint = chat_completions_endpoint(&self.base_url);
-        let mut payload = serde_json::json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_output_tokens,
-        });
+        let mut payload = chat_completion_payload(
+            &self.model,
+            system_prompt,
+            user_content,
+            self.config.temperature,
+            max_tokens,
+        );
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
         let started = Instant::now();
@@ -94,7 +115,7 @@ impl OpenAiCompatibleLlm {
             model = %self.model,
             system_chars = system_prompt.chars().count(),
             user_chars = user_content.chars().count(),
-            max_tokens = self.config.max_output_tokens,
+            max_tokens = ?max_tokens,
             timeout_seconds = self.config.timeout_seconds,
             "LLM chat completion request started"
         );
@@ -157,6 +178,29 @@ impl OpenAiCompatibleLlm {
         );
         Ok(content)
     }
+}
+
+fn chat_completion_payload(
+    model: &str,
+    system_prompt: &str,
+    user_content: &str,
+    temperature: f32,
+    max_tokens: Option<u32>,
+) -> Value {
+    let mut payload = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "temperature": temperature,
+    });
+    if let Some(max_tokens) = max_tokens {
+        if let Some(payload_object) = payload.as_object_mut() {
+            payload_object.insert("max_tokens".into(), json!(max_tokens));
+        }
+    }
+    payload
 }
 
 fn apply_request_body_overrides(
@@ -982,6 +1026,23 @@ reasoning_effort = "none"
         assert_eq!(payload["temperature"], json!(0));
         assert_eq!(payload["enable_thinking"], json!(false));
         assert_eq!(payload["reasoning_effort"], json!("none"));
+        assert_eq!(payload["max_tokens"], json!(2000));
+    }
+
+    #[test]
+    fn chat_completion_payload_can_omit_max_tokens() {
+        let payload = chat_completion_payload("model-a", "system prompt", "user prompt", 0.3, None);
+
+        assert_eq!(payload["model"], json!("model-a"));
+        assert!((payload["temperature"].as_f64().unwrap() - 0.3).abs() < 0.0001);
+        assert!(payload.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn chat_completion_payload_keeps_max_tokens_when_requested() {
+        let payload =
+            chat_completion_payload("model-a", "system prompt", "user prompt", 0.3, Some(2000));
+
         assert_eq!(payload["max_tokens"], json!(2000));
     }
 
