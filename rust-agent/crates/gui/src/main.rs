@@ -74,6 +74,7 @@ struct ConfigView {
     llm_model_env: String,
     llm_timeout: u64,
     llm_max_tokens: u32,
+    llm_max_input_chars: u32,
     llm_request_body_overrides: String,
     image_enabled: bool,
     image_provider: String,
@@ -773,6 +774,7 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             text_field(ui, "LLM Model 环境变量/直接值", &mut view.llm_model_env);
             number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
             number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
+            number_u32(ui, "LLM 最大输入字符数", &mut view.llm_max_input_chars);
             multiline_field(
                 ui,
                 "LLM 请求体覆盖(JSON)",
@@ -1202,6 +1204,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             llm_model_env: config.llm.model_env,
             llm_timeout: config.llm.timeout_seconds,
             llm_max_tokens: config.llm.max_output_tokens,
+            llm_max_input_chars: config.privacy.max_chars_to_llm.min(u32::MAX as usize) as u32,
             llm_request_body_overrides,
             image_enabled: config.image_gen.enabled,
             image_provider: config.image_gen.provider,
@@ -1272,6 +1275,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         llm_model_env: get_str(doc, "llm", "model_env", "LLM_MODEL"),
         llm_timeout: get_u64(doc, "llm", "timeout_seconds", 120),
         llm_max_tokens: get_u64(doc, "llm", "max_output_tokens", 2000) as u32,
+        llm_max_input_chars: get_u64(doc, "privacy", "max_chars_to_llm", 20_000)
+            .min(u32::MAX as u64) as u32,
         llm_request_body_overrides: request_body_overrides_from_doc(doc),
         image_enabled: get_bool(doc, "image_gen", "enabled", true),
         image_provider: get_str(doc, "image_gen", "provider", "openai"),
@@ -1366,7 +1371,13 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     set_str(wxdb, "temp_dir", &update.wx_cli_temp_dir);
     remove_table(&mut doc, "wx_cli");
 
-    remove_key(table_mut(&mut doc, "privacy"), "max_messages_to_llm");
+    let privacy = table_mut(&mut doc, "privacy");
+    remove_key(privacy, "max_messages_to_llm");
+    set_int(
+        privacy,
+        "max_chars_to_llm",
+        update.llm_max_input_chars as i64,
+    );
 
     let llm = table_mut(&mut doc, "llm");
     set_str(llm, "provider", &update.llm_provider);
