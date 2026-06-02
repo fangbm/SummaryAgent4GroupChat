@@ -13,6 +13,9 @@ use wechat_summary_core::{
     ImageArtifact,
 };
 
+const CHAT_COMPLETION_MAX_ATTEMPTS: usize = 3;
+const CHAT_COMPLETION_RETRY_DELAYS_MS: [u64; 2] = [1_000, 3_000];
+
 #[derive(Debug, Error)]
 pub enum AiError {
     #[error("missing API key; set environment variable {env_var} or configure api_key directly")]
@@ -109,75 +112,133 @@ impl OpenAiCompatibleLlm {
         );
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
-        let started = Instant::now();
-        info!(
-            base_url = %self.base_url,
-            model = %self.model,
-            system_chars = system_prompt.chars().count(),
-            user_chars = user_content.chars().count(),
-            max_tokens = ?max_tokens,
-            timeout_seconds = self.config.timeout_seconds,
-            "LLM chat completion request started"
-        );
-        let response = self
-            .client
-            .post(endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await?;
-        let status = response.status();
-        let elapsed_ms = started.elapsed().as_millis();
-        if !status.is_success() {
-            let body = response
-                .text()
+        for attempt in 1..=CHAT_COMPLETION_MAX_ATTEMPTS {
+            let started = Instant::now();
+            info!(
+                base_url = %self.base_url,
+                model = %self.model,
+                system_chars = system_prompt.chars().count(),
+                user_chars = user_content.chars().count(),
+                max_tokens = ?max_tokens,
+                timeout_seconds = self.config.timeout_seconds,
+                attempt,
+                max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                "LLM chat completion request started"
+            );
+            let response = match self
+                .client
+                .post(&endpoint)
+                .bearer_auth(&self.api_key)
+                .json(&payload)
+                .send()
                 .await
-                .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-            let snippet = truncate_for_log(&body, 500);
-            warn!(
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    let retry = attempt < CHAT_COMPLETION_MAX_ATTEMPTS
+                        && should_retry_chat_completion_transport_error(&error);
+                    warn!(
+                        elapsed_ms,
+                        attempt,
+                        max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                        retry,
+                        error = %error,
+                        "LLM chat completion transport failed"
+                    );
+                    if retry {
+                        sleep(chat_completion_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+            let status = response.status();
+            let elapsed_ms = started.elapsed().as_millis();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+                let snippet = truncate_for_log(&body, 500);
+                let retry = attempt < CHAT_COMPLETION_MAX_ATTEMPTS
+                    && should_retry_chat_completion_failure(status, &snippet);
+                warn!(
+                    status = %status,
+                    elapsed_ms,
+                    attempt,
+                    max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                    retry,
+                    response = %snippet,
+                    "LLM chat completion request failed"
+                );
+                if retry {
+                    sleep(chat_completion_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(AiError::InvalidResponse(format!(
+                    "chat completion API returned {status}: {snippet}"
+                )));
+            }
+            info!(
                 status = %status,
                 elapsed_ms,
-                response = %snippet,
-                "LLM chat completion request failed"
+                attempt,
+                max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                "LLM chat completion HTTP request completed"
             );
-            return Err(AiError::InvalidResponse(format!(
-                "chat completion API returned {status}: {snippet}"
-            )));
-        }
-        info!(
-            status = %status,
-            elapsed_ms,
-            "LLM chat completion HTTP request completed"
-        );
 
-        let body = response.text().await?;
-        let response = serde_json::from_str::<Value>(&body).map_err(|error| {
-            let snippet = truncate_for_log(&body, 500);
-            warn!(
-                elapsed_ms,
-                response = %snippet,
-                "LLM chat completion JSON parsing failed"
+            let body = response.text().await?;
+            let response = serde_json::from_str::<Value>(&body).map_err(|error| {
+                let snippet = truncate_for_log(&body, 500);
+                warn!(
+                    elapsed_ms,
+                    response = %snippet,
+                    "LLM chat completion JSON parsing failed"
+                );
+                AiError::InvalidResponse(format!("invalid chat completion JSON: {error}"))
+            })?;
+            let content = extract_chat_completion_content(&response).ok_or_else(|| {
+                let finish_reason = chat_completion_finish_reason(&response);
+                let snippet = truncate_for_log(&response.to_string(), 500);
+                warn!(
+                    finish_reason = %finish_reason,
+                    response = %snippet,
+                    "LLM chat completion response is missing content"
+                );
+                AiError::InvalidResponse(format!(
+                    "missing chat completion content (finish_reason={finish_reason})"
+                ))
+            })?;
+            info!(
+                output_chars = content.chars().count(),
+                "LLM chat completion response parsed"
             );
-            AiError::InvalidResponse(format!("invalid chat completion JSON: {error}"))
-        })?;
-        let content = extract_chat_completion_content(&response).ok_or_else(|| {
-            let finish_reason = chat_completion_finish_reason(&response);
-            let snippet = truncate_for_log(&response.to_string(), 500);
-            warn!(
-                finish_reason = %finish_reason,
-                response = %snippet,
-                "LLM chat completion response is missing content"
-            );
-            AiError::InvalidResponse(format!(
-                "missing chat completion content (finish_reason={finish_reason})"
-            ))
-        })?;
-        info!(
-            output_chars = content.chars().count(),
-            "LLM chat completion response parsed"
-        );
-        Ok(content)
+            return Ok(content);
+        }
+
+        unreachable!("chat completion retry loop always returns")
     }
+}
+
+fn should_retry_chat_completion_failure(status: reqwest::StatusCode, body: &str) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || body.contains("UPSTREAM_FAILED")
+        || body.contains("UPSTREAM_REQUEST_FAILED")
+}
+
+fn should_retry_chat_completion_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect()
+}
+
+fn chat_completion_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(
+        CHAT_COMPLETION_RETRY_DELAYS_MS
+            .get(attempt.saturating_sub(1))
+            .copied()
+            .unwrap_or_else(|| *CHAT_COMPLETION_RETRY_DELAYS_MS.last().unwrap_or(&1_000)),
+    )
 }
 
 fn chat_completion_payload(
@@ -1044,6 +1105,30 @@ reasoning_effort = "none"
             chat_completion_payload("model-a", "system prompt", "user prompt", 0.3, Some(2000));
 
         assert_eq!(payload["max_tokens"], json!(2000));
+    }
+
+    #[test]
+    fn chat_completion_retry_policy_retries_transient_upstream_failures() {
+        assert!(should_retry_chat_completion_failure(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"code":"UPSTREAM_FAILED"}"#
+        ));
+        assert!(should_retry_chat_completion_failure(
+            reqwest::StatusCode::BAD_GATEWAY,
+            ""
+        ));
+        assert!(should_retry_chat_completion_failure(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            ""
+        ));
+    }
+
+    #[test]
+    fn chat_completion_retry_policy_does_not_retry_context_errors() {
+        assert!(!should_retry_chat_completion_failure(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"type":"context_length_exceeded"}"#
+        ));
     }
 
     #[test]

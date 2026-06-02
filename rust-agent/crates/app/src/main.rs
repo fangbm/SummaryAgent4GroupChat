@@ -915,6 +915,11 @@ async fn run_summary_pipeline(
                     "after image summary failure",
                 )
                 .await?;
+                if options.text_summary_enabled {
+                    send_image_failure_message(config, client, &trigger.room_id, &error_message)
+                        .await;
+                    return Ok(PipelineOutcome::SummaryProduced);
+                }
                 return Err(error);
             }
         };
@@ -978,6 +983,11 @@ async fn run_summary_pipeline(
                     "after image prompt failure",
                 )
                 .await?;
+                if options.text_summary_enabled {
+                    send_image_failure_message(config, client, &trigger.room_id, &error_message)
+                        .await;
+                    return Ok(PipelineOutcome::SummaryProduced);
+                }
                 return Err(error);
             }
         };
@@ -1030,6 +1040,11 @@ async fn run_summary_pipeline(
                     "after image generation failure",
                 )
                 .await?;
+                if options.text_summary_enabled {
+                    send_image_failure_message(config, client, &trigger.room_id, &error_message)
+                        .await;
+                    return Ok(PipelineOutcome::SummaryProduced);
+                }
                 let prefix = if options.text_summary_enabled {
                     "文字总结已完成，但"
                 } else {
@@ -1270,6 +1285,35 @@ async fn send_summary_image_with_sender(
     info!(room_id = %room_id, "summary image sent");
     append_runtime_log(config, &format!("summary image sent room={}", room_id));
     Ok(())
+}
+
+async fn send_image_failure_message(
+    config: &AgentConfig,
+    client: &PlatformClient,
+    room_id: &str,
+    error_message: &str,
+) {
+    if let Err(error) = client
+        .send_text(
+            room_id,
+            &format!("文字总结已完成，但图片生成失败：{error_message}"),
+        )
+        .await
+    {
+        let send_error = format_error_chain(&error);
+        warn!(
+            room_id = %room_id,
+            error = %send_error,
+            "failed to send image failure message after completed text summary"
+        );
+        append_runtime_log(
+            config,
+            &format!(
+                "failed to send image failure message room={} error={}",
+                room_id, send_error
+            ),
+        );
+    }
 }
 
 async fn send_summary_image(
