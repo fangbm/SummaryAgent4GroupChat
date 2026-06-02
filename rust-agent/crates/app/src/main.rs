@@ -44,6 +44,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
         .init();
 
     append_runtime_log(&config, "agent startup started");
+    refresh_wxdb_keys_on_start(&config);
 
     let store = SqliteStateStore::open(&config.storage.sqlite_path)
         .with_context(|| format!("opening state store {}", config.storage.sqlite_path))?;
@@ -109,6 +110,76 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 event,
             )
             .await?;
+        }
+    }
+}
+
+fn refresh_wxdb_keys_on_start(config: &AgentConfig) {
+    match wx4py_client::refresh_builtin_wxdb_keys_on_start(&config.wx_cli) {
+        Ok(Some(reports)) => {
+            let total_before: usize = reports.iter().map(|report| report.before_keys).sum();
+            let total_scanned: usize = reports.iter().map(|report| report.scanned_keys).sum();
+            let total_after: usize = reports.iter().map(|report| report.after_keys).sum();
+            info!(
+                stores = reports.len(),
+                before_keys = total_before,
+                scanned_keys = total_scanned,
+                after_keys = total_after,
+                "startup wxdb init completed"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "startup wxdb init completed stores={} before_keys={} scanned_keys={} after_keys={}",
+                    reports.len(),
+                    total_before,
+                    total_scanned,
+                    total_after
+                ),
+            );
+            for report in reports {
+                if let Some(error) = report.scan_error {
+                    warn!(
+                        db_dir = %report.db_dir,
+                        error = %error,
+                        "startup wxdb init scan warning"
+                    );
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "startup wxdb init scan warning db_dir={} error={}",
+                            report.db_dir, error
+                        ),
+                    );
+                } else {
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "startup wxdb init store db_dir={} before_keys={} imported_legacy_keys={} scanned_keys={} after_keys={}",
+                            report.db_dir,
+                            report.before_keys,
+                            report.imported_legacy_keys,
+                            report.scanned_keys,
+                            report.after_keys
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(None) => {
+            info!("startup wxdb init skipped because external wxdb executable is configured");
+            append_runtime_log(
+                config,
+                "startup wxdb init skipped external wxdb executable configured",
+            );
+        }
+        Err(error) => {
+            let error_message = format_error_chain(&anyhow::Error::new(error));
+            warn!(error = %error_message, "startup wxdb init failed");
+            append_runtime_log(
+                config,
+                &format!("startup wxdb init failed error={error_message}"),
+            );
         }
     }
 }

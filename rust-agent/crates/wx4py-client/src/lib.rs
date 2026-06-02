@@ -39,6 +39,39 @@ pub enum Wx4pyError {
 
 pub type Result<T> = std::result::Result<T, Wx4pyError>;
 
+#[derive(Debug, Clone)]
+pub struct WxdbInitReport {
+    pub db_dir: String,
+    pub before_keys: usize,
+    pub imported_legacy_keys: usize,
+    pub scanned_keys: usize,
+    pub after_keys: usize,
+    pub scan_error: Option<String>,
+}
+
+pub fn refresh_builtin_wxdb_keys_on_start(
+    wx_cli: &WxCliConfig,
+) -> Result<Option<Vec<WxdbInitReport>>> {
+    if !should_use_builtin_wxdb(wx_cli) {
+        return Ok(None);
+    }
+
+    let config = wechat_summary_wxdb::RuntimeConfig::load();
+    let reports = wechat_summary_wxdb::refresh_keys(&config)
+        .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb init failed: {error:#}")))?
+        .into_iter()
+        .map(|report| WxdbInitReport {
+            db_dir: report.db_dir.display().to_string(),
+            before_keys: report.before_keys,
+            imported_legacy_keys: report.imported_legacy_keys,
+            scanned_keys: report.scanned_keys,
+            after_keys: report.after_keys,
+            scan_error: report.scan_error,
+        })
+        .collect();
+    Ok(Some(reports))
+}
+
 #[derive(Debug)]
 pub struct Wx4pyClient {
     _child: Child,
