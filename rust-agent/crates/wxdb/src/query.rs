@@ -89,6 +89,7 @@ pub fn query_history_with_config(
 
     let mut best: Option<HistoryResult> = None;
     let mut errors = Vec::new();
+    let mut missing_key_store_errors = Vec::new();
     let mut global_warnings = Vec::new();
 
     for db_dir in &config.db_dirs {
@@ -103,7 +104,12 @@ pub fn query_history_with_config(
                 }
             }
             Err(error) => {
-                errors.push(format!("{}: {error:#}", db_dir.display()));
+                let error = format!("{}: {error:#}", db_dir.display());
+                if is_missing_db_key_error(&error) {
+                    missing_key_store_errors.push(error);
+                } else {
+                    errors.push(error);
+                }
             }
         }
     }
@@ -114,7 +120,12 @@ pub fn query_history_with_config(
         return Ok(result);
     }
 
+    errors.extend(missing_key_store_errors);
     anyhow::bail!("所有 WeChat 数据库候选均查询失败: {}", errors.join(" | "))
+}
+
+fn is_missing_db_key_error(error: &str) -> bool {
+    error.contains("没有可用数据库密钥")
 }
 
 fn query_history_in_store(
@@ -659,5 +670,13 @@ mod tests {
             msg_table_name("test").len(),
             "Msg_098f6bcd4621d373cade4e832627b4f6".len()
         );
+    }
+
+    #[test]
+    fn recognizes_missing_db_key_errors() {
+        assert!(is_missing_db_key_error(
+            r"\\?\D:\Temp\xwechat_files\wxid_a\db_storage: 没有可用数据库密钥；请确认微信正在运行"
+        ));
+        assert!(!is_missing_db_key_error("打开 contact.db 失败"));
     }
 }

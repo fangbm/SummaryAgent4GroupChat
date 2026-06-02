@@ -108,6 +108,7 @@ struct GuiApp {
     log_path_label: String,
     terminal_output: String,
     agent: Option<AgentProcess>,
+    wxdb_init: Option<WxdbInitProcess>,
     status: StatusView,
     tab: Tab,
     message: Option<String>,
@@ -115,6 +116,12 @@ struct GuiApp {
 }
 
 struct AgentProcess {
+    child: Child,
+    output: Receiver<String>,
+    pid: u32,
+}
+
+struct WxdbInitProcess {
     child: Child,
     output: Receiver<String>,
     pid: u32,
@@ -246,6 +253,7 @@ impl GuiApp {
             log_path_label: String::new(),
             terminal_output: "GUI 已就绪，主程序终端输出会显示在这里。\n".to_string(),
             agent: None,
+            wxdb_init: None,
             status: StatusView::default(),
             tab: Tab::Dashboard,
             message: None,
@@ -330,6 +338,23 @@ impl GuiApp {
         match install_runtime(&self.state) {
             Ok(_) => self.message = Some("已启动 Python Runtime 安装脚本".to_string()),
             Err(error) => self.message = Some(format!("安装运行时失败：{error:#}")),
+        }
+    }
+
+    fn run_wxdb_init(&mut self) {
+        self.poll_wxdb_init_output();
+        if self.wxdb_init.is_some() {
+            self.message = Some("wxdb init 正在运行".to_string());
+            return;
+        }
+
+        match start_wxdb_init(&self.state) {
+            Ok(process) => {
+                self.append_terminal_line(format!("[gui] wxdb init 已启动 pid={}\n", process.pid));
+                self.wxdb_init = Some(process);
+                self.message = Some("wxdb init 已启动，输出会显示在 GUI 终端".to_string());
+            }
+            Err(error) => self.message = Some(format!("运行 wxdb init 失败：{error:#}")),
         }
     }
 
@@ -454,6 +479,29 @@ impl GuiApp {
         }
     }
 
+    fn poll_wxdb_init_output(&mut self) {
+        let mut lines = Vec::new();
+        let mut exit_status = None;
+        if let Some(process) = &mut self.wxdb_init {
+            lines.extend(process.output.try_iter());
+            match process.child.try_wait() {
+                Ok(Some(status)) => exit_status = Some(format!("{status}")),
+                Ok(None) => {}
+                Err(error) => exit_status = Some(format!("检查 wxdb init 状态失败：{error}")),
+            }
+        }
+
+        for line in lines {
+            self.append_terminal_line(line);
+        }
+
+        if let Some(status) = exit_status {
+            self.append_terminal_line(format!("[gui] wxdb init 已退出：{status}\n"));
+            self.wxdb_init = None;
+            self.refresh_status();
+        }
+    }
+
     fn append_terminal_line(&mut self, line: String) {
         self.terminal_output
             .push_str(&redact_secret_like_tokens(&line));
@@ -472,7 +520,9 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_agent_output();
-        let should_refresh_runtime = self.agent.is_some() || self.tab == Tab::Runtime;
+        self.poll_wxdb_init_output();
+        let should_refresh_runtime =
+            self.agent.is_some() || self.wxdb_init.is_some() || self.tab == Tab::Runtime;
         if should_refresh_runtime && self.last_status_refresh.elapsed() >= Duration::from_secs(1) {
             self.refresh_status();
             self.last_status_refresh = Instant::now();
@@ -509,6 +559,9 @@ impl eframe::App for GuiApp {
                 }
                 if ui.button("安装 Python Runtime").clicked() {
                     self.install_runtime();
+                }
+                if ui.button("运行 wxdb init").clicked() {
+                    self.run_wxdb_init();
                 }
                 if ui.button("启动主程序").clicked() {
                     self.start_agent();
@@ -1800,6 +1853,32 @@ fn start_agent(state: &AppState) -> Result<AgentProcess> {
     spawn_output_reader("stderr", stderr, sender);
 
     Ok(AgentProcess { child, output, pid })
+}
+
+fn start_wxdb_init(state: &AppState) -> Result<WxdbInitProcess> {
+    let wxdb = find_exe("wxdb");
+    if !wxdb.exists() {
+        return Err(anyhow!("wxdb 不存在: {}", wxdb.display()));
+    }
+
+    let mut command = Command::new(wxdb);
+    command
+        .arg("init")
+        .current_dir(&state.working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_command_window(&mut command);
+
+    let mut child = command.spawn().context("starting wxdb init")?;
+    let pid = child.id();
+    let stdout = child.stdout.take().context("capturing wxdb init stdout")?;
+    let stderr = child.stderr.take().context("capturing wxdb init stderr")?;
+    let (sender, output) = mpsc::channel();
+    spawn_output_reader("wxdb stdout", stdout, sender.clone());
+    spawn_output_reader("wxdb stderr", stderr, sender);
+
+    Ok(WxdbInitProcess { child, output, pid })
 }
 
 fn spawn_output_reader<R>(label: &'static str, reader: R, sender: mpsc::Sender<String>)
