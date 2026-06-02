@@ -34,6 +34,10 @@ fixed_hours = 2
 enabled = true
 # Only one successful summary request is allowed per room within this window.
 successful_request_cooldown_seconds = 300
+# Extra manual image cooldown, counted after successful_request_cooldown_seconds.
+# During this extra window manual summaries send text only and report remaining image cooldown.
+# Scheduled summaries are not affected.
+successful_image_cooldown_seconds = 0
 
 [manual_summary]
 # false: /总结 only sends text; add 图片/image/img to generate an image for that request.

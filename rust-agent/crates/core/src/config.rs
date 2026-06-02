@@ -199,6 +199,8 @@ pub struct RateLimitConfig {
     pub enabled: bool,
     #[serde(default = "default_successful_request_cooldown_seconds")]
     pub successful_request_cooldown_seconds: i64,
+    #[serde(default)]
+    pub successful_image_cooldown_seconds: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -253,6 +255,7 @@ impl Default for RateLimitConfig {
         Self {
             enabled: true,
             successful_request_cooldown_seconds: default_successful_request_cooldown_seconds(),
+            successful_image_cooldown_seconds: 0,
         }
     }
 }
@@ -663,6 +666,7 @@ mod tests {
         let cfg: RateLimitConfig = toml::from_str("").unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.successful_request_cooldown_seconds, 300);
+        assert_eq!(cfg.successful_image_cooldown_seconds, 0);
     }
 
     #[test]

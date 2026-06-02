@@ -249,6 +249,32 @@ async fn handle_platform_event(
         return Ok(());
     }
 
+    let mut pipeline_options = PipelineOptions::manual(config, command.image_token_present);
+    if pipeline_options.image_gen_enabled {
+        let last_image = store.get_last_image(&trigger.room_id)?;
+        if let Some(remaining) = image_cooldown_remaining(incoming.timestamp, last_image, config) {
+            pipeline_options.image_gen_enabled = false;
+            let message = format!(
+                "图片生成冷却中，剩余 {}，本次只生成文字总结。",
+                format_duration_zh(remaining)
+            );
+            info!(
+                room_id = %trigger.room_id,
+                remaining_seconds = remaining.num_seconds(),
+                "manual image generation skipped by image cooldown"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "manual image cooldown active room={} remaining_seconds={}",
+                    trigger.room_id,
+                    remaining.num_seconds()
+                ),
+            );
+            let _ = client.send_text(&trigger.room_id, &message).await;
+        }
+    }
+
     let range = TimeRangeCalculator::resolve_with_override(
         incoming.timestamp,
         last_trigger,
@@ -286,7 +312,11 @@ async fn handle_platform_event(
         &incoming,
         &trigger,
         &range,
-        PipelineOptions::manual(config, command.image_token_present),
+        pipeline_options,
+        Some(ImageCooldownRecorder {
+            store: store.clone(),
+            timestamp: incoming.timestamp,
+        }),
     )
     .await
     {
@@ -425,6 +455,7 @@ async fn run_scheduled_summaries(
             &trigger,
             &range,
             PipelineOptions::scheduled(config),
+            None,
         )
         .await
         {
@@ -465,6 +496,12 @@ struct PipelineOptions {
     send_disabled_message: bool,
 }
 
+#[derive(Clone)]
+struct ImageCooldownRecorder {
+    store: SqliteStateStore,
+    timestamp: DateTime<Utc>,
+}
+
 impl PipelineOptions {
     fn manual(config: &AgentConfig, image_token_present: bool) -> Self {
         let image_enabled_for_request =
@@ -496,6 +533,7 @@ async fn run_summary_pipeline(
     trigger: &TriggerMatch,
     range: &ResolvedTimeRange,
     options: PipelineOptions,
+    image_cooldown_recorder: Option<ImageCooldownRecorder>,
 ) -> Result<()> {
     if !options.text_summary_enabled && !options.image_gen_enabled {
         if options.send_disabled_message {
@@ -722,6 +760,7 @@ async fn run_summary_pipeline(
             trigger.room_id.clone(),
             llm_input,
             options.text_summary_enabled,
+            image_cooldown_recorder,
         );
         info!(
             room_id = %trigger.room_id,
@@ -873,6 +912,11 @@ async fn run_summary_pipeline(
                 )
                 .await?;
                 send_summary_image(config, client, &trigger.room_id, &artifact).await?;
+                record_image_cooldown_success(
+                    config,
+                    image_cooldown_recorder.as_ref(),
+                    &trigger.room_id,
+                )?;
             }
             Err(error) => {
                 let error_message = format_error_chain(&error);
@@ -926,10 +970,18 @@ fn spawn_background_image_pipeline(
     room_id: String,
     llm_input: String,
     text_summary_enabled: bool,
+    image_cooldown_recorder: Option<ImageCooldownRecorder>,
 ) {
     tokio::spawn(async move {
-        run_background_image_pipeline(config, sender, room_id, llm_input, text_summary_enabled)
-            .await;
+        run_background_image_pipeline(
+            config,
+            sender,
+            room_id,
+            llm_input,
+            text_summary_enabled,
+            image_cooldown_recorder,
+        )
+        .await;
     });
 }
 
@@ -939,8 +991,16 @@ async fn run_background_image_pipeline(
     room_id: String,
     llm_input: String,
     text_summary_enabled: bool,
+    image_cooldown_recorder: Option<ImageCooldownRecorder>,
 ) {
-    let result = run_background_image_pipeline_inner(&config, &sender, &room_id, &llm_input).await;
+    let result = run_background_image_pipeline_inner(
+        &config,
+        &sender,
+        &room_id,
+        &llm_input,
+        image_cooldown_recorder.as_ref(),
+    )
+    .await;
     if let Err(error) = result {
         let error_message = format_error_chain(&error);
         warn!(room_id = %room_id, error = %error_message, "background image pipeline failed");
@@ -974,6 +1034,7 @@ async fn run_background_image_pipeline_inner(
     sender: &PlatformSender,
     room_id: &str,
     llm_input: &str,
+    image_cooldown_recorder: Option<&ImageCooldownRecorder>,
 ) -> Result<()> {
     let llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
         .context("initializing LLM client for background image pipeline")?;
@@ -1053,6 +1114,7 @@ async fn run_background_image_pipeline_inner(
 
     let artifact = generate_summary_image(config, room_id, &image_prompt).await?;
     send_summary_image_with_sender(config, sender, room_id, &artifact).await?;
+    record_image_cooldown_success(config, image_cooldown_recorder, room_id)?;
     append_runtime_log(
         config,
         &format!("background image pipeline completed room={}", room_id),
@@ -1160,6 +1222,34 @@ async fn send_deferred_summary_text(
         ),
     );
     Ok(true)
+}
+
+fn record_image_cooldown_success(
+    config: &AgentConfig,
+    recorder: Option<&ImageCooldownRecorder>,
+    room_id: &str,
+) -> Result<()> {
+    let Some(recorder) = recorder else {
+        return Ok(());
+    };
+
+    recorder
+        .store
+        .set_last_image(room_id, recorder.timestamp)
+        .context("recording image cooldown state")?;
+    info!(
+        room_id = %room_id,
+        cooldown_started_at = %recorder.timestamp,
+        "image cooldown state recorded"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "image cooldown state recorded room={} cooldown_started_at={}",
+            room_id, recorder.timestamp
+        ),
+    );
+    Ok(())
 }
 
 fn progress_message(options: PipelineOptions) -> &'static str {
@@ -1293,6 +1383,24 @@ fn rate_limit_remaining(
     let last_success = last_success?;
     let cooldown = Duration::seconds(config.rate_limit.successful_request_cooldown_seconds);
     let elapsed = now - last_success;
+    (elapsed < cooldown).then_some(cooldown - elapsed)
+}
+
+fn image_cooldown_remaining(
+    now: DateTime<Utc>,
+    last_image_success: Option<DateTime<Utc>>,
+    config: &AgentConfig,
+) -> Option<Duration> {
+    if !config.rate_limit.enabled || config.rate_limit.successful_image_cooldown_seconds <= 0 {
+        return None;
+    }
+
+    let last_image_success = last_image_success?;
+    let summary_cooldown =
+        Duration::seconds(config.rate_limit.successful_request_cooldown_seconds.max(0));
+    let image_cooldown = Duration::seconds(config.rate_limit.successful_image_cooldown_seconds);
+    let cooldown = summary_cooldown + image_cooldown;
+    let elapsed = now - last_image_success;
     (elapsed < cooldown).then_some(cooldown - elapsed)
 }
 
@@ -1657,6 +1765,44 @@ mod tests {
         let now = last_success + Duration::seconds(300);
 
         assert!(rate_limit_remaining(now, Some(last_success), &config).is_none());
+    }
+
+    #[test]
+    fn image_cooldown_starts_after_summary_cooldown() {
+        let mut config = test_config();
+        config.rate_limit.successful_request_cooldown_seconds = 300;
+        config.rate_limit.successful_image_cooldown_seconds = 600;
+        let last_image_success = Utc.timestamp_opt(1_716_464_700, 0).unwrap();
+
+        let remaining = image_cooldown_remaining(
+            last_image_success + Duration::seconds(301),
+            Some(last_image_success),
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(remaining.num_seconds(), 599);
+        assert!(image_cooldown_remaining(
+            last_image_success + Duration::seconds(900),
+            Some(last_image_success),
+            &config
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn image_cooldown_is_disabled_when_extra_window_is_zero() {
+        let mut config = test_config();
+        config.rate_limit.successful_request_cooldown_seconds = 300;
+        config.rate_limit.successful_image_cooldown_seconds = 0;
+        let last_image_success = Utc.timestamp_opt(1_716_464_700, 0).unwrap();
+
+        assert!(image_cooldown_remaining(
+            last_image_success + Duration::seconds(1),
+            Some(last_image_success),
+            &config
+        )
+        .is_none());
     }
 
     #[test]

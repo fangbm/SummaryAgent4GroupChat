@@ -52,6 +52,9 @@ struct ConfigView {
     match_mode: String,
     whitelist_rooms: String,
     ignore_self: bool,
+    rate_limit_enabled: bool,
+    summary_cooldown_seconds: i64,
+    image_cooldown_seconds: i64,
     manual_image_by_default: bool,
     scheduled_enabled: bool,
     scheduled_hour: u32,
@@ -709,6 +712,9 @@ fn listen_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             multiline_field(ui, "触发词", &mut view.triggers, 5);
             ui.checkbox(&mut view.ignore_self, "忽略自己发送的消息");
             ui.checkbox(&mut view.manual_image_by_default, "手动总结默认生成图片");
+            ui.checkbox(&mut view.rate_limit_enabled, "启用手动总结冷却");
+            number_i64(ui, "总结指令冷却秒数", &mut view.summary_cooldown_seconds);
+            number_i64(ui, "图片额外冷却秒数", &mut view.image_cooldown_seconds);
             number_u32(ui, "历史读取最大条数", &mut view.history_max_messages);
         },
         |ui| {
@@ -939,6 +945,9 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             match_mode: format!("{:?}", config.listen.match_mode).to_ascii_lowercase(),
             whitelist_rooms: join_lines(&config.listen.whitelist_rooms),
             ignore_self: config.listen.ignore_self,
+            rate_limit_enabled: config.rate_limit.enabled,
+            summary_cooldown_seconds: config.rate_limit.successful_request_cooldown_seconds,
+            image_cooldown_seconds: config.rate_limit.successful_image_cooldown_seconds,
             manual_image_by_default: config.manual_summary.image_by_default,
             scheduled_enabled: config.scheduled_summary.enabled,
             scheduled_hour: config.scheduled_summary.local_hour,
@@ -995,6 +1004,14 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         match_mode: get_str(doc, "listen", "match_mode", "prefix"),
         whitelist_rooms: join_lines(&get_array(doc, "listen", "whitelist_rooms")),
         ignore_self: get_bool(doc, "listen", "ignore_self", true),
+        rate_limit_enabled: get_bool(doc, "rate_limit", "enabled", true),
+        summary_cooldown_seconds: get_i64(
+            doc,
+            "rate_limit",
+            "successful_request_cooldown_seconds",
+            300,
+        ),
+        image_cooldown_seconds: get_i64(doc, "rate_limit", "successful_image_cooldown_seconds", 0),
         manual_image_by_default: get_bool(doc, "manual_summary", "image_by_default", false),
         scheduled_enabled: get_bool(doc, "scheduled_summary", "enabled", true),
         scheduled_hour: get_u64(doc, "scheduled_summary", "local_hour", 22) as u32,
@@ -1069,6 +1086,19 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         &split_lines(&update.whitelist_rooms),
     );
     set_bool(listen, "ignore_self", update.ignore_self);
+
+    let rate_limit = table_mut(&mut doc, "rate_limit");
+    set_bool(rate_limit, "enabled", update.rate_limit_enabled);
+    set_int(
+        rate_limit,
+        "successful_request_cooldown_seconds",
+        update.summary_cooldown_seconds,
+    );
+    set_int(
+        rate_limit,
+        "successful_image_cooldown_seconds",
+        update.image_cooldown_seconds,
+    );
 
     set_bool(
         table_mut(&mut doc, "manual_summary"),
