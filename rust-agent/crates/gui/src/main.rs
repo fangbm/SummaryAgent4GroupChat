@@ -2003,9 +2003,9 @@ fn tail_file(path: &Path, max_bytes: u64) -> Result<String> {
     if start > 0 {
         reader.seek_relative(start as i64)?;
     }
-    let mut text = String::new();
-    reader.read_to_string(&mut text)?;
-    Ok(text)
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn format_bytes(bytes: u64) -> String {
