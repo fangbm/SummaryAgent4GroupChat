@@ -7,7 +7,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -103,11 +103,13 @@ struct GuiApp {
     view: ConfigView,
     validation: String,
     log_tail: String,
+    log_path_label: String,
     terminal_output: String,
     agent: Option<AgentProcess>,
     status: StatusView,
     tab: Tab,
     message: Option<String>,
+    last_status_refresh: Instant,
 }
 
 struct AgentProcess {
@@ -239,11 +241,13 @@ impl GuiApp {
             view,
             validation,
             log_tail: String::new(),
+            log_path_label: String::new(),
             terminal_output: "GUI 已就绪，主程序终端输出会显示在这里。\n".to_string(),
             agent: None,
             status: StatusView::default(),
             tab: Tab::Dashboard,
             message: None,
+            last_status_refresh: Instant::now(),
         };
         app.refresh_status();
         Ok(app)
@@ -288,9 +292,11 @@ impl GuiApp {
         };
         let output_dir = resolve_working_path(&self.state, &self.view.runtime_output_dir);
         let log_path = output_dir.join("wechat-summary-app.log");
+        let log_path_display = log_path.display().to_string();
+        self.log_path_label = log_path_display.clone();
         self.log_tail = tail_file(&log_path, 16 * 1024)
             .map(|text| redact_secret_like_tokens(&text))
-            .unwrap_or_else(|_| "暂无日志".to_string());
+            .unwrap_or_else(|error| format!("暂无日志\n路径：{log_path_display}\n原因：{error}"));
         self.status = StatusView {
             targets,
             app_ready: find_exe("wechat-summary-app").exists(),
@@ -464,7 +470,12 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_agent_output();
-        if self.agent.is_some() {
+        let should_refresh_runtime = self.agent.is_some() || self.tab == Tab::Runtime;
+        if should_refresh_runtime && self.last_status_refresh.elapsed() >= Duration::from_secs(1) {
+            self.refresh_status();
+            self.last_status_refresh = Instant::now();
+        }
+        if should_refresh_runtime {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
 
@@ -528,6 +539,7 @@ impl eframe::App for GuiApp {
                         ui,
                         &mut self.view,
                         &mut self.log_tail,
+                        &self.log_path_label,
                         &mut self.terminal_output,
                         self.agent.is_some(),
                     )
@@ -793,6 +805,7 @@ fn runtime_tab(
     ui: &mut egui::Ui,
     view: &mut ConfigView,
     log_tail: &mut String,
+    log_path_label: &str,
     terminal_output: &mut String,
     agent_running: bool,
 ) {
@@ -829,9 +842,13 @@ fn runtime_tab(
         terminal_output,
         pane_height,
         true,
+        TextRenderMode::Ansi,
     );
     ui.add_space(8.0);
-    ui.label("日志文件尾部");
+    ui.horizontal(|ui| {
+        ui.label("日志文件尾部");
+        ui.small(log_path_label);
+    });
     readonly_scroll_text(
         ui,
         "log-tail-scroll",
@@ -839,7 +856,14 @@ fn runtime_tab(
         log_tail,
         pane_height,
         false,
+        TextRenderMode::Plain,
     );
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TextRenderMode {
+    Plain,
+    Ansi,
 }
 
 fn readonly_scroll_text(
@@ -849,6 +873,7 @@ fn readonly_scroll_text(
     text: &str,
     height: f32,
     stick_to_bottom: bool,
+    render_mode: TextRenderMode,
 ) {
     let scroll_area = egui::ScrollArea::vertical()
         .id_salt(scroll_id)
@@ -859,14 +884,224 @@ fn readonly_scroll_text(
         ui.set_height(height);
         scroll_area.show(ui, |ui| {
             ui.push_id(label_id, |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(text).monospace())
-                        .wrap()
-                        .selectable(true),
-                );
+                let label = match render_mode {
+                    TextRenderMode::Plain => {
+                        egui::Label::new(egui::RichText::new(text).monospace())
+                    }
+                    TextRenderMode::Ansi => egui::Label::new(ansi_layout_job(ui, text)),
+                }
+                .wrap()
+                .selectable(true);
+                ui.add(label);
             });
         });
     });
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AnsiTextStyle {
+    foreground: Option<egui::Color32>,
+    bold: bool,
+}
+
+fn ansi_layout_job(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let mut style = AnsiTextStyle::default();
+    let mut index = 0;
+    let mut segment_start = 0;
+    let bytes = text.as_bytes();
+
+    while index < bytes.len() {
+        if bytes[index] == b'\x1b' && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+            if let Some(end_offset) = text[index + 2..].bytes().position(|byte| byte == b'm') {
+                append_ansi_segment(ui, &mut job, &style, &text[segment_start..index]);
+                let params = &text[index + 2..index + 2 + end_offset];
+                apply_ansi_sgr(params, &mut style);
+                index += 2 + end_offset + 1;
+                segment_start = index;
+                continue;
+            }
+        }
+
+        index += text[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+
+    append_ansi_segment(ui, &mut job, &style, &text[segment_start..]);
+    job
+}
+
+fn append_ansi_segment(
+    ui: &egui::Ui,
+    job: &mut egui::text::LayoutJob,
+    style: &AnsiTextStyle,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    let mut color = style
+        .foreground
+        .unwrap_or_else(|| ui.visuals().text_color());
+    if style.bold && style.foreground.is_none() {
+        color = egui::Color32::from_rgb(31, 41, 55);
+    }
+
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Monospace.resolve(ui.style()),
+            color,
+            ..Default::default()
+        },
+    );
+}
+
+fn apply_ansi_sgr(params: &str, style: &mut AnsiTextStyle) {
+    let codes: Vec<i32> = if params.trim().is_empty() {
+        vec![0]
+    } else {
+        params
+            .split(';')
+            .map(|part| part.parse::<i32>().unwrap_or(0))
+            .collect()
+    };
+
+    let mut index = 0;
+    while index < codes.len() {
+        let code = codes[index];
+        match code {
+            0 => *style = AnsiTextStyle::default(),
+            1 => style.bold = true,
+            22 => style.bold = false,
+            30..=37 | 90..=97 => {
+                style.foreground = Some(ansi_basic_color(code, style.bold));
+            }
+            38 if index + 1 < codes.len() => match codes[index + 1] {
+                2 if index + 4 < codes.len() => {
+                    style.foreground = Some(egui::Color32::from_rgb(
+                        codes[index + 2].clamp(0, 255) as u8,
+                        codes[index + 3].clamp(0, 255) as u8,
+                        codes[index + 4].clamp(0, 255) as u8,
+                    ));
+                    index += 4;
+                }
+                5 if index + 2 < codes.len() => {
+                    style.foreground = Some(ansi_256_color(codes[index + 2].clamp(0, 255) as u8));
+                    index += 2;
+                }
+                _ => {}
+            },
+            39 => style.foreground = None,
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn ansi_basic_color(code: i32, bold: bool) -> egui::Color32 {
+    let bright = bold || code >= 90;
+    match code % 10 {
+        0 => {
+            if bright {
+                egui::Color32::from_rgb(107, 114, 128)
+            } else {
+                egui::Color32::from_rgb(55, 65, 81)
+            }
+        }
+        1 => {
+            if bright {
+                egui::Color32::from_rgb(239, 68, 68)
+            } else {
+                egui::Color32::from_rgb(220, 38, 38)
+            }
+        }
+        2 => {
+            if bright {
+                egui::Color32::from_rgb(34, 197, 94)
+            } else {
+                egui::Color32::from_rgb(22, 163, 74)
+            }
+        }
+        3 => {
+            if bright {
+                egui::Color32::from_rgb(234, 179, 8)
+            } else {
+                egui::Color32::from_rgb(202, 138, 4)
+            }
+        }
+        4 => {
+            if bright {
+                egui::Color32::from_rgb(59, 130, 246)
+            } else {
+                egui::Color32::from_rgb(37, 99, 235)
+            }
+        }
+        5 => {
+            if bright {
+                egui::Color32::from_rgb(217, 70, 239)
+            } else {
+                egui::Color32::from_rgb(192, 38, 211)
+            }
+        }
+        6 => {
+            if bright {
+                egui::Color32::from_rgb(6, 182, 212)
+            } else {
+                egui::Color32::from_rgb(8, 145, 178)
+            }
+        }
+        7 => {
+            if bright {
+                egui::Color32::from_rgb(243, 244, 246)
+            } else {
+                egui::Color32::from_rgb(156, 163, 175)
+            }
+        }
+        _ => egui::Color32::from_rgb(31, 41, 55),
+    }
+}
+
+fn ansi_256_color(index: u8) -> egui::Color32 {
+    const BASIC: [egui::Color32; 16] = [
+        egui::Color32::from_rgb(55, 65, 81),
+        egui::Color32::from_rgb(220, 38, 38),
+        egui::Color32::from_rgb(22, 163, 74),
+        egui::Color32::from_rgb(202, 138, 4),
+        egui::Color32::from_rgb(37, 99, 235),
+        egui::Color32::from_rgb(192, 38, 211),
+        egui::Color32::from_rgb(8, 145, 178),
+        egui::Color32::from_rgb(156, 163, 175),
+        egui::Color32::from_rgb(107, 114, 128),
+        egui::Color32::from_rgb(239, 68, 68),
+        egui::Color32::from_rgb(34, 197, 94),
+        egui::Color32::from_rgb(234, 179, 8),
+        egui::Color32::from_rgb(59, 130, 246),
+        egui::Color32::from_rgb(217, 70, 239),
+        egui::Color32::from_rgb(6, 182, 212),
+        egui::Color32::from_rgb(243, 244, 246),
+    ];
+
+    match index {
+        0..=15 => BASIC[index as usize],
+        16..=231 => {
+            let cube_index = index - 16;
+            let levels = [0, 95, 135, 175, 215, 255];
+            let red = levels[(cube_index / 36) as usize];
+            let green = levels[((cube_index % 36) / 6) as usize];
+            let blue = levels[(cube_index % 6) as usize];
+            egui::Color32::from_rgb(red, green, blue)
+        }
+        232..=255 => {
+            let value = 8 + (index - 232) * 10;
+            egui::Color32::from_gray(value)
+        }
+    }
 }
 
 fn two_columns(
