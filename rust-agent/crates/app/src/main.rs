@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -24,6 +24,9 @@ use wechat_summary_storage::SqliteStateStore;
 use crate::platform::{PlatformClient, PlatformEvent, PlatformHistoryMessage, PlatformSender};
 
 const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
+const RECENT_OBSERVED_WINDOW_HOURS: i64 = 6;
+const RECENT_OBSERVED_MAX_MESSAGES: usize = 5_000;
+const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,6 +57,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
         .with_context(|| format!("starting {} platform client", config.platform.kind.as_str()))?;
     let platform_rooms = client.configured_rooms(&config);
     let mut recent_trigger_attempts = RecentTriggerAttempts::default();
+    let mut recent_observed_messages = RecentObservedMessages::default();
 
     info!(
         platform = client.kind().as_str(),
@@ -107,6 +111,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 &matcher,
                 &client,
                 &mut recent_trigger_attempts,
+                &mut recent_observed_messages,
                 event,
             )
             .await?;
@@ -229,6 +234,7 @@ async fn handle_platform_event(
     matcher: &TriggerMatcher,
     client: &PlatformClient,
     recent_trigger_attempts: &mut RecentTriggerAttempts,
+    recent_observed_messages: &mut RecentObservedMessages,
     event: PlatformEvent,
 ) -> Result<()> {
     let event_preview = event.content.chars().take(40).collect::<String>();
@@ -248,6 +254,7 @@ async fn handle_platform_event(
         ),
     );
     let incoming = IncomingMessage::from(event);
+    recent_observed_messages.record(&incoming, Utc::now());
     let Some(trigger) = matcher.match_message(&incoming) else {
         append_runtime_log(
             config,
@@ -388,6 +395,7 @@ async fn handle_platform_event(
             store: store.clone(),
             timestamp: incoming.timestamp,
         }),
+        Some(recent_observed_messages),
     )
     .await
     {
@@ -458,6 +466,52 @@ fn trigger_attempt_key(trigger: &TriggerMatch) -> String {
         trigger.room_id.trim(),
         trigger.trigger_content.trim()
     )
+}
+
+#[derive(Debug, Default)]
+struct RecentObservedMessages {
+    messages: VecDeque<IncomingMessage>,
+}
+
+impl RecentObservedMessages {
+    fn record(&mut self, message: &IncomingMessage, now: DateTime<Utc>) {
+        if message.msg_type != "text" || message.content.trim().is_empty() {
+            return;
+        }
+
+        self.messages.push_back(message.clone());
+        self.prune(now);
+    }
+
+    fn count_user_text_in_range(
+        &self,
+        room_id: &str,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        incoming: &IncomingMessage,
+    ) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| {
+                message.room_id == room_id
+                    && message.timestamp >= since
+                    && message.timestamp <= until
+                    && message.msg_type == "text"
+                    && !message.is_self
+                    && !message.content.trim().is_empty()
+                    && !is_current_incoming_message(message, incoming)
+                    && !is_agent_status_content(&message.content)
+            })
+            .count()
+    }
+
+    fn prune(&mut self, now: DateTime<Utc>) {
+        let cutoff = now - Duration::hours(RECENT_OBSERVED_WINDOW_HOURS);
+        self.messages.retain(|message| message.timestamp >= cutoff);
+        while self.messages.len() > RECENT_OBSERVED_MAX_MESSAGES {
+            self.messages.pop_front();
+        }
+    }
 }
 
 async fn run_scheduled_summaries(
@@ -536,6 +590,7 @@ async fn run_scheduled_summaries(
             &trigger,
             &range,
             PipelineOptions::scheduled(config),
+            None,
             None,
         )
         .await
@@ -628,6 +683,7 @@ async fn run_summary_pipeline(
     range: &ResolvedTimeRange,
     options: PipelineOptions,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
+    recent_observed_messages: Option<&RecentObservedMessages>,
 ) -> Result<PipelineOutcome> {
     if !options.text_summary_enabled && !options.image_gen_enabled {
         if options.send_disabled_message {
@@ -683,6 +739,87 @@ async fn run_summary_pipeline(
         )
         .await
         .context("querying platform chat history")?;
+    if history.is_empty() {
+        let observed_count = recent_observed_messages
+            .map(|recent| {
+                recent.count_user_text_in_range(
+                    &trigger.room_id,
+                    range.since,
+                    range.until,
+                    incoming,
+                )
+            })
+            .unwrap_or(0);
+        if observed_count > 0 {
+            warn!(
+                room_id = %trigger.room_id,
+                observed_count,
+                since = %range.since,
+                until = %range.until,
+                "platform history returned empty despite recent observed messages"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "history empty but recent listener saw messages room={} observed_count={} since={} until={}",
+                    trigger.room_id, observed_count, range.since, range.until
+                ),
+            );
+            for (retry_index, delay_ms) in EMPTY_HISTORY_RETRY_DELAYS_MS.iter().copied().enumerate()
+            {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "history empty retry scheduled room={} retry={} delay_ms={}",
+                        trigger.room_id,
+                        retry_index + 1,
+                        delay_ms
+                    ),
+                );
+                tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
+                history = client
+                    .query_text_messages(
+                        &trigger.room_id,
+                        incoming.room_name.as_deref(),
+                        range.since,
+                        range.until,
+                        history_query_limit,
+                    )
+                    .await
+                    .context("retrying platform chat history after suspicious empty result")?;
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "history empty retry completed room={} retry={} history_len={}",
+                        trigger.room_id,
+                        retry_index + 1,
+                        history.len()
+                    ),
+                );
+                if !history.is_empty() {
+                    break;
+                }
+            }
+
+            if history.is_empty() {
+                client
+                    .send_text(
+                        &trigger.room_id,
+                        "历史读取暂时为空，但刚刚监听到该群有消息。wxdb 可能还在同步，请稍后再试。",
+                    )
+                    .await
+                    .context("sending suspicious empty-history message")?;
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "history suspicious empty after retries room={} observed_count={}",
+                        trigger.room_id, observed_count
+                    ),
+                );
+                return Ok(PipelineOutcome::NoSummary);
+            }
+        }
+    }
     let platform_history_len = history.len();
     let first_platform_ts = history.iter().map(|message| message.timestamp).min();
     let last_platform_ts = history.iter().map(|message| message.timestamp).max();
@@ -1574,12 +1711,23 @@ fn is_current_trigger_message(
         && (message.sender_id == incoming.sender_id || message.is_self)
 }
 
+fn is_current_incoming_message(message: &IncomingMessage, incoming: &IncomingMessage) -> bool {
+    message.timestamp == incoming.timestamp
+        && message.content.trim() == incoming.content.trim()
+        && message.sender_id == incoming.sender_id
+}
+
 fn is_agent_status_message(message: &PlatformHistoryMessage) -> bool {
-    let content = message.content.trim();
+    is_agent_status_content(&message.content)
+}
+
+fn is_agent_status_content(content: &str) -> bool {
+    let content = content.trim();
     content.starts_with("收到 /总结")
         || content.starts_with("收到 #总结")
         || content.starts_with("总结失败：")
         || content.starts_with("这段时间没有可总结的文本聊天记录")
+        || content.starts_with("历史读取暂时为空")
         || content.starts_with("当前配置未开启文字总结或图片生成")
         || content.starts_with("群聊总结（")
 }
@@ -1703,6 +1851,93 @@ mod tests {
         };
 
         assert!(is_agent_status_message(&message));
+    }
+
+    #[test]
+    fn recent_observed_messages_counts_only_real_user_text_in_range() {
+        let room = "paper2galgame用户群2";
+        let base = Utc.with_ymd_and_hms(2026, 6, 2, 14, 30, 0).unwrap();
+        let incoming = incoming_message(room, "wxid_self", "/总结", base + Duration::seconds(60));
+        let mut recent = RecentObservedMessages::default();
+
+        recent.record(
+            &incoming_message(
+                room,
+                "wxid_user",
+                "终于打开了（",
+                base + Duration::seconds(10),
+            ),
+            base + Duration::seconds(10),
+        );
+        recent.record(
+            &incoming_message(
+                "other-room",
+                "wxid_user",
+                "隔壁消息",
+                base + Duration::seconds(11),
+            ),
+            base + Duration::seconds(11),
+        );
+        recent.record(&incoming, base + Duration::seconds(60));
+        recent.record(
+            &incoming_message(
+                room,
+                "wxid_bot",
+                "收到 /总结，正在整理文字总结。",
+                base + Duration::seconds(61),
+            ),
+            base + Duration::seconds(61),
+        );
+
+        assert_eq!(
+            recent.count_user_text_in_range(room, base, base + Duration::seconds(60), &incoming),
+            1
+        );
+    }
+
+    #[test]
+    fn recent_observed_messages_prunes_old_events() {
+        let room = "paper2galgame用户群2";
+        let now = Utc.with_ymd_and_hms(2026, 6, 2, 14, 30, 0).unwrap();
+        let mut recent = RecentObservedMessages::default();
+        let incoming = incoming_message(room, "wxid_self", "/总结", now);
+
+        recent.record(
+            &incoming_message(
+                room,
+                "wxid_old",
+                "很久之前的消息",
+                now - Duration::hours(RECENT_OBSERVED_WINDOW_HOURS + 1),
+            ),
+            now,
+        );
+        recent.record(
+            &incoming_message(room, "wxid_user", "最近的消息", now - Duration::minutes(1)),
+            now,
+        );
+
+        assert_eq!(
+            recent.count_user_text_in_range(room, now - Duration::hours(12), now, &incoming),
+            1
+        );
+    }
+
+    fn incoming_message(
+        room_id: &str,
+        sender_id: &str,
+        content: &str,
+        timestamp: DateTime<Utc>,
+    ) -> IncomingMessage {
+        IncomingMessage {
+            room_id: room_id.to_string(),
+            room_name: Some(room_id.to_string()),
+            sender_id: sender_id.to_string(),
+            sender_name: None,
+            content: content.to_string(),
+            msg_type: "text".to_string(),
+            timestamp,
+            is_self: false,
+        }
     }
 
     #[test]
