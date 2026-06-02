@@ -71,6 +71,7 @@ struct ConfigView {
     llm_provider: String,
     llm_api_key_env: String,
     llm_base_url_env: String,
+    llm_model: String,
     llm_model_env: String,
     llm_timeout: u64,
     llm_max_tokens: u32,
@@ -771,7 +772,8 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
                 "LLM Base URL 环境变量/直接值",
                 &mut view.llm_base_url_env,
             );
-            text_field(ui, "LLM Model 环境变量/直接值", &mut view.llm_model_env);
+            text_field(ui, "模型名称", &mut view.llm_model);
+            text_field(ui, "模型环境变量", &mut view.llm_model_env);
             number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
             number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
             number_u32(ui, "LLM 最大输入字符数", &mut view.llm_max_input_chars);
@@ -1152,6 +1154,33 @@ fn number_i64(ui: &mut egui::Ui, label: &str, value: &mut i64) {
     });
 }
 
+fn split_llm_model_fields(model: Option<String>, model_env: String) -> (String, String) {
+    let model = model.unwrap_or_default().trim().to_string();
+    if !model.is_empty() {
+        return (model, model_env);
+    }
+
+    let trimmed_env = model_env.trim();
+    if should_treat_model_env_as_model_name(trimmed_env) {
+        (trimmed_env.to_string(), "LLM_MODEL".to_string())
+    } else {
+        (String::new(), model_env)
+    }
+}
+
+fn should_treat_model_env_as_model_name(value: &str) -> bool {
+    if value.is_empty() || value == "LLM_MODEL" || env::var(value).is_ok() {
+        return false;
+    }
+
+    value.chars().any(|ch| ch.is_ascii_lowercase())
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn load_config_view(state: &AppState) -> Result<(ConfigView, String)> {
     let text = fs::read_to_string(&state.config_path)
         .with_context(|| format!("reading {}", state.config_path.display()))?;
@@ -1170,6 +1199,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         let history_max_messages = config.history_message_limit().min(u32::MAX as usize) as u32;
         let llm_request_body_overrides =
             request_body_overrides_to_json(&config.llm.request_body_overrides);
+        let (llm_model, llm_model_env) =
+            split_llm_model_fields(config.llm.model, config.llm.model_env);
         return ConfigView {
             platform_kind: config.platform.kind.as_str().to_string(),
             wx_groups: join_lines(&config.wx4py.groups),
@@ -1201,7 +1232,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             llm_provider: config.llm.provider,
             llm_api_key_env: config.llm.api_key_env,
             llm_base_url_env: config.llm.base_url_env,
-            llm_model_env: config.llm.model_env,
+            llm_model,
+            llm_model_env,
             llm_timeout: config.llm.timeout_seconds,
             llm_max_tokens: config.llm.max_output_tokens,
             llm_max_input_chars: config.privacy.max_chars_to_llm.min(u32::MAX as usize) as u32,
@@ -1219,6 +1251,11 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             runtime_cleanup_days: config.runtime.cleanup_after_days,
         };
     }
+
+    let (llm_model, llm_model_env) = split_llm_model_fields(
+        non_empty_string(get_str(doc, "llm", "model", "")),
+        get_str(doc, "llm", "model_env", "LLM_MODEL"),
+    );
 
     ConfigView {
         platform_kind: get_str(doc, "platform", "kind", "wx"),
@@ -1272,7 +1309,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         llm_provider: get_str(doc, "llm", "provider", "openai_compatible"),
         llm_api_key_env: get_str(doc, "llm", "api_key_env", "LLM_API_KEY"),
         llm_base_url_env: get_str(doc, "llm", "base_url_env", "LLM_BASE_URL"),
-        llm_model_env: get_str(doc, "llm", "model_env", "LLM_MODEL"),
+        llm_model,
+        llm_model_env,
         llm_timeout: get_u64(doc, "llm", "timeout_seconds", 120),
         llm_max_tokens: get_u64(doc, "llm", "max_output_tokens", 2000) as u32,
         llm_max_input_chars: get_u64(doc, "privacy", "max_chars_to_llm", 20_000)
@@ -1383,6 +1421,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     set_str(llm, "provider", &update.llm_provider);
     set_str(llm, "api_key_env", &update.llm_api_key_env);
     set_str(llm, "base_url_env", &update.llm_base_url_env);
+    if update.llm_model.trim().is_empty() {
+        remove_key(llm, "model");
+    } else {
+        set_str(llm, "model", update.llm_model.trim());
+    }
     set_str(llm, "model_env", &update.llm_model_env);
     set_int(llm, "timeout_seconds", update.llm_timeout as i64);
     set_int(llm, "max_output_tokens", update.llm_max_tokens as i64);
