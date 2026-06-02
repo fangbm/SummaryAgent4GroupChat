@@ -320,12 +320,22 @@ async fn handle_platform_event(
     )
     .await
     {
-        Ok(()) => {
+        Ok(PipelineOutcome::SummaryProduced) => {
             store.set_last_trigger(&trigger.room_id, incoming.timestamp)?;
             info!(room_id = %trigger.room_id, "summary pipeline completed");
             append_runtime_log(
                 config,
                 &format!("pipeline completed room={}", trigger.room_id),
+            );
+        }
+        Ok(PipelineOutcome::NoSummary) => {
+            info!(room_id = %trigger.room_id, "summary pipeline completed without summary output");
+            append_runtime_log(
+                config,
+                &format!(
+                    "pipeline completed without summary room={}",
+                    trigger.room_id
+                ),
             );
         }
         Err(error) => {
@@ -459,12 +469,19 @@ async fn run_scheduled_summaries(
         )
         .await
         {
-            Ok(()) => {
+            Ok(PipelineOutcome::SummaryProduced) => {
                 store.set_last_trigger(&room, now)?;
                 info!(room_id = %room, "scheduled summary pipeline completed");
                 append_runtime_log(
                     config,
                     &format!("scheduled pipeline completed room={}", room),
+                );
+            }
+            Ok(PipelineOutcome::NoSummary) => {
+                info!(room_id = %room, "scheduled summary pipeline completed without summary output");
+                append_runtime_log(
+                    config,
+                    &format!("scheduled pipeline completed without summary room={}", room),
                 );
             }
             Err(error) => {
@@ -502,6 +519,12 @@ struct ImageCooldownRecorder {
     timestamp: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PipelineOutcome {
+    SummaryProduced,
+    NoSummary,
+}
+
 impl PipelineOptions {
     fn manual(config: &AgentConfig, image_token_present: bool) -> Self {
         let image_enabled_for_request =
@@ -534,7 +557,7 @@ async fn run_summary_pipeline(
     range: &ResolvedTimeRange,
     options: PipelineOptions,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
-) -> Result<()> {
+) -> Result<PipelineOutcome> {
     if !options.text_summary_enabled && !options.image_gen_enabled {
         if options.send_disabled_message {
             client
@@ -542,7 +565,7 @@ async fn run_summary_pipeline(
                 .await
                 .context("sending disabled pipeline message")?;
         }
-        return Ok(());
+        return Ok(PipelineOutcome::NoSummary);
     }
 
     if options.send_progress {
@@ -560,7 +583,7 @@ async fn run_summary_pipeline(
             )
             .await
             .context("sending privacy block message")?;
-        return Ok(());
+        return Ok(PipelineOutcome::NoSummary);
     }
 
     let history_message_limit = config.history_message_limit();
@@ -670,7 +693,7 @@ async fn run_summary_pipeline(
             .send_text(&trigger.room_id, "这段时间没有可总结的文本聊天记录。")
             .await
             .context("sending empty-history message")?;
-        return Ok(());
+        return Ok(PipelineOutcome::NoSummary);
     }
 
     let privacy = PrivacyFilter::new(config.privacy.clone());
@@ -770,7 +793,7 @@ async fn run_summary_pipeline(
             config,
             &format!("manual image pipeline spawned room={}", trigger.room_id),
         );
-        return Ok(());
+        return Ok(PipelineOutcome::SummaryProduced);
     }
 
     if options.image_gen_enabled {
@@ -961,7 +984,7 @@ async fn run_summary_pipeline(
     )
     .await?;
 
-    Ok(())
+    Ok(PipelineOutcome::SummaryProduced)
 }
 
 fn spawn_background_image_pipeline(

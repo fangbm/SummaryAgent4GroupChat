@@ -372,6 +372,11 @@ fn query_text_messages_via_builtin_wxdb(
         unknown_shards = ?result.meta.unknown_shards,
         "builtin wxdb history completed"
     );
+    if result.messages.is_empty() {
+        if let Some(reason) = empty_builtin_wxdb_result_uncertain_reason(&result) {
+            return Err(Wx4pyError::WxCli(reason));
+        }
+    }
 
     result
         .messages
@@ -400,6 +405,39 @@ fn query_text_messages_via_builtin_wxdb(
             })
         })
         .collect()
+}
+
+fn empty_builtin_wxdb_result_uncertain_reason(
+    result: &wechat_summary_wxdb::HistoryResult,
+) -> Option<String> {
+    if !result.messages.is_empty() {
+        return None;
+    }
+
+    let mut reasons = result.meta.warnings.clone();
+    reasons.extend(
+        result
+            .meta
+            .unknown_shards
+            .iter()
+            .map(|shard| format!("磁盘存在但没有密钥的消息分片: {shard}")),
+    );
+    if reasons.is_empty() {
+        return None;
+    }
+
+    const MAX_REASON_CHARS: usize = 900;
+    let mut reason = reasons.join(" | ");
+    if reason.chars().count() > MAX_REASON_CHARS {
+        reason = reason
+            .chars()
+            .take(MAX_REASON_CHARS)
+            .chain("...".chars())
+            .collect();
+    }
+    Some(format!(
+        "builtin wxdb returned no messages, but some WeChat database candidates were not fully readable; cannot confirm the chat is empty: {reason}"
+    ))
 }
 
 fn query_builtin_wxdb_history(
