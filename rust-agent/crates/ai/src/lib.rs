@@ -500,15 +500,53 @@ fn image_caption_payload(
 }
 
 fn image_data_url_from_bytes(path: Option<&Path>, bytes: &[u8]) -> Result<String, AiError> {
-    let mime = image_mime_type(path, bytes).ok_or_else(|| {
+    if let Some(mime) = image_mime_type(path, bytes) {
+        let encoded = general_purpose::STANDARD.encode(bytes);
+        return Ok(format!("data:{mime};base64,{encoded}"));
+    }
+    convert_image_to_jpeg_data_url(path, bytes)
+}
+
+fn convert_image_to_jpeg_data_url(path: Option<&Path>, bytes: &[u8]) -> Result<String, AiError> {
+    let source = image_source_label(path);
+    let decoded = image::load_from_memory(bytes).map_err(|error| {
         AiError::InvalidResponse(format!(
-            "unsupported image format for captioning: {}",
-            path.map(|path| path.display().to_string())
-                .unwrap_or_else(|| "downloaded image".to_string())
+            "unsupported image format for captioning: {source}; jpeg fallback failed: {error}"
         ))
     })?;
-    let encoded = general_purpose::STANDARD.encode(bytes);
-    Ok(format!("data:{mime};base64,{encoded}"))
+    let rgb = decoded.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    let mut encoded = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 90);
+    encoder
+        .encode(
+            &rgb,
+            width,
+            height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|error| {
+            AiError::InvalidResponse(format!(
+                "unsupported image format for captioning: {source}; jpeg fallback encode failed: {error}"
+            ))
+        })?;
+    info!(
+        source = %source,
+        input_bytes = bytes.len(),
+        output_bytes = encoded.len(),
+        width,
+        height,
+        "image caption unsupported image converted to jpeg"
+    );
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        general_purpose::STANDARD.encode(encoded)
+    ))
+}
+
+fn image_source_label(path: Option<&Path>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "downloaded image".to_string())
 }
 
 fn validate_image_data_url(data_url: &str) -> Result<(), AiError> {
@@ -1361,18 +1399,36 @@ mod tests {
     }
 
     #[test]
-    fn image_data_url_accepts_static_gif_and_rejects_animated_gif() {
+    fn image_data_url_accepts_static_gif_and_marks_animated_gif_unsupported() {
         let static_gif =
             b"GIF89a\x01\x00\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00;";
         let animated_gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00;";
 
         let static_data_url = image_data_url_from_bytes(None, static_gif).unwrap();
         assert!(static_data_url.starts_with("data:image/gif;base64,"));
-        assert!(image_data_url_from_bytes(None, animated_gif).is_err());
+        assert_eq!(image_mime_type(None, animated_gif), None);
     }
 
     #[test]
-    fn image_data_url_rejects_bmp() {
+    fn image_data_url_converts_unsupported_decodable_images_to_jpeg() {
+        let image = image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0]));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut cursor, image::ImageFormat::Bmp)
+            .unwrap();
+        let bmp = cursor.into_inner();
+
+        assert_eq!(
+            image_mime_type(Some(std::path::Path::new("image.bmp")), &bmp),
+            None
+        );
+        let data_url =
+            image_data_url_from_bytes(Some(std::path::Path::new("image.bmp")), &bmp).unwrap();
+        assert!(data_url.starts_with("data:image/jpeg;base64,"));
+    }
+
+    #[test]
+    fn image_data_url_rejects_invalid_unsupported_images() {
         assert!(
             image_data_url_from_bytes(Some(std::path::Path::new("image.bmp")), b"BM\x00\x00")
                 .is_err()
