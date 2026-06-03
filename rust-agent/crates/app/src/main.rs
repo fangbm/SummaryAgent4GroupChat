@@ -2,7 +2,8 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{self, Write},
+    path::PathBuf,
     time::Duration as StdDuration,
 };
 
@@ -12,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
 use wechat_summary_ai::{
     AiError, OpenAiCompatibleLlm, OpenAiImageClient, OpenAiVisionCaptionClient,
 };
@@ -50,6 +51,8 @@ async fn run_agent(config_path: &str) -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&config.runtime.log_level))
+        .with_writer(RuntimeTraceWriter::new(&config))
+        .with_ansi(false)
         .init();
 
     append_runtime_log(&config, "agent startup started");
@@ -215,6 +218,57 @@ fn append_runtime_log(config: &AgentConfig, message: &str) {
     let path = output_dir.join("wechat-summary-app.log");
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{} {}", Utc::now().to_rfc3339(), message);
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeTraceWriter {
+    path: PathBuf,
+}
+
+impl RuntimeTraceWriter {
+    fn new(config: &AgentConfig) -> Self {
+        let output_dir = std::path::Path::new(&config.runtime.output_dir);
+        let _ = fs::create_dir_all(output_dir);
+        Self {
+            path: output_dir.join("wechat-summary-app.log"),
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for RuntimeTraceWriter {
+    type Writer = RuntimeTraceGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RuntimeTraceGuard {
+            file: OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .ok(),
+        }
+    }
+}
+
+struct RuntimeTraceGuard {
+    file: Option<fs::File>,
+}
+
+impl Write for RuntimeTraceGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _ = io::stdout().write_all(buf);
+        if let Some(file) = &mut self.file {
+            let _ = file.write_all(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let _ = io::stdout().flush();
+        if let Some(file) = &mut self.file {
+            let _ = file.flush();
+        }
+        Ok(())
     }
 }
 

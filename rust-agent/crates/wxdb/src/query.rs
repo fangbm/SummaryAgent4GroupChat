@@ -4,6 +4,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::cache::{CacheMode, DbCache};
 use crate::config::{self, RuntimeConfig};
@@ -108,12 +109,41 @@ pub fn query_history_with_config(
     let mut errors = Vec::new();
     let mut missing_key_store_errors = Vec::new();
     let mut global_warnings = Vec::new();
+    let query_started = Instant::now();
+
+    tracing::info!(
+        chat_name = %query.chat_name,
+        since = ?query.since,
+        until = ?query.until,
+        limit = query.limit,
+        text_only = query.text_only,
+        msg_types = ?query.msg_types,
+        media_decode_limit = ?query.media_decode_limit,
+        db_dirs = config.db_dirs.len(),
+        "wxdb query started"
+    );
 
     for db_dir in &config.db_dirs {
+        let store_started = Instant::now();
+        tracing::info!(
+            db_dir = %db_dir.display(),
+            chat_name = %query.chat_name,
+            "wxdb store query started"
+        );
         match query_history_in_store(config, db_dir, &query) {
             Ok(mut result) => {
                 result.meta.candidates_scanned = config.db_dirs.len();
                 result.meta.db_dir = Some(db_dir.clone());
+                tracing::info!(
+                    db_dir = %db_dir.display(),
+                    chat_name = %query.chat_name,
+                    count = result.count,
+                    shards_scanned = result.meta.shards_scanned,
+                    shards_hit = result.meta.shards_hit,
+                    warnings = result.meta.warnings.len(),
+                    elapsed_ms = store_started.elapsed().as_millis(),
+                    "wxdb store query completed"
+                );
                 if result.count > best.as_ref().map(|current| current.count).unwrap_or(0) {
                     best = Some(result);
                 } else if result.count == 0 && best.is_none() {
@@ -122,6 +152,13 @@ pub fn query_history_with_config(
             }
             Err(error) => {
                 let error = format!("{}: {error:#}", db_dir.display());
+                tracing::warn!(
+                    db_dir = %db_dir.display(),
+                    chat_name = %query.chat_name,
+                    error = %error,
+                    elapsed_ms = store_started.elapsed().as_millis(),
+                    "wxdb store query failed"
+                );
                 if is_missing_db_key_error(&error) {
                     missing_key_store_errors.push(error);
                 } else {
@@ -134,10 +171,23 @@ pub fn query_history_with_config(
     if let Some(mut result) = best {
         global_warnings.extend(errors);
         result.meta.warnings.extend(global_warnings);
+        tracing::info!(
+            chat_name = %query.chat_name,
+            count = result.count,
+            db_dir = ?result.meta.db_dir,
+            elapsed_ms = query_started.elapsed().as_millis(),
+            "wxdb query completed"
+        );
         return Ok(result);
     }
 
     errors.extend(missing_key_store_errors);
+    tracing::warn!(
+        chat_name = %query.chat_name,
+        elapsed_ms = query_started.elapsed().as_millis(),
+        errors = errors.len(),
+        "wxdb query failed for all stores"
+    );
     anyhow::bail!("所有 WeChat 数据库候选均查询失败: {}", errors.join(" | "))
 }
 
@@ -150,18 +200,44 @@ fn query_history_in_store(
     db_dir: &Path,
     query: &HistoryQuery,
 ) -> Result<HistoryResult> {
+    let store_started = Instant::now();
+    tracing::info!(
+        db_dir = %db_dir.display(),
+        chat_name = %query.chat_name,
+        "wxdb store initialization started"
+    );
     let keys = keyring::ensure_keys_for_db_dir(config, db_dir)?;
     if keys.is_empty() {
         anyhow::bail!("没有可用数据库密钥；请确认微信正在运行，必要时用管理员权限执行 wxdb init");
     }
+    tracing::info!(
+        db_dir = %db_dir.display(),
+        key_count = keys.len(),
+        elapsed_ms = store_started.elapsed().as_millis(),
+        "wxdb store keys loaded"
+    );
 
+    let cache_started = Instant::now();
     let mut cache = DbCache::new(
         db_dir.to_path_buf(),
         config.cache_dir_for(db_dir),
         config.mtime_file_for(db_dir),
         keys,
     )?;
+    tracing::info!(
+        db_dir = %db_dir.display(),
+        elapsed_ms = cache_started.elapsed().as_millis(),
+        "wxdb cache opened"
+    );
+    let names_started = Instant::now();
     let names = load_names(&mut cache)?;
+    tracing::info!(
+        db_dir = %db_dir.display(),
+        contacts = names.map.len(),
+        known_message_shards = names.msg_db_keys.len(),
+        elapsed_ms = names_started.elapsed().as_millis(),
+        "wxdb names loaded"
+    );
     let username = resolve_username(&query.chat_name, &names)
         .with_context(|| format!("找不到联系人或群聊: {}", query.chat_name))?;
     let display = names
@@ -170,8 +246,20 @@ fn query_history_in_store(
         .cloned()
         .unwrap_or_else(|| query.chat_name.clone());
     let is_group = username.contains("@chatroom");
+    let shard_started = Instant::now();
     let (shards, scanned, mut warnings) = find_msg_shards(&mut cache, &names, &username)?;
     let unknown_shards = unknown_message_shards(&cache, &names);
+    tracing::info!(
+        db_dir = %db_dir.display(),
+        chat_name = %query.chat_name,
+        username = %username,
+        is_group,
+        shards_scanned = scanned,
+        shards_matched = shards.len(),
+        unknown_shards = unknown_shards.len(),
+        elapsed_ms = shard_started.elapsed().as_millis(),
+        "wxdb message shards resolved"
+    );
     if shards.is_empty() {
         return Ok(HistoryResult {
             chat: display,
@@ -191,11 +279,19 @@ fn query_history_in_store(
         });
     }
 
+    let nick_started = Instant::now();
     let group_nicknames = if is_group {
         load_group_nicknames(&mut cache, &username).unwrap_or_default()
     } else {
         HashMap::new()
     };
+    tracing::info!(
+        db_dir = %db_dir.display(),
+        chat_name = %query.chat_name,
+        group_nicknames = group_nicknames.len(),
+        elapsed_ms = nick_started.elapsed().as_millis(),
+        "wxdb group nicknames loaded"
+    );
     let names_map = names.map.clone();
     let media_cache_dir = config.cache_dir_for(db_dir).join("media");
     let mut all_messages = Vec::new();
@@ -205,7 +301,9 @@ fn query_history_in_store(
 
     for shard in &shards {
         cache_modes.insert(shard.rel_key.clone(), shard.cache_mode);
+        let before_count = all_messages.len();
         let rows = query_messages(
+            &shard.rel_key,
             &shard.path,
             &shard.table,
             &username,
@@ -225,12 +323,29 @@ fn query_history_in_store(
             shards_hit += 1;
         }
         all_messages.extend(rows);
+        tracing::info!(
+            db_dir = %db_dir.display(),
+            chat_name = %query.chat_name,
+            shard = %shard.rel_key,
+            accumulated_messages = all_messages.len(),
+            added_messages = all_messages.len().saturating_sub(before_count),
+            media_decode_remaining = ?media_decode_remaining,
+            "wxdb shard accumulated"
+        );
     }
 
     all_messages.sort_by_key(|message| std::cmp::Reverse(message.timestamp));
     all_messages.truncate(query.limit);
     all_messages.sort_by_key(|message| message.timestamp);
     let count = all_messages.len();
+    tracing::info!(
+        db_dir = %db_dir.display(),
+        chat_name = %query.chat_name,
+        count,
+        shards_hit,
+        elapsed_ms = store_started.elapsed().as_millis(),
+        "wxdb store result prepared"
+    );
     warnings.extend(
         unknown_shards
             .iter()
@@ -385,6 +500,7 @@ fn find_msg_shards(
 }
 
 fn query_messages(
+    shard_rel_key: &str,
     db_path: &Path,
     table: &str,
     chat_username: &str,
@@ -400,6 +516,20 @@ fn query_messages(
     limit: usize,
     media_decode_remaining: &mut Option<usize>,
 ) -> Result<Vec<HistoryMessage>> {
+    let started = Instant::now();
+    let budget_before = *media_decode_remaining;
+    tracing::info!(
+        shard = %shard_rel_key,
+        db_path = %db_path.display(),
+        table,
+        since = ?since,
+        until = ?until,
+        text_only,
+        msg_types = ?msg_types,
+        limit,
+        media_decode_remaining = ?media_decode_remaining,
+        "wxdb shard query started"
+    );
     let conn = Connection::open(db_path)?;
     let id2u = load_id2u(&conn);
     let mut clauses: Vec<String> = Vec::new();
@@ -450,7 +580,13 @@ fn query_messages(
     })?;
 
     let mut messages = Vec::new();
-    for row in rows.flatten() {
+    let mut stats = QueryMessageStats::default();
+    for row in rows {
+        let Ok(row) = row else {
+            stats.row_errors += 1;
+            continue;
+        };
+        stats.rows_seen += 1;
         let (local_id, local_type, timestamp, real_sender_id, content_bytes, ct) = row;
         let raw_content = decompress_message(&content_bytes, ct);
         let base_type = base_msg_type(local_type);
@@ -468,20 +604,35 @@ fn query_messages(
         );
         let content = format_content(local_id, local_type, &raw_content, is_group);
         if content.trim().is_empty() {
+            stats.empty_content += 1;
             continue;
         }
-        let image_media = if base_type == 3 && consume_media_decode_budget(media_decode_remaining) {
-            Some(resolve_image_media(
-                account_root,
-                media_cache_dir,
-                chat_username,
-                timestamp,
-                &raw_content,
-            ))
-            .flatten()
+        let image_media = if base_type == 3 {
+            stats.image_messages += 1;
+            if consume_media_decode_budget(media_decode_remaining) {
+                stats.media_decode_attempts += 1;
+                let media = resolve_image_media(
+                    account_root,
+                    media_cache_dir,
+                    chat_username,
+                    timestamp,
+                    &raw_content,
+                );
+                match &media {
+                    Some(media) if media.decoded_path.is_some() => stats.media_decode_success += 1,
+                    Some(media) if media.decode_error.is_some() => stats.media_decode_errors += 1,
+                    Some(_) => stats.media_decode_unresolved += 1,
+                    None => stats.media_decode_no_candidates += 1,
+                }
+                media
+            } else {
+                stats.media_decode_skipped_budget += 1;
+                None
+            }
         } else {
             None
         };
+        stats.messages_kept += 1;
         messages.push(HistoryMessage {
             timestamp,
             time: fmt_time(timestamp),
@@ -519,7 +670,42 @@ fn query_messages(
                 .and_then(|media| media.decode_error.clone()),
         });
     }
+    tracing::info!(
+        shard = %shard_rel_key,
+        db_path = %db_path.display(),
+        table,
+        rows_seen = stats.rows_seen,
+        row_errors = stats.row_errors,
+        empty_content = stats.empty_content,
+        messages = stats.messages_kept,
+        image_messages = stats.image_messages,
+        media_decode_attempts = stats.media_decode_attempts,
+        media_decode_success = stats.media_decode_success,
+        media_decode_errors = stats.media_decode_errors,
+        media_decode_unresolved = stats.media_decode_unresolved,
+        media_decode_no_candidates = stats.media_decode_no_candidates,
+        media_decode_skipped_budget = stats.media_decode_skipped_budget,
+        media_decode_budget_before = ?budget_before,
+        media_decode_budget_after = ?media_decode_remaining,
+        elapsed_ms = started.elapsed().as_millis(),
+        "wxdb shard query completed"
+    );
     Ok(messages)
+}
+
+#[derive(Debug, Default)]
+struct QueryMessageStats {
+    rows_seen: usize,
+    row_errors: usize,
+    empty_content: usize,
+    messages_kept: usize,
+    image_messages: usize,
+    media_decode_attempts: usize,
+    media_decode_success: usize,
+    media_decode_errors: usize,
+    media_decode_unresolved: usize,
+    media_decode_no_candidates: usize,
+    media_decode_skipped_budget: usize,
 }
 
 fn consume_media_decode_budget(media_decode_remaining: &mut Option<usize>) -> bool {

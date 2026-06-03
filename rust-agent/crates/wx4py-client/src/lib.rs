@@ -222,6 +222,17 @@ impl Wx4pyClient {
         let wx_cli = self.wx_cli.clone();
         let total_timeout_seconds = history_query_timeout_seconds(&wx_cli);
         let (sender, receiver) = mpsc::channel();
+        let started = Instant::now();
+        tracing::info!(
+            room_id,
+            chat_name,
+            %since,
+            %until,
+            limit,
+            media_decode_limit = ?media_decode_limit,
+            timeout_seconds = total_timeout_seconds,
+            "wxdb history worker spawning"
+        );
 
         thread::spawn(move || {
             let result = query_text_messages_inner(
@@ -237,8 +248,30 @@ impl Wx4pyClient {
         });
 
         match receiver.recv_timeout(StdDuration::from_secs(total_timeout_seconds)) {
-            Ok(result) => result,
+            Ok(result) => {
+                match &result {
+                    Ok(messages) => tracing::info!(
+                        room_id,
+                        count = messages.len(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "wxdb history worker completed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        room_id,
+                        error = %error,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "wxdb history worker failed"
+                    ),
+                }
+                result
+            }
             Err(RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    room_id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    timeout_seconds = total_timeout_seconds,
+                    "wxdb history worker timed out"
+                );
                 Err(Wx4pyError::HistoryQueryTimeout(total_timeout_seconds))
             }
             Err(RecvTimeoutError::Disconnected) => Err(Wx4pyError::WxCli(
