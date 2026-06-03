@@ -351,6 +351,8 @@ pub struct LlmConfig {
     pub model_env: String,
     #[serde(default = "default_llm_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_retry_5xx_attempts")]
+    pub retry_5xx_attempts: usize,
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
     #[serde(default = "default_temperature")]
@@ -427,6 +429,8 @@ pub struct ImageGenConfig {
     pub poll_interval_seconds: u64,
     #[serde(default = "default_image_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_retry_5xx_attempts")]
+    pub retry_5xx_attempts: usize,
     #[serde(default)]
     pub prompt_template: Option<String>,
 }
@@ -468,6 +472,8 @@ pub struct ImageCaptionConfig {
     pub model_env: String,
     #[serde(default = "default_llm_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_retry_5xx_attempts")]
+    pub retry_5xx_attempts: usize,
     #[serde(default = "default_image_caption_max_output_tokens")]
     pub max_output_tokens: u32,
     #[serde(default = "default_image_caption_temperature")]
@@ -494,6 +500,7 @@ impl Default for ImageCaptionConfig {
             model: None,
             model_env: default_image_caption_model_env(),
             timeout_seconds: default_llm_timeout(),
+            retry_5xx_attempts: default_retry_5xx_attempts(),
             max_output_tokens: default_image_caption_max_output_tokens(),
             temperature: default_image_caption_temperature(),
             system_prompt: default_image_caption_system_prompt(),
@@ -597,6 +604,10 @@ fn default_max_chars() -> usize {
 
 fn default_llm_timeout() -> u64 {
     120
+}
+
+fn default_retry_5xx_attempts() -> usize {
+    5
 }
 
 fn default_llm_base_url_env() -> String {
@@ -804,6 +815,7 @@ mod tests {
         assert!(image_prompt.user_prompt_template.contains("{chat_input}"));
         assert!(!image_caption.enabled);
         assert_eq!(image_caption.model_env, "IMAGE_CAPTION_MODEL");
+        assert_eq!(image_caption.retry_5xx_attempts, 5);
         assert!(image_caption.user_prompt.contains("转述"));
     }
 
@@ -847,6 +859,7 @@ reasoning_effort = "none"
         )
         .unwrap();
 
+        assert_eq!(cfg.retry_5xx_attempts, 5);
         assert_eq!(
             cfg.request_body_overrides
                 .get("enable_thinking")

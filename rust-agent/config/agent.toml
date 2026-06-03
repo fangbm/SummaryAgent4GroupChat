@@ -101,6 +101,7 @@ api_key_env = "LLM_API_KEY"
 base_url_env = "LLM_BASE_URL"
 model_env = "LLM_MODEL"
 timeout_seconds = 120
+retry_5xx_attempts = 5
 max_output_tokens = 2000
 temperature = 0.3
 
@@ -368,6 +369,7 @@ model_env = "IMAGE_MODEL"
 size = "2:3"
 resolution = "1k"
 timeout_seconds = 300
+retry_5xx_attempts = 5
 
 [image_caption]
 enabled = false
@@ -380,6 +382,7 @@ api_key_env = "IMAGE_CAPTION_API_KEY"
 base_url_env = "IMAGE_CAPTION_BASE_URL"
 model_env = "IMAGE_CAPTION_MODEL"
 timeout_seconds = 120
+retry_5xx_attempts = 5
 max_output_tokens = 500
 temperature = 0.1
 max_images_per_summary = 20

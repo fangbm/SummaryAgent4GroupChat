@@ -74,6 +74,7 @@ struct ConfigView {
     llm_model: String,
     llm_model_env: String,
     llm_timeout: u64,
+    llm_retry_5xx_attempts: u32,
     llm_max_tokens: u32,
     llm_max_input_chars: u32,
     llm_request_body_overrides: String,
@@ -85,6 +86,7 @@ struct ConfigView {
     image_size: String,
     image_resolution: String,
     image_timeout: u64,
+    image_retry_5xx_attempts: u32,
     image_caption_enabled: bool,
     image_caption_provider: String,
     image_caption_api_key_env: String,
@@ -92,6 +94,7 @@ struct ConfigView {
     image_caption_model: String,
     image_caption_model_env: String,
     image_caption_timeout: u64,
+    image_caption_retry_5xx_attempts: u32,
     image_caption_max_tokens: u32,
     image_caption_max_images: u32,
     image_caption_request_body_overrides: String,
@@ -838,6 +841,7 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         text_field(ui, "模型名称", &mut view.llm_model);
         text_field(ui, "模型环境变量", &mut view.llm_model_env);
         number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
+        number_u32(ui, "5xx 重试次数", &mut view.llm_retry_5xx_attempts);
         number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
         number_u32(ui, "LLM 最大输入字符数", &mut view.llm_max_input_chars);
         multiline_field(
@@ -865,6 +869,7 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         text_field(ui, "图片尺寸", &mut view.image_size);
         text_field(ui, "图片分辨率", &mut view.image_resolution);
         number_u64(ui, "图片超时秒数", &mut view.image_timeout);
+        number_u32(ui, "5xx 重试次数", &mut view.image_retry_5xx_attempts);
 
         let ui = &mut columns[2];
         ui.heading("图片转述");
@@ -883,6 +888,11 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         text_field(ui, "转述模型名称", &mut view.image_caption_model);
         text_field(ui, "转述模型环境变量", &mut view.image_caption_model_env);
         number_u64(ui, "转述超时秒数", &mut view.image_caption_timeout);
+        number_u32(
+            ui,
+            "5xx 重试次数",
+            &mut view.image_caption_retry_5xx_attempts,
+        );
         number_u32(ui, "转述最大输出 Token", &mut view.image_caption_max_tokens);
         number_u32(ui, "每次最多转述图片数", &mut view.image_caption_max_images);
         multiline_field(
@@ -1339,6 +1349,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             llm_model,
             llm_model_env,
             llm_timeout: config.llm.timeout_seconds,
+            llm_retry_5xx_attempts: config.llm.retry_5xx_attempts.min(u32::MAX as usize) as u32,
             llm_max_tokens: config.llm.max_output_tokens,
             llm_max_input_chars: config.privacy.max_chars_to_llm.min(u32::MAX as usize) as u32,
             llm_request_body_overrides,
@@ -1350,6 +1361,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             image_size: config.image_gen.size,
             image_resolution: config.image_gen.resolution.unwrap_or_default(),
             image_timeout: config.image_gen.timeout_seconds,
+            image_retry_5xx_attempts: config.image_gen.retry_5xx_attempts.min(u32::MAX as usize)
+                as u32,
             image_caption_enabled: config.image_caption.enabled,
             image_caption_provider: config.image_caption.provider,
             image_caption_api_key_env: config.image_caption.api_key_env,
@@ -1357,6 +1370,10 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             image_caption_model,
             image_caption_model_env,
             image_caption_timeout: config.image_caption.timeout_seconds,
+            image_caption_retry_5xx_attempts: config
+                .image_caption
+                .retry_5xx_attempts
+                .min(u32::MAX as usize) as u32,
             image_caption_max_tokens: config.image_caption.max_output_tokens,
             image_caption_max_images: config
                 .image_caption
@@ -1434,6 +1451,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         llm_model,
         llm_model_env,
         llm_timeout: get_u64(doc, "llm", "timeout_seconds", 120),
+        llm_retry_5xx_attempts: get_u64(doc, "llm", "retry_5xx_attempts", 5).min(u32::MAX as u64)
+            as u32,
         llm_max_tokens: get_u64(doc, "llm", "max_output_tokens", 2000) as u32,
         llm_max_input_chars: get_u64(doc, "privacy", "max_chars_to_llm", 20_000)
             .min(u32::MAX as u64) as u32,
@@ -1446,6 +1465,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         image_size: get_str(doc, "image_gen", "size", "2:3"),
         image_resolution: get_str(doc, "image_gen", "resolution", "1k"),
         image_timeout: get_u64(doc, "image_gen", "timeout_seconds", 300),
+        image_retry_5xx_attempts: get_u64(doc, "image_gen", "retry_5xx_attempts", 5)
+            .min(u32::MAX as u64) as u32,
         image_caption_enabled: get_bool(doc, "image_caption", "enabled", false),
         image_caption_provider: get_str(doc, "image_caption", "provider", "openai_compatible"),
         image_caption_api_key_env: get_str(
@@ -1463,6 +1484,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         image_caption_model,
         image_caption_model_env,
         image_caption_timeout: get_u64(doc, "image_caption", "timeout_seconds", 120),
+        image_caption_retry_5xx_attempts: get_u64(doc, "image_caption", "retry_5xx_attempts", 5)
+            .min(u32::MAX as u64) as u32,
         image_caption_max_tokens: get_u64(doc, "image_caption", "max_output_tokens", 500) as u32,
         image_caption_max_images: get_u64(doc, "image_caption", "max_images_per_summary", 20)
             .min(u32::MAX as u64) as u32,
@@ -1574,6 +1597,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     }
     set_str(llm, "model_env", &update.llm_model_env);
     set_int(llm, "timeout_seconds", update.llm_timeout as i64);
+    set_int(
+        llm,
+        "retry_5xx_attempts",
+        update.llm_retry_5xx_attempts as i64,
+    );
     set_int(llm, "max_output_tokens", update.llm_max_tokens as i64);
     set_json_object_table(
         llm,
@@ -1590,6 +1618,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     set_str(image_gen, "size", &update.image_size);
     set_str(image_gen, "resolution", &update.image_resolution);
     set_int(image_gen, "timeout_seconds", update.image_timeout as i64);
+    set_int(
+        image_gen,
+        "retry_5xx_attempts",
+        update.image_retry_5xx_attempts as i64,
+    );
 
     let image_caption = table_mut(&mut doc, "image_caption");
     set_bool(image_caption, "enabled", update.image_caption_enabled);
@@ -1614,6 +1647,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         image_caption,
         "timeout_seconds",
         update.image_caption_timeout as i64,
+    );
+    set_int(
+        image_caption,
+        "retry_5xx_attempts",
+        update.image_caption_retry_5xx_attempts as i64,
     );
     set_int(
         image_caption,

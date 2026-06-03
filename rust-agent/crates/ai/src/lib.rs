@@ -14,8 +14,7 @@ use wechat_summary_core::{
     ImageArtifact,
 };
 
-const CHAT_COMPLETION_MAX_ATTEMPTS: usize = 3;
-const CHAT_COMPLETION_RETRY_DELAYS_MS: [u64; 2] = [1_000, 3_000];
+const HTTP_5XX_RETRY_DELAYS_MS: [u64; 5] = [1_000, 2_000, 5_000, 10_000, 15_000];
 
 #[derive(Debug, Error)]
 pub enum AiError {
@@ -116,7 +115,8 @@ impl OpenAiCompatibleLlm {
         );
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
-        for attempt in 1..=CHAT_COMPLETION_MAX_ATTEMPTS {
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        for attempt in 1..=max_attempts {
             let started = Instant::now();
             info!(
                 base_url = %self.base_url,
@@ -126,7 +126,7 @@ impl OpenAiCompatibleLlm {
                 max_tokens = ?max_tokens,
                 timeout_seconds = self.config.timeout_seconds,
                 attempt,
-                max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                max_attempts,
                 "LLM chat completion request started"
             );
             let response = match self
@@ -140,18 +140,19 @@ impl OpenAiCompatibleLlm {
                 Ok(response) => response,
                 Err(error) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    let retry = attempt < CHAT_COMPLETION_MAX_ATTEMPTS
-                        && should_retry_chat_completion_transport_error(&error);
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
                     warn!(
                         elapsed_ms,
                         attempt,
-                        max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                        max_attempts,
                         retry,
+                        retry_after_ms,
                         error = %error,
                         "LLM chat completion transport failed"
                     );
                     if retry {
-                        sleep(chat_completion_retry_delay(attempt)).await;
+                        sleep(http_retry_delay(attempt)).await;
                         continue;
                     }
                     return Err(AiError::Http(error));
@@ -165,19 +166,21 @@ impl OpenAiCompatibleLlm {
                     .await
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
-                let retry = attempt < CHAT_COMPLETION_MAX_ATTEMPTS
+                let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
                 warn!(
                     status = %status,
                     elapsed_ms,
                     attempt,
-                    max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                    max_attempts,
                     retry,
+                    retry_after_ms,
                     response = %snippet,
                     "LLM chat completion request failed"
                 );
                 if retry {
-                    sleep(chat_completion_retry_delay(attempt)).await;
+                    sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
                 let message = format!("chat completion API returned {status}: {snippet}");
@@ -190,7 +193,7 @@ impl OpenAiCompatibleLlm {
                 status = %status,
                 elapsed_ms,
                 attempt,
-                max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                max_attempts,
                 "LLM chat completion HTTP request completed"
             );
 
@@ -284,45 +287,85 @@ impl OpenAiVisionCaptionClient {
 
     async fn download_image_as_data_url(&self, url: &str) -> Result<String, AiError> {
         let source = redacted_url_source(url);
-        let started = Instant::now();
-        info!(
-            source = %source,
-            "image caption remote image download started"
-        );
-        let response = self.client.get(url).send().await?;
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToOwned::to_owned);
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("failed to read image response body: {error}"));
-            let snippet = truncate_for_log(&body, 300);
-            warn!(
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        for attempt in 1..=max_attempts {
+            let started = Instant::now();
+            info!(
                 source = %source,
-                status = %status,
-                elapsed_ms = started.elapsed().as_millis(),
-                response = %snippet,
-                "image caption remote image download failed"
+                attempt,
+                max_attempts,
+                "image caption remote image download started"
             );
-            return Err(AiError::InvalidResponse(format!(
-                "remote image download returned {status}: {snippet}"
-            )));
+            let response = match self.client.get(url).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    warn!(
+                        source = %source,
+                        attempt,
+                        max_attempts,
+                        retry,
+                        retry_after_ms,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %error,
+                        "image caption remote image download transport failed"
+                    );
+                    if retry {
+                        sleep(http_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read image response body: {error}"));
+                let snippet = truncate_for_log(&body, 300);
+                let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                warn!(
+                    source = %source,
+                    status = %status,
+                    attempt,
+                    max_attempts,
+                    retry,
+                    retry_after_ms,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    response = %snippet,
+                    "image caption remote image download failed"
+                );
+                if retry {
+                    sleep(http_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(AiError::InvalidResponse(format!(
+                    "remote image download returned {status}: {snippet}"
+                )));
+            }
+            let bytes = response.bytes().await?;
+            let data_url = image_data_url_from_bytes(None, &bytes)?;
+            info!(
+                source = %source,
+                content_type = content_type.as_deref().unwrap_or("unknown"),
+                bytes = bytes.len(),
+                attempt,
+                max_attempts,
+                elapsed_ms = started.elapsed().as_millis(),
+                "image caption remote image downloaded"
+            );
+            return Ok(data_url);
         }
-        let bytes = response.bytes().await?;
-        let data_url = image_data_url_from_bytes(None, &bytes)?;
-        info!(
-            source = %source,
-            content_type = content_type.as_deref().unwrap_or("unknown"),
-            bytes = bytes.len(),
-            elapsed_ms = started.elapsed().as_millis(),
-            "image caption remote image downloaded"
-        );
-        Ok(data_url)
+
+        unreachable!("image caption remote image download retry loop always returns")
     }
 
     async fn complete_with_image_url(&self, image_url: &str) -> Result<String, AiError> {
@@ -337,7 +380,8 @@ impl OpenAiVisionCaptionClient {
         );
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
-        for attempt in 1..=CHAT_COMPLETION_MAX_ATTEMPTS {
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        for attempt in 1..=max_attempts {
             let started = Instant::now();
             info!(
                 base_url = %self.base_url,
@@ -346,7 +390,7 @@ impl OpenAiVisionCaptionClient {
                 max_tokens = self.config.max_output_tokens,
                 timeout_seconds = self.config.timeout_seconds,
                 attempt,
-                max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                max_attempts,
                 image_source_kind = if image_url.starts_with("data:") { "data_url" } else { "url" },
                 "image caption request started"
             );
@@ -360,17 +404,19 @@ impl OpenAiVisionCaptionClient {
             {
                 Ok(response) => response,
                 Err(error) => {
-                    let retry = attempt < CHAT_COMPLETION_MAX_ATTEMPTS
-                        && should_retry_chat_completion_transport_error(&error);
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
                     warn!(
                         elapsed_ms = started.elapsed().as_millis(),
                         attempt,
+                        max_attempts,
                         retry,
+                        retry_after_ms,
                         error = %error,
                         "image caption transport failed"
                     );
                     if retry {
-                        sleep(chat_completion_retry_delay(attempt)).await;
+                        sleep(http_retry_delay(attempt)).await;
                         continue;
                     }
                     return Err(AiError::Http(error));
@@ -384,18 +430,21 @@ impl OpenAiVisionCaptionClient {
                     .await
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
-                let retry = attempt < CHAT_COMPLETION_MAX_ATTEMPTS
+                let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
                 warn!(
                     status = %status,
                     elapsed_ms = started.elapsed().as_millis(),
                     attempt,
+                    max_attempts,
                     retry,
+                    retry_after_ms,
                     response = %snippet,
                     "image caption request failed"
                 );
                 if retry {
-                    sleep(chat_completion_retry_delay(attempt)).await;
+                    sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
                 let message = format!("image caption API returned {status}: {snippet}");
@@ -432,23 +481,33 @@ impl OpenAiVisionCaptionClient {
 }
 
 fn should_retry_chat_completion_failure(status: reqwest::StatusCode, body: &str) -> bool {
+    should_retry_http_failure(status, body)
+}
+
+fn should_retry_http_failure(status: reqwest::StatusCode, body: &str) -> bool {
     status.is_server_error()
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || body.contains("UPSTREAM_FAILED")
         || body.contains("UPSTREAM_REQUEST_FAILED")
 }
 
-fn should_retry_chat_completion_transport_error(error: &reqwest::Error) -> bool {
+fn should_retry_http_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect()
 }
 
-fn chat_completion_retry_delay(attempt: usize) -> Duration {
-    Duration::from_millis(
-        CHAT_COMPLETION_RETRY_DELAYS_MS
-            .get(attempt.saturating_sub(1))
-            .copied()
-            .unwrap_or_else(|| *CHAT_COMPLETION_RETRY_DELAYS_MS.last().unwrap_or(&1_000)),
-    )
+fn http_max_attempts(retry_attempts: usize) -> usize {
+    retry_attempts.saturating_add(1)
+}
+
+fn http_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(http_retry_delay_ms(attempt))
+}
+
+fn http_retry_delay_ms(attempt: usize) -> u64 {
+    HTTP_5XX_RETRY_DELAYS_MS
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .unwrap_or_else(|| *HTTP_5XX_RETRY_DELAYS_MS.last().unwrap_or(&1_000))
 }
 
 fn chat_completion_payload(
@@ -737,52 +796,91 @@ impl OpenAiImageClient {
         let endpoint = image_generations_endpoint(&self.base_url);
         let payload = self.image_generation_payload(prompt);
 
-        let started = Instant::now();
-        info!(
-            base_url = %self.base_url,
-            model = %self.model,
-            prompt_chars = prompt.chars().count(),
-            size = %self.config.size,
-            quality = ?self.config.quality,
-            resolution = ?self.config.resolution,
-            timeout_seconds = self.config.timeout_seconds,
-            "image generation request started"
-        );
-        let response = self
-            .client
-            .post(endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await?;
-        let status = response.status();
-        let elapsed_ms = started.elapsed().as_millis();
-        if !status.is_success() {
-            let body = response
-                .text()
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        for attempt in 1..=max_attempts {
+            let started = Instant::now();
+            info!(
+                base_url = %self.base_url,
+                model = %self.model,
+                prompt_chars = prompt.chars().count(),
+                size = %self.config.size,
+                quality = ?self.config.quality,
+                resolution = ?self.config.resolution,
+                timeout_seconds = self.config.timeout_seconds,
+                attempt,
+                max_attempts,
+                "image generation request started"
+            );
+            let response = match self
+                .client
+                .post(&endpoint)
+                .bearer_auth(&self.api_key)
+                .json(&payload)
+                .send()
                 .await
-                .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-            let snippet = truncate_for_log(&body, 500);
-            warn!(
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    warn!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        attempt,
+                        max_attempts,
+                        retry,
+                        retry_after_ms,
+                        error = %error,
+                        "image generation transport failed"
+                    );
+                    if retry {
+                        sleep(http_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+            let status = response.status();
+            let elapsed_ms = started.elapsed().as_millis();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+                let snippet = truncate_for_log(&body, 500);
+                let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                warn!(
+                    status = %status,
+                    elapsed_ms,
+                    attempt,
+                    max_attempts,
+                    retry,
+                    retry_after_ms,
+                    response = %snippet,
+                    "image generation request failed"
+                );
+                if retry {
+                    sleep(http_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(AiError::InvalidResponse(format!(
+                    "image generation API returned {status}: {snippet}"
+                )));
+            }
+            info!(
                 status = %status,
                 elapsed_ms,
-                response = %snippet,
-                "image generation request failed"
+                attempt,
+                max_attempts,
+                "image generation HTTP request completed"
             );
-            return Err(AiError::InvalidResponse(format!(
-                "image generation API returned {status}: {snippet}"
-            )));
+
+            let response = response.json::<Value>().await?;
+            let bytes = self.image_bytes_from_generation_response(response).await?;
+            return self.write_image(output_dir, &bytes);
         }
-        info!(
-            status = %status,
-            elapsed_ms,
-            "image generation HTTP request completed"
-        );
 
-        let response = response.json::<Value>().await?;
-
-        let bytes = self.image_bytes_from_generation_response(response).await?;
-        self.write_image(output_dir, &bytes)
+        unreachable!("image generation retry loop always returns")
     }
 
     fn image_generation_payload(&self, prompt: &str) -> Value {
@@ -853,41 +951,91 @@ impl OpenAiImageClient {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let poll_started = Instant::now();
-            let response = self
-                .client
-                .get(format!(
-                    "{}/tasks/{}",
-                    api_root_url(&self.base_url),
-                    task_id
-                ))
-                .bearer_auth(&self.api_key)
-                .send()
-                .await?;
-            let status = response.status();
-            let elapsed_ms = poll_started.elapsed().as_millis();
-            if !status.is_success() {
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-                let snippet = truncate_for_log(&body, 500);
-                warn!(
-                    task_id = %task_id,
-                    attempt,
-                    status = %status,
-                    elapsed_ms,
-                    response = %snippet,
-                    "image task poll failed"
-                );
-                return Err(AiError::InvalidResponse(format!(
-                    "image task API returned {status}: {snippet}"
-                )));
-            }
+            let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+            let response = {
+                let mut final_response = None;
+                for http_attempt in 1..=max_attempts {
+                    let poll_started = Instant::now();
+                    let response = match self
+                        .client
+                        .get(format!(
+                            "{}/tasks/{}",
+                            api_root_url(&self.base_url),
+                            task_id
+                        ))
+                        .bearer_auth(&self.api_key)
+                        .send()
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            let retry = http_attempt < max_attempts
+                                && should_retry_http_transport_error(&error);
+                            let retry_after_ms = retry
+                                .then(|| http_retry_delay_ms(http_attempt))
+                                .unwrap_or(0);
+                            warn!(
+                                task_id = %task_id,
+                                attempt,
+                                http_attempt,
+                                max_attempts,
+                                retry,
+                                retry_after_ms,
+                                elapsed_ms = poll_started.elapsed().as_millis(),
+                                error = %error,
+                                "image task poll transport failed"
+                            );
+                            if retry {
+                                sleep(http_retry_delay(http_attempt)).await;
+                                continue;
+                            }
+                            return Err(AiError::Http(error));
+                        }
+                    };
+                    let status = response.status();
+                    let elapsed_ms = poll_started.elapsed().as_millis();
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_else(|error| {
+                            format!("failed to read error response body: {error}")
+                        });
+                        let snippet = truncate_for_log(&body, 500);
+                        let retry = http_attempt < max_attempts
+                            && should_retry_http_failure(status, &snippet);
+                        let retry_after_ms = retry
+                            .then(|| http_retry_delay_ms(http_attempt))
+                            .unwrap_or(0);
+                        warn!(
+                            task_id = %task_id,
+                            attempt,
+                            http_attempt,
+                            max_attempts,
+                            retry,
+                            retry_after_ms,
+                            status = %status,
+                            elapsed_ms,
+                            response = %snippet,
+                            "image task poll failed"
+                        );
+                        if retry {
+                            sleep(http_retry_delay(http_attempt)).await;
+                            continue;
+                        }
+                        return Err(AiError::InvalidResponse(format!(
+                            "image task API returned {status}: {snippet}"
+                        )));
+                    }
+                    final_response = Some((response, elapsed_ms, http_attempt));
+                    break;
+                }
+                final_response
+                    .expect("image task poll retry loop always returns a response or error")
+            };
+            let (response, elapsed_ms, http_attempt) = response;
             let response = response.json::<Value>().await?;
             info!(
                 task_id = %task_id,
                 attempt,
+                http_attempt,
                 status = %apimart_task_status(&response),
                 elapsed_ms,
                 "image task poll completed"
@@ -922,36 +1070,74 @@ impl OpenAiImageClient {
 
     async fn download_image(&self, url: String) -> Result<Vec<u8>, AiError> {
         let source = redacted_url_source(&url);
-        let started = Instant::now();
-        info!(source = %source, "image download started");
-        let response = self.client.get(url).send().await?;
-        let status = response.status();
-        let elapsed_ms = started.elapsed().as_millis();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-            let snippet = truncate_for_log(&body, 500);
-            warn!(
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        for attempt in 1..=max_attempts {
+            let started = Instant::now();
+            info!(source = %source, attempt, max_attempts, "image download started");
+            let response = match self.client.get(&url).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    warn!(
+                        source = %source,
+                        attempt,
+                        max_attempts,
+                        retry,
+                        retry_after_ms,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %error,
+                        "image download transport failed"
+                    );
+                    if retry {
+                        sleep(http_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+            let status = response.status();
+            let elapsed_ms = started.elapsed().as_millis();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+                let snippet = truncate_for_log(&body, 500);
+                let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                warn!(
+                    source = %source,
+                    status = %status,
+                    attempt,
+                    max_attempts,
+                    retry,
+                    retry_after_ms,
+                    elapsed_ms,
+                    response = %snippet,
+                    "image download failed"
+                );
+                if retry {
+                    sleep(http_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(AiError::InvalidResponse(format!(
+                    "image download returned {status}: {snippet}"
+                )));
+            }
+            let bytes = response.bytes().await?.to_vec();
+            info!(
                 source = %source,
-                status = %status,
                 elapsed_ms,
-                response = %snippet,
-                "image download failed"
+                attempt,
+                max_attempts,
+                bytes = bytes.len(),
+                "image download completed"
             );
-            return Err(AiError::InvalidResponse(format!(
-                "image download returned {status}: {snippet}"
-            )));
+            return Ok(bytes);
         }
-        let bytes = response.bytes().await?.to_vec();
-        info!(
-            source = %source,
-            elapsed_ms,
-            bytes = bytes.len(),
-            "image download completed"
-        );
-        Ok(bytes)
+
+        unreachable!("image download retry loop always returns")
     }
 
     fn write_image(
@@ -1294,6 +1480,7 @@ mod tests {
             model: None,
             model_env: "IMAGE_CAPTION_MODEL".into(),
             timeout_seconds: 120,
+            retry_5xx_attempts: 5,
             max_output_tokens: 500,
             temperature: 0.1,
             system_prompt: "describe".into(),
@@ -1320,6 +1507,7 @@ mod tests {
             poll_initial_delay_seconds: 10,
             poll_interval_seconds: 5,
             timeout_seconds: 300,
+            retry_5xx_attempts: 5,
             prompt_template: None,
         }
     }
@@ -1643,6 +1831,15 @@ reasoning_effort = "none"
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             ""
         ));
+    }
+
+    #[test]
+    fn http_retry_count_defaults_to_extra_attempts() {
+        assert_eq!(http_max_attempts(0), 1);
+        assert_eq!(http_max_attempts(5), 6);
+        assert_eq!(http_retry_delay_ms(1), 1_000);
+        assert_eq!(http_retry_delay_ms(5), 15_000);
+        assert_eq!(http_retry_delay_ms(6), 15_000);
     }
 
     #[test]
