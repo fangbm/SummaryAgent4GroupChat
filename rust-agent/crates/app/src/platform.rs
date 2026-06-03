@@ -118,11 +118,12 @@ impl PlatformClient {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
         limit: u32,
+        media_decode_limit: Option<usize>,
     ) -> Result<Vec<PlatformHistoryMessage>> {
         match self {
             Self::Wx4py(platform) => platform
                 .client
-                .query_text_messages(room_id, room_name, since, until, limit)
+                .query_text_messages(room_id, room_name, since, until, limit, media_decode_limit)
                 .await
                 .map(|messages| messages.into_iter().map(Into::into).collect())
                 .map_err(Into::into),

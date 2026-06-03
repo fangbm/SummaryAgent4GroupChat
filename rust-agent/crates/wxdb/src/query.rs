@@ -18,6 +18,7 @@ pub struct HistoryQuery {
     pub limit: usize,
     pub text_only: bool,
     pub msg_types: Vec<String>,
+    pub media_decode_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +201,7 @@ fn query_history_in_store(
     let mut all_messages = Vec::new();
     let mut shards_hit = 0usize;
     let mut cache_modes = HashMap::new();
+    let mut media_decode_remaining = query.media_decode_limit;
 
     for shard in &shards {
         cache_modes.insert(shard.rel_key.clone(), shard.cache_mode);
@@ -217,6 +219,7 @@ fn query_history_in_store(
             query.text_only,
             &query.msg_types,
             query.limit,
+            &mut media_decode_remaining,
         )?;
         if !rows.is_empty() {
             shards_hit += 1;
@@ -395,6 +398,7 @@ fn query_messages(
     text_only: bool,
     msg_types: &[String],
     limit: usize,
+    media_decode_remaining: &mut Option<usize>,
 ) -> Result<Vec<HistoryMessage>> {
     let conn = Connection::open(db_path)?;
     let id2u = load_id2u(&conn);
@@ -466,17 +470,18 @@ fn query_messages(
         if content.trim().is_empty() {
             continue;
         }
-        let image_media = (base_type == 3)
-            .then(|| {
-                resolve_image_media(
-                    account_root,
-                    media_cache_dir,
-                    chat_username,
-                    timestamp,
-                    &raw_content,
-                )
-            })
-            .flatten();
+        let image_media = if base_type == 3 && consume_media_decode_budget(media_decode_remaining) {
+            Some(resolve_image_media(
+                account_root,
+                media_cache_dir,
+                chat_username,
+                timestamp,
+                &raw_content,
+            ))
+            .flatten()
+        } else {
+            None
+        };
         messages.push(HistoryMessage {
             timestamp,
             time: fmt_time(timestamp),
@@ -515,6 +520,17 @@ fn query_messages(
         });
     }
     Ok(messages)
+}
+
+fn consume_media_decode_budget(media_decode_remaining: &mut Option<usize>) -> bool {
+    match media_decode_remaining {
+        Some(0) => false,
+        Some(remaining) => {
+            *remaining -= 1;
+            true
+        }
+        None => true,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1052,6 +1068,25 @@ mod tests {
         assert!(is_caption_friendly_image_format("jpg"));
         assert!(is_caption_friendly_image_format("png"));
         assert!(!is_caption_friendly_image_format("hevc"));
+    }
+
+    #[test]
+    fn media_decode_budget_can_disable_or_limit_image_resolution() {
+        let mut disabled = Some(0);
+        assert!(!consume_media_decode_budget(&mut disabled));
+        assert_eq!(disabled, Some(0));
+
+        let mut limited = Some(2);
+        assert!(consume_media_decode_budget(&mut limited));
+        assert_eq!(limited, Some(1));
+        assert!(consume_media_decode_budget(&mut limited));
+        assert_eq!(limited, Some(0));
+        assert!(!consume_media_decode_budget(&mut limited));
+
+        let mut unlimited = None;
+        assert!(consume_media_decode_budget(&mut unlimited));
+        assert!(consume_media_decode_budget(&mut unlimited));
+        assert_eq!(unlimited, None);
     }
 
     #[test]

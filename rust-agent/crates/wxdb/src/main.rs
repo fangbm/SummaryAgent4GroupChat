@@ -91,6 +91,7 @@ fn main() -> Result<()> {
                     .as_deref()
                     .map(history_type_filter)
                     .unwrap_or_default(),
+                media_decode_limit: None,
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -127,6 +128,7 @@ fn main() -> Result<()> {
                 limit,
                 text_only: false,
                 msg_types: Vec::new(),
+                media_decode_limit: None,
             })?;
             if let Some(parent) = output.parent() {
                 std::fs::create_dir_all(parent)?;

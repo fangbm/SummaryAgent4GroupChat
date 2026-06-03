@@ -215,6 +215,7 @@ impl Wx4pyClient {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
         limit: u32,
+        media_decode_limit: Option<usize>,
     ) -> Result<Vec<Wx4pyHistoryMessage>> {
         let chat_name = self.chat_name(room_id, room_name);
         let output = self.temp_output_path(room_id);
@@ -223,8 +224,15 @@ impl Wx4pyClient {
         let (sender, receiver) = mpsc::channel();
 
         thread::spawn(move || {
-            let result =
-                query_text_messages_inner(&wx_cli, &chat_name, since, until, limit, &output);
+            let result = query_text_messages_inner(
+                &wx_cli,
+                &chat_name,
+                since,
+                until,
+                limit,
+                media_decode_limit,
+                &output,
+            );
             let _ = sender.send(result);
         });
 
@@ -320,10 +328,17 @@ fn query_text_messages_inner(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    media_decode_limit: Option<usize>,
     output: &Path,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     if should_use_builtin_wxdb(wx_cli) {
-        return query_text_messages_via_builtin_wxdb(chat_name, since, until, limit);
+        return query_text_messages_via_builtin_wxdb(
+            chat_name,
+            since,
+            until,
+            limit,
+            media_decode_limit,
+        );
     }
 
     if let Some(parent) = output.parent() {
@@ -373,15 +388,18 @@ fn query_text_messages_via_builtin_wxdb(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    media_decode_limit: Option<usize>,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     tracing::info!(
         chat_name,
         %since,
         %until,
         limit,
+        media_decode_limit = ?media_decode_limit,
         "querying builtin wxdb history"
     );
-    let mut result = query_builtin_wxdb_history(chat_name, since, until, limit)?;
+    let mut result =
+        query_builtin_wxdb_history(chat_name, since, until, limit, media_decode_limit)?;
     if result.messages.is_empty() && until.signed_duration_since(since) >= Duration::minutes(5) {
         tracing::warn!(
             chat_name,
@@ -390,7 +408,7 @@ fn query_text_messages_via_builtin_wxdb(
             "builtin wxdb returned no messages; retrying once after a short delay"
         );
         thread::sleep(StdDuration::from_millis(800));
-        result = query_builtin_wxdb_history(chat_name, since, until, limit)?;
+        result = query_builtin_wxdb_history(chat_name, since, until, limit, media_decode_limit)?;
     }
 
     for warning in &result.meta.warnings {
@@ -488,6 +506,7 @@ fn query_builtin_wxdb_history(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    media_decode_limit: Option<usize>,
 ) -> Result<wechat_summary_wxdb::HistoryResult> {
     wechat_summary_wxdb::query_history(wechat_summary_wxdb::HistoryQuery {
         chat_name: chat_name.to_string(),
@@ -496,6 +515,7 @@ fn query_builtin_wxdb_history(
         limit: limit as usize,
         text_only: false,
         msg_types: vec!["text".to_string(), "image".to_string()],
+        media_decode_limit,
     })
     .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb failed: {error:#}")))
 }

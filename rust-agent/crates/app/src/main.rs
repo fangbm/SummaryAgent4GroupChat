@@ -721,18 +721,24 @@ async fn run_summary_pipeline(
 
     let history_message_limit = config.history_message_limit();
     let history_query_limit = history_message_limit.min(u32::MAX as usize) as u32;
+    let media_decode_limit = image_caption_media_decode_limit(config);
     info!(
         room_id = %trigger.room_id,
         since = %range.since,
         until = %range.until,
         limit = history_message_limit,
+        media_decode_limit = ?media_decode_limit,
         "querying platform history"
     );
     append_runtime_log(
         config,
         &format!(
-            "history query started room={} since={} until={} limit={}",
-            trigger.room_id, range.since, range.until, history_message_limit
+            "history query started room={} since={} until={} limit={} media_decode_limit={}",
+            trigger.room_id,
+            range.since,
+            range.until,
+            history_message_limit,
+            format_media_decode_limit(media_decode_limit)
         ),
     );
     let mut history = client
@@ -742,6 +748,7 @@ async fn run_summary_pipeline(
             range.since,
             range.until,
             history_query_limit,
+            media_decode_limit,
         )
         .await
         .context("querying platform chat history")?;
@@ -790,6 +797,7 @@ async fn run_summary_pipeline(
                         range.since,
                         range.until,
                         history_query_limit,
+                        media_decode_limit,
                     )
                     .await
                     .context("retrying platform chat history after suspicious empty result")?;
@@ -2237,6 +2245,20 @@ fn format_error_chain(error: &anyhow::Error) -> String {
         .join(": ")
 }
 
+fn image_caption_media_decode_limit(config: &AgentConfig) -> Option<usize> {
+    if config.image_caption.enabled {
+        Some(config.image_caption.max_images_per_summary)
+    } else {
+        Some(0)
+    }
+}
+
+fn format_media_decode_limit(limit: Option<usize>) -> String {
+    limit
+        .map(|limit| limit.to_string())
+        .unwrap_or_else(|| "unlimited".to_string())
+}
+
 async fn apply_image_captions(
     config: &AgentConfig,
     room_id: &str,
@@ -2474,6 +2496,20 @@ mod tests {
 
         message.media_path = Some(r"D:\Temp\raw.dat".into());
         assert_eq!(image_caption_source(&message), None);
+    }
+
+    #[test]
+    fn media_decode_limit_follows_image_caption_config() {
+        let mut config = test_config();
+        config.image_caption.enabled = false;
+        config.image_caption.max_images_per_summary = 20;
+        assert_eq!(image_caption_media_decode_limit(&config), Some(0));
+
+        config.image_caption.enabled = true;
+        config.image_caption.max_images_per_summary = 7;
+        assert_eq!(image_caption_media_decode_limit(&config), Some(7));
+        assert_eq!(format_media_decode_limit(Some(7)), "7");
+        assert_eq!(format_media_decode_limit(None), "unlimited");
     }
 
     #[test]
