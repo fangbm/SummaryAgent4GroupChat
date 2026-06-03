@@ -3,8 +3,8 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::PathBuf,
-    time::Duration as StdDuration,
+    path::{Path, PathBuf},
+    time::{Duration as StdDuration, SystemTime},
 };
 
 mod platform;
@@ -46,25 +46,24 @@ async fn main() -> Result<()> {
 }
 
 async fn run_agent(config_path: &str) -> Result<()> {
-    let config = AgentConfig::from_path(config_path)
-        .with_context(|| format!("loading config {}", config_path))?;
+    let mut config_reloader = ConfigReloader::load(config_path)?;
+    let config = config_reloader.config();
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&config.runtime.log_level))
-        .with_writer(RuntimeTraceWriter::new(&config))
+        .with_writer(RuntimeTraceWriter::new(config))
         .with_ansi(false)
         .init();
 
-    append_runtime_log(&config, "agent startup started");
-    refresh_wxdb_keys_on_start(&config);
+    append_runtime_log(config, "agent startup started");
+    refresh_wxdb_keys_on_start(config);
 
     let store = SqliteStateStore::open(&config.storage.sqlite_path)
         .with_context(|| format!("opening state store {}", config.storage.sqlite_path))?;
-    let matcher = TriggerMatcher::new(config.listen.clone()).context("building trigger matcher")?;
-    let client = PlatformClient::start(&config)
+    let client = PlatformClient::start(config)
         .await
         .with_context(|| format!("starting {} platform client", config.platform.kind.as_str()))?;
-    let platform_rooms = client.configured_rooms(&config);
+    let platform_rooms = client.configured_rooms(config);
     let mut recent_trigger_attempts = RecentTriggerAttempts::default();
     let mut recent_observed_messages = RecentObservedMessages::default();
 
@@ -74,7 +73,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
         "platform message receiving enabled"
     );
     append_runtime_log(
-        &config,
+        config,
         &format!(
             "platform enabled kind={} rooms={:?}",
             client.kind().as_str(),
@@ -82,7 +81,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
         ),
     );
 
-    let mut next_scheduled_run = next_scheduled_run_after(Utc::now(), &config);
+    let mut next_scheduled_run = next_scheduled_run_after(Utc::now(), config);
     if let Some(run_at) = next_scheduled_run {
         info!(
             run_at_utc = %run_at,
@@ -90,7 +89,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
             "scheduled summary enabled"
         );
         append_runtime_log(
-            &config,
+            config,
             &format!(
                 "scheduled summary enabled next_run_utc={} next_run_beijing={}",
                 run_at,
@@ -100,10 +99,14 @@ async fn run_agent(config_path: &str) -> Result<()> {
     }
 
     loop {
+        reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run)?;
+
         let now = Utc::now();
+        let config = config_reloader.config();
         if next_scheduled_run.is_some_and(|run_at| now >= run_at) {
-            run_scheduled_summaries(&config, &store, &client, now).await?;
-            next_scheduled_run = next_scheduled_run_after(now + Duration::seconds(1), &config);
+            run_scheduled_summaries(config, &store, &client, now).await?;
+            let config = config_reloader.config();
+            next_scheduled_run = next_scheduled_run_after(now + Duration::seconds(1), config);
             if let Some(run_at) = next_scheduled_run {
                 info!(
                     run_at_utc = %run_at,
@@ -114,10 +117,13 @@ async fn run_agent(config_path: &str) -> Result<()> {
         }
 
         if let Some(event) = client.next_event_timeout(StdDuration::from_secs(1))? {
+            reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run)?;
+            let config = config_reloader.config();
+            let matcher = config_reloader.matcher();
             handle_platform_event(
-                &config,
+                config,
                 &store,
-                &matcher,
+                matcher,
                 &client,
                 &mut recent_trigger_attempts,
                 &mut recent_observed_messages,
@@ -126,6 +132,135 @@ async fn run_agent(config_path: &str) -> Result<()> {
             .await?;
         }
     }
+}
+
+fn reload_config_if_changed(
+    config_reloader: &mut ConfigReloader,
+    next_scheduled_run: &mut Option<DateTime<Utc>>,
+) -> Result<()> {
+    if !config_reloader.reload_if_changed()? {
+        return Ok(());
+    }
+
+    let config = config_reloader.config();
+    *next_scheduled_run = next_scheduled_run_after(Utc::now(), config);
+    if let Some(run_at) = next_scheduled_run {
+        info!(
+            run_at_utc = %run_at,
+            run_at_beijing = %format_beijing_time(*run_at),
+            "scheduled summary replanned after config reload"
+        );
+        append_runtime_log(
+            config,
+            &format!(
+                "scheduled summary replanned after config reload next_run_utc={} next_run_beijing={}",
+                run_at,
+                format_beijing_time(*run_at)
+            ),
+        );
+    } else {
+        info!("scheduled summary disabled after config reload");
+        append_runtime_log(config, "scheduled summary disabled after config reload");
+    }
+
+    Ok(())
+}
+
+struct ConfigReloader {
+    path: PathBuf,
+    config: AgentConfig,
+    matcher: TriggerMatcher,
+    last_modified: Option<SystemTime>,
+    last_failed_modified: Option<SystemTime>,
+}
+
+impl ConfigReloader {
+    fn load(config_path: &str) -> Result<Self> {
+        let path = PathBuf::from(config_path);
+        let config = AgentConfig::from_path(&path)
+            .with_context(|| format!("loading config {}", path.display()))?;
+        let matcher =
+            TriggerMatcher::new(config.listen.clone()).context("building trigger matcher")?;
+        let last_modified = config_modified_time(&path);
+        Ok(Self {
+            path,
+            config,
+            matcher,
+            last_modified,
+            last_failed_modified: None,
+        })
+    }
+
+    fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
+    fn matcher(&self) -> &TriggerMatcher {
+        &self.matcher
+    }
+
+    fn reload_if_changed(&mut self) -> Result<bool> {
+        let modified = config_modified_time(&self.path);
+        if modified.is_none() || modified == self.last_modified {
+            return Ok(false);
+        }
+        if modified == self.last_failed_modified {
+            return Ok(false);
+        }
+
+        let config = match AgentConfig::from_path(&self.path) {
+            Ok(config) => config,
+            Err(error) => {
+                self.last_failed_modified = modified;
+                let message = format!(
+                    "config hot reload failed path={} error={}",
+                    self.path.display(),
+                    error
+                );
+                warn!(path = %self.path.display(), error = %error, "config hot reload failed");
+                append_runtime_log(&self.config, &message);
+                return Ok(false);
+            }
+        };
+        let matcher = match TriggerMatcher::new(config.listen.clone()) {
+            Ok(matcher) => matcher,
+            Err(error) => {
+                self.last_failed_modified = modified;
+                let message = format!(
+                    "config hot reload failed path={} error=building trigger matcher: {}",
+                    self.path.display(),
+                    error
+                );
+                warn!(
+                    path = %self.path.display(),
+                    error = %error,
+                    "config hot reload failed while rebuilding trigger matcher"
+                );
+                append_runtime_log(&self.config, &message);
+                return Ok(false);
+            }
+        };
+
+        self.config = config;
+        self.matcher = matcher;
+        self.last_modified = modified;
+        self.last_failed_modified = None;
+        info!(path = %self.path.display(), "config hot reloaded");
+        append_runtime_log(
+            &self.config,
+            &format!(
+                "config hot reloaded path={} note=startup-only settings still require restart: platform listener, storage path, runtime log writer",
+                self.path.display()
+            ),
+        );
+        Ok(true)
+    }
+}
+
+fn config_modified_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 fn refresh_wxdb_keys_on_start(config: &AgentConfig) {
@@ -2470,6 +2605,7 @@ fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use std::time::Duration as TestDuration;
 
     use super::*;
 
@@ -2587,6 +2723,45 @@ mod tests {
         assert_eq!(image_caption_media_decode_limit(&config), Some(7));
         assert_eq!(format_media_decode_limit(Some(7)), "7");
         assert_eq!(format_media_decode_limit(None), "unlimited");
+    }
+
+    #[test]
+    fn config_reloader_applies_valid_file_changes() {
+        let path = unique_config_path();
+        write_hot_reload_config(&path, "/总结", 30);
+        let mut reloader = ConfigReloader::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(reloader.config().time_range.fallback_minutes, 30);
+
+        wait_for_config_mtime_tick();
+        write_hot_reload_config(&path, "/复盘", 90);
+        assert!(reloader.reload_if_changed().unwrap());
+        assert_eq!(reloader.config().time_range.fallback_minutes, 90);
+
+        let incoming = incoming_text("/复盘 1h");
+        assert!(reloader.matcher().match_message(&incoming).is_some());
+        let old_trigger = incoming_text("/总结 1h");
+        assert!(reloader.matcher().match_message(&old_trigger).is_none());
+
+        cleanup_config_path(&path);
+    }
+
+    #[test]
+    fn config_reloader_keeps_old_config_until_invalid_file_is_fixed() {
+        let path = unique_config_path();
+        write_hot_reload_config(&path, "/总结", 30);
+        let mut reloader = ConfigReloader::load(path.to_str().unwrap()).unwrap();
+
+        wait_for_config_mtime_tick();
+        std::fs::write(&path, "not-valid = [").unwrap();
+        assert!(!reloader.reload_if_changed().unwrap());
+        assert_eq!(reloader.config().time_range.fallback_minutes, 30);
+
+        wait_for_config_mtime_tick();
+        write_hot_reload_config(&path, "/总结", 120);
+        assert!(reloader.reload_if_changed().unwrap());
+        assert_eq!(reloader.config().time_range.fallback_minutes, 120);
+
+        cleanup_config_path(&path);
     }
 
     #[test]
@@ -3102,5 +3277,84 @@ mod tests {
             "#,
         )
         .unwrap()
+    }
+
+    fn incoming_text(content: &str) -> IncomingMessage {
+        IncomingMessage {
+            room_id: "测试群".to_string(),
+            room_name: None,
+            sender_id: "user".to_string(),
+            sender_name: None,
+            content: content.to_string(),
+            msg_type: "text".to_string(),
+            timestamp: Utc::now(),
+            is_self: false,
+        }
+    }
+
+    fn write_hot_reload_config(path: &Path, trigger: &str, fallback_minutes: i64) {
+        let base_dir = path.parent().unwrap();
+        let sqlite_path = base_dir.join("state.sqlite");
+        let runtime_dir = base_dir.join("runtime");
+        let text = format!(
+            r#"
+            [wx4py]
+            groups = ["测试群"]
+
+            [listen]
+            triggers = [{}]
+
+            [time_range]
+            fallback_minutes = {}
+
+            [rate_limit]
+
+            [storage]
+            sqlite_path = {}
+
+            [llm]
+            provider = "openai_compatible"
+            api_key_env = "LLM_API_KEY"
+
+            [image_gen]
+            enabled = false
+            provider = "openai"
+            api_key_env = "IMAGE_API_KEY"
+            size = "2:3"
+
+            [runtime]
+            output_dir = {}
+            "#,
+            toml_string(trigger),
+            fallback_minutes,
+            toml_string(&sqlite_path.to_string_lossy()),
+            toml_string(&runtime_dir.to_string_lossy())
+        );
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn unique_config_path() -> PathBuf {
+        let unique = format!(
+            "summary-agent-hot-reload-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("agent.toml")
+    }
+
+    fn toml_string(value: &str) -> String {
+        format!("{value:?}")
+    }
+
+    fn wait_for_config_mtime_tick() {
+        std::thread::sleep(TestDuration::from_millis(100));
+    }
+
+    fn cleanup_config_path(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 }
