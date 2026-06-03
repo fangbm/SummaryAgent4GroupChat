@@ -1,6 +1,7 @@
 use std::{env, fs, path::Path, time::Duration};
 
 use base64::{engine::general_purpose, Engine};
+use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -263,8 +264,65 @@ impl OpenAiVisionCaptionClient {
     }
 
     pub async fn caption_image(&self, image_source: &str) -> Result<String, AiError> {
-        let image_url = image_url_for_multimodal_request(image_source)?;
+        let image_url = self.image_url_for_multimodal_request(image_source).await?;
         self.complete_with_image_url(&image_url).await
+    }
+
+    async fn image_url_for_multimodal_request(&self, source: &str) -> Result<String, AiError> {
+        let trimmed = source.trim();
+        if trimmed.starts_with("data:") {
+            validate_image_data_url(trimmed)?;
+            return Ok(trimmed.to_string());
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return self.download_image_as_data_url(trimmed).await;
+        }
+        let path = Path::new(trimmed);
+        let bytes = fs::read(path)?;
+        image_data_url_from_bytes(Some(path), &bytes)
+    }
+
+    async fn download_image_as_data_url(&self, url: &str) -> Result<String, AiError> {
+        let source = redacted_url_source(url);
+        let started = Instant::now();
+        info!(
+            source = %source,
+            "image caption remote image download started"
+        );
+        let response = self.client.get(url).send().await?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("failed to read image response body: {error}"));
+            let snippet = truncate_for_log(&body, 300);
+            warn!(
+                source = %source,
+                status = %status,
+                elapsed_ms = started.elapsed().as_millis(),
+                response = %snippet,
+                "image caption remote image download failed"
+            );
+            return Err(AiError::InvalidResponse(format!(
+                "remote image download returned {status}: {snippet}"
+            )));
+        }
+        let bytes = response.bytes().await?;
+        let data_url = image_data_url_from_bytes(None, &bytes)?;
+        info!(
+            source = %source,
+            content_type = content_type.as_deref().unwrap_or("unknown"),
+            bytes = bytes.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "image caption remote image downloaded"
+        );
+        Ok(data_url)
     }
 
     async fn complete_with_image_url(&self, image_url: &str) -> Result<String, AiError> {
@@ -441,27 +499,40 @@ fn image_caption_payload(
     })
 }
 
-fn image_url_for_multimodal_request(source: &str) -> Result<String, AiError> {
-    let trimmed = source.trim();
-    if trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("data:")
-    {
-        return Ok(trimmed.to_string());
-    }
-    let path = std::path::Path::new(trimmed);
-    let bytes = std::fs::read(path)?;
-    let mime = image_mime_type(path, &bytes).ok_or_else(|| {
+fn image_data_url_from_bytes(path: Option<&Path>, bytes: &[u8]) -> Result<String, AiError> {
+    let mime = image_mime_type(path, bytes).ok_or_else(|| {
         AiError::InvalidResponse(format!(
             "unsupported image format for captioning: {}",
-            path.display()
+            path.map(|path| path.display().to_string())
+                .unwrap_or_else(|| "downloaded image".to_string())
         ))
     })?;
     let encoded = general_purpose::STANDARD.encode(bytes);
     Ok(format!("data:{mime};base64,{encoded}"))
 }
 
-fn image_mime_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str> {
+fn validate_image_data_url(data_url: &str) -> Result<(), AiError> {
+    let Some((metadata, _payload)) = data_url.split_once(',') else {
+        return Err(AiError::InvalidResponse(
+            "invalid image data URL for captioning".into(),
+        ));
+    };
+    let metadata = metadata.to_ascii_lowercase();
+    let supported = metadata == "data:image/jpeg;base64"
+        || metadata == "data:image/jpg;base64"
+        || metadata == "data:image/png;base64"
+        || metadata == "data:image/gif;base64"
+        || metadata == "data:image/webp;base64";
+    if supported {
+        Ok(())
+    } else {
+        Err(AiError::InvalidResponse(format!(
+            "unsupported image data URL media type for captioning: {metadata}"
+        )))
+    }
+}
+
+fn image_mime_type(path: Option<&Path>, bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 3 && bytes[..3] == [0xff, 0xd8, 0xff] {
         return Some("image/jpeg");
     }
@@ -469,12 +540,12 @@ fn image_mime_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str>
         return Some("image/png");
     }
     if bytes.len() >= 3 && &bytes[..3] == b"GIF" {
-        return Some("image/gif");
+        return gif_is_static(bytes).then_some("image/gif");
     }
     if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         return Some("image/webp");
     }
-    match path
+    match path?
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
@@ -483,10 +554,72 @@ fn image_mime_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str>
     {
         "jpg" | "jpeg" => Some("image/jpeg"),
         "png" => Some("image/png"),
-        "gif" => Some("image/gif"),
+        "gif" if gif_is_static(bytes) => Some("image/gif"),
         "webp" => Some("image/webp"),
-        "bmp" => Some("image/bmp"),
         _ => None,
+    }
+}
+
+fn gif_is_static(bytes: &[u8]) -> bool {
+    if bytes.len() < 13 || (!bytes.starts_with(b"GIF87a") && !bytes.starts_with(b"GIF89a")) {
+        return false;
+    }
+    let mut index = 13usize;
+    let packed = bytes[10];
+    if packed & 0x80 != 0 {
+        index = index.saturating_add(3 * (1usize << ((packed & 0x07) + 1)));
+    }
+
+    let mut frames = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x2c => {
+                frames += 1;
+                if frames > 1 {
+                    return false;
+                }
+                index += 10;
+                if index > bytes.len() {
+                    return false;
+                }
+                let image_packed = bytes[index - 1];
+                if image_packed & 0x80 != 0 {
+                    index = index.saturating_add(3 * (1usize << ((image_packed & 0x07) + 1)));
+                }
+                if index >= bytes.len() {
+                    return false;
+                }
+                index += 1;
+                if !skip_gif_sub_blocks(bytes, &mut index) {
+                    return false;
+                }
+            }
+            0x21 => {
+                index += 2;
+                if !skip_gif_sub_blocks(bytes, &mut index) {
+                    return false;
+                }
+            }
+            0x3b => break,
+            _ => return false,
+        }
+    }
+    frames <= 1
+}
+
+fn skip_gif_sub_blocks(bytes: &[u8], index: &mut usize) -> bool {
+    loop {
+        let Some(size) = bytes.get(*index).copied() else {
+            return false;
+        };
+        *index += 1;
+        if size == 0 {
+            return true;
+        }
+        *index = (*index).saturating_add(size as usize);
+        if *index > bytes.len() {
+            return false;
+        }
     }
 }
 
@@ -1209,9 +1342,49 @@ mod tests {
     #[test]
     fn image_mime_type_detects_png() {
         assert_eq!(
-            image_mime_type(std::path::Path::new("image.bin"), &[0x89, 0x50, 0x4e, 0x47]),
+            image_mime_type(None, &[0x89, 0x50, 0x4e, 0x47]),
             Some("image/png")
         );
+    }
+
+    #[test]
+    fn image_data_url_uses_supported_rfc2397_media_types() {
+        let jpeg = image_data_url_from_bytes(None, &[0xff, 0xd8, 0xff, 0x00]).unwrap();
+        assert!(jpeg.starts_with("data:image/jpeg;base64,"));
+
+        let png = image_data_url_from_bytes(None, &[0x89, 0x50, 0x4e, 0x47]).unwrap();
+        assert!(png.starts_with("data:image/png;base64,"));
+
+        let webp = image_data_url_from_bytes(None, b"RIFF\x00\x00\x00\x00WEBPVP8 \x00\x00\x00\x00")
+            .unwrap();
+        assert!(webp.starts_with("data:image/webp;base64,"));
+    }
+
+    #[test]
+    fn image_data_url_accepts_static_gif_and_rejects_animated_gif() {
+        let static_gif =
+            b"GIF89a\x01\x00\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00;";
+        let animated_gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x00;";
+
+        let static_data_url = image_data_url_from_bytes(None, static_gif).unwrap();
+        assert!(static_data_url.starts_with("data:image/gif;base64,"));
+        assert!(image_data_url_from_bytes(None, animated_gif).is_err());
+    }
+
+    #[test]
+    fn image_data_url_rejects_bmp() {
+        assert!(
+            image_data_url_from_bytes(Some(std::path::Path::new("image.bmp")), b"BM\x00\x00")
+                .is_err()
+        );
+        assert!(image_data_url_from_bytes(Some(std::path::Path::new("image.gif")), b"").is_err());
+    }
+
+    #[test]
+    fn image_data_url_validation_requires_supported_base64_image_type() {
+        assert!(validate_image_data_url("data:image/jpeg;base64,abc").is_ok());
+        assert!(validate_image_data_url("data:image/png,abc").is_err());
+        assert!(validate_image_data_url("data:image/bmp;base64,abc").is_err());
     }
 
     #[test]
