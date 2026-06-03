@@ -28,6 +28,8 @@ pub enum AiError {
     Io(#[from] std::io::Error),
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    #[error("rate limited: {0}")]
+    RateLimited(String),
     #[error("image task failed: {0}")]
     ImageTaskFailed(String),
     #[error("image task timed out after {0} seconds")]
@@ -36,6 +38,7 @@ pub enum AiError {
     Base64(#[from] base64::DecodeError),
 }
 
+#[derive(Clone)]
 pub struct OpenAiCompatibleLlm {
     config: LlmConfig,
     client: reqwest::Client,
@@ -176,9 +179,11 @@ impl OpenAiCompatibleLlm {
                     sleep(chat_completion_retry_delay(attempt)).await;
                     continue;
                 }
-                return Err(AiError::InvalidResponse(format!(
-                    "chat completion API returned {status}: {snippet}"
-                )));
+                let message = format!("chat completion API returned {status}: {snippet}");
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(AiError::RateLimited(message));
+                }
+                return Err(AiError::InvalidResponse(message));
             }
             info!(
                 status = %status,

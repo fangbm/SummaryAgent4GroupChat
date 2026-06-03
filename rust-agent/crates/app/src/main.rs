@@ -8,11 +8,12 @@ use std::{
 
 mod platform;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use wechat_summary_ai::{OpenAiCompatibleLlm, OpenAiImageClient};
+use wechat_summary_ai::{AiError, OpenAiCompatibleLlm, OpenAiImageClient};
 use wechat_summary_core::{
     config::{PlatformKindConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
@@ -27,6 +28,9 @@ const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
 const RECENT_OBSERVED_WINDOW_HOURS: i64 = 6;
 const RECENT_OBSERVED_MAX_MESSAGES: usize = 5_000;
 const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
+const LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS: u64 = 60;
+const LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS: usize = 3;
+const CHUNK_PROMPT_HEADROOM_CHARS: usize = 4_096;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -905,10 +909,7 @@ async fn run_summary_pipeline(
     }
 
     let privacy = PrivacyFilter::new(config.privacy.clone());
-    let llm_input = limit_chars(
-        privacy.apply(&formatted.merged_input),
-        config.privacy.max_chars_to_llm,
-    );
+    let llm_input = privacy.apply(&formatted.merged_input);
     info!(
         room_id = %trigger.room_id,
         input_chars = llm_input.chars().count(),
@@ -932,29 +933,19 @@ async fn run_summary_pipeline(
         .context("initializing LLM client")?;
     let mut pending_text_reply = None;
     if options.text_summary_enabled {
-        let text_summary_prompt = render_prompt_template(
-            &config.text_summary.user_prompt_template,
-            &llm_input,
-            "",
-            "",
-        );
-        info!(
-            room_id = %trigger.room_id,
-            prompt_chars = text_summary_prompt.chars().count(),
-            "calling LLM for text summary"
-        );
-        append_runtime_log(
+        let summary_result = complete_chat_summary_with_fallback(
             config,
-            &format!(
-                "calling llm text summary room={} prompt_chars={}",
-                trigger.room_id,
-                text_summary_prompt.chars().count()
-            ),
-        );
-        let summary = llm
-            .complete(&config.text_summary.system_prompt, &text_summary_prompt)
-            .await
-            .context("calling LLM for text summary")?;
+            &llm,
+            &trigger.room_id,
+            "text summary",
+            &config.text_summary.system_prompt,
+            &config.text_summary.user_prompt_template,
+            &chat_messages,
+            &privacy,
+        )
+        .await
+        .context("calling LLM for text summary")?;
+        let summary = summary_result.output;
         info!(
             room_id = %trigger.room_id,
             output_chars = summary.chars().count(),
@@ -990,6 +981,7 @@ async fn run_summary_pipeline(
             client.sender(),
             trigger.room_id.clone(),
             llm_input,
+            chat_messages.clone(),
             options.text_summary_enabled,
             image_cooldown_recorder,
         );
@@ -1005,29 +997,18 @@ async fn run_summary_pipeline(
     }
 
     if options.image_gen_enabled {
-        let image_summary_request = render_prompt_template(
-            &config.image_summary.user_prompt_template,
-            &llm_input,
-            "",
-            "",
-        );
-        info!(
-            room_id = %trigger.room_id,
-            prompt_chars = image_summary_request.chars().count(),
-            "calling LLM for image summary"
-        );
-        append_runtime_log(
+        let image_summary_result = match complete_chat_summary_with_fallback(
             config,
-            &format!(
-                "calling llm image summary room={} prompt_chars={}",
-                trigger.room_id,
-                image_summary_request.chars().count()
-            ),
-        );
-        let image_summary = match llm
-            .complete(&config.image_summary.system_prompt, &image_summary_request)
-            .await
-            .context("calling LLM for image summary")
+            &llm,
+            &trigger.room_id,
+            "image summary",
+            &config.image_summary.system_prompt,
+            &config.image_summary.user_prompt_template,
+            &chat_messages,
+            &privacy,
+        )
+        .await
+        .context("calling LLM for image summary")
         {
             Ok(summary) => summary,
             Err(error) => {
@@ -1060,6 +1041,14 @@ async fn run_summary_pipeline(
                 return Err(error);
             }
         };
+        let image_summary = image_summary_result.output;
+        let image_prompt_chat_input = chat_input_for_followup_prompt(
+            config,
+            &config.image_prompt.user_prompt_template,
+            &llm_input,
+            &image_summary_result.followup_chat_input,
+            &image_summary,
+        );
         info!(
             room_id = %trigger.room_id,
             output_chars = image_summary.chars().count(),
@@ -1075,7 +1064,7 @@ async fn run_summary_pipeline(
         );
         let image_prompt_request = render_prompt_template(
             &config.image_prompt.user_prompt_template,
-            &llm_input,
+            &image_prompt_chat_input,
             "",
             &image_summary,
         );
@@ -1215,6 +1204,7 @@ fn spawn_background_image_pipeline(
     sender: PlatformSender,
     room_id: String,
     llm_input: String,
+    chat_messages: Vec<ChatMessage>,
     text_summary_enabled: bool,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
 ) {
@@ -1224,6 +1214,7 @@ fn spawn_background_image_pipeline(
             sender,
             room_id,
             llm_input,
+            chat_messages,
             text_summary_enabled,
             image_cooldown_recorder,
         )
@@ -1236,6 +1227,7 @@ async fn run_background_image_pipeline(
     sender: PlatformSender,
     room_id: String,
     llm_input: String,
+    chat_messages: Vec<ChatMessage>,
     text_summary_enabled: bool,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
 ) {
@@ -1244,6 +1236,7 @@ async fn run_background_image_pipeline(
         &sender,
         &room_id,
         &llm_input,
+        &chat_messages,
         image_cooldown_recorder.as_ref(),
     )
     .await;
@@ -1280,33 +1273,25 @@ async fn run_background_image_pipeline_inner(
     sender: &PlatformSender,
     room_id: &str,
     llm_input: &str,
+    chat_messages: &[ChatMessage],
     image_cooldown_recorder: Option<&ImageCooldownRecorder>,
 ) -> Result<()> {
     let llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
         .context("initializing LLM client for background image pipeline")?;
-    let image_summary_request = render_prompt_template(
-        &config.image_summary.user_prompt_template,
-        llm_input,
-        "",
-        "",
-    );
-    info!(
-        room_id = %room_id,
-        prompt_chars = image_summary_request.chars().count(),
-        "calling LLM for background image summary"
-    );
-    append_runtime_log(
+    let privacy = PrivacyFilter::new(config.privacy.clone());
+    let image_summary_result = complete_chat_summary_with_fallback(
         config,
-        &format!(
-            "calling llm background image summary room={} prompt_chars={}",
-            room_id,
-            image_summary_request.chars().count()
-        ),
-    );
-    let image_summary = llm
-        .complete(&config.image_summary.system_prompt, &image_summary_request)
-        .await
-        .context("calling LLM for background image summary")?;
+        &llm,
+        room_id,
+        "background image summary",
+        &config.image_summary.system_prompt,
+        &config.image_summary.user_prompt_template,
+        chat_messages,
+        &privacy,
+    )
+    .await
+    .context("calling LLM for background image summary")?;
+    let image_summary = image_summary_result.output;
     info!(
         room_id = %room_id,
         output_chars = image_summary.chars().count(),
@@ -1321,9 +1306,16 @@ async fn run_background_image_pipeline_inner(
         ),
     );
 
-    let image_prompt_request = render_prompt_template(
+    let image_prompt_chat_input = chat_input_for_followup_prompt(
+        config,
         &config.image_prompt.user_prompt_template,
         llm_input,
+        &image_summary_result.followup_chat_input,
+        &image_summary,
+    );
+    let image_prompt_request = render_prompt_template(
+        &config.image_prompt.user_prompt_template,
+        &image_prompt_chat_input,
         "",
         &image_summary,
     );
@@ -1366,6 +1358,482 @@ async fn run_background_image_pipeline_inner(
         &format!("background image pipeline completed room={}", room_id),
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct LongChatCompletion {
+    output: String,
+    followup_chat_input: String,
+}
+
+#[derive(Debug, Clone)]
+struct LlmChunkRequest {
+    index: usize,
+    message_count: usize,
+    input_chars: usize,
+    prompt_chars: usize,
+    prompt: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkSummary {
+    index: usize,
+    message_count: usize,
+    output: String,
+}
+
+async fn complete_chat_summary_with_fallback(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    stage: &str,
+    system_prompt: &str,
+    user_prompt_template: &str,
+    chat_messages: &[ChatMessage],
+    privacy: &PrivacyFilter,
+) -> Result<LongChatCompletion> {
+    let max_prompt_chars = config.privacy.max_chars_to_llm.max(1);
+    let full_chat_input = private_formatted_chat_input(chat_messages, privacy);
+    let full_prompt = render_prompt_template(user_prompt_template, &full_chat_input, "", "");
+    let full_prompt_chars = full_prompt.chars().count();
+    if full_prompt_chars <= max_prompt_chars || chat_messages.len() <= 1 {
+        append_runtime_log(
+            config,
+            &format!(
+                "calling llm {} room={} prompt_chars={} mode=direct",
+                stage, room_id, full_prompt_chars
+            ),
+        );
+        let output = complete_llm_with_rate_limit_queue(
+            config,
+            llm,
+            room_id,
+            stage,
+            system_prompt,
+            full_prompt,
+        )
+        .await?;
+        return Ok(LongChatCompletion {
+            output,
+            followup_chat_input: full_chat_input,
+        });
+    }
+
+    let chunks = build_llm_chunk_requests(
+        chat_messages,
+        privacy,
+        user_prompt_template,
+        max_prompt_chars,
+    );
+    info!(
+        room_id = %room_id,
+        stage,
+        prompt_chars = full_prompt_chars,
+        max_prompt_chars,
+        chunks = chunks.len(),
+        "LLM long chat fallback activated"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm long chat fallback room={} stage={} prompt_chars={} max_chars={} chunks={}",
+            room_id,
+            stage,
+            full_prompt_chars,
+            max_prompt_chars,
+            chunks.len()
+        ),
+    );
+    let chunk_summaries =
+        complete_chunk_requests(config, llm, room_id, stage, system_prompt, &chunks).await?;
+    let combined_input = format_chunk_summaries_for_final(&chunk_summaries);
+    let final_prompt = render_prompt_template(user_prompt_template, &combined_input, "", "");
+    let final_prompt_chars = final_prompt.chars().count();
+    if final_prompt_chars > max_prompt_chars {
+        warn!(
+            room_id = %room_id,
+            stage,
+            final_prompt_chars,
+            max_prompt_chars,
+            chunks = chunk_summaries.len(),
+            "LLM long chat final summary still exceeds limit; returning concatenated chunk summaries"
+        );
+        append_runtime_log(
+            config,
+            &format!(
+                "llm long chat final skipped room={} stage={} final_prompt_chars={} max_chars={} chunks={}",
+                room_id,
+                stage,
+                final_prompt_chars,
+                max_prompt_chars,
+                chunk_summaries.len()
+            ),
+        );
+        return Ok(LongChatCompletion {
+            output: combined_input.clone(),
+            followup_chat_input: combined_input,
+        });
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "calling llm {} final room={} prompt_chars={} chunks={}",
+            stage,
+            room_id,
+            final_prompt_chars,
+            chunk_summaries.len()
+        ),
+    );
+    let output = complete_llm_with_rate_limit_queue(
+        config,
+        llm,
+        room_id,
+        &format!("{stage} final"),
+        system_prompt,
+        final_prompt,
+    )
+    .await?;
+    Ok(LongChatCompletion {
+        output,
+        followup_chat_input: combined_input,
+    })
+}
+
+async fn complete_chunk_requests(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    stage: &str,
+    system_prompt: &str,
+    chunks: &[LlmChunkRequest],
+) -> Result<Vec<ChunkSummary>> {
+    let mut join_set = JoinSet::new();
+    for chunk in chunks.iter().cloned() {
+        append_runtime_log(
+            config,
+            &format!(
+                "llm chunk scheduled room={} stage={} chunk={}/{} message_count={} input_chars={} prompt_chars={}",
+                room_id,
+                stage,
+                chunk.index + 1,
+                chunks.len(),
+                chunk.message_count,
+                chunk.input_chars,
+                chunk.prompt_chars
+            ),
+        );
+        let llm = llm.clone();
+        let system_prompt = system_prompt.to_string();
+        join_set.spawn(async move {
+            let result = llm.complete(&system_prompt, &chunk.prompt).await;
+            (chunk, result)
+        });
+    }
+
+    let mut summaries = vec![None; chunks.len()];
+    let mut rate_limited = Vec::new();
+    let mut first_error = None;
+    while let Some(joined) = join_set.join_next().await {
+        let (chunk, result) = joined.context("joining LLM chunk request task")?;
+        match result {
+            Ok(output) => {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm chunk completed room={} stage={} chunk={}/{} message_count={} output_chars={}",
+                        room_id,
+                        stage,
+                        chunk.index + 1,
+                        chunks.len(),
+                        chunk.message_count,
+                        output.chars().count()
+                    ),
+                );
+                summaries[chunk.index] = Some(ChunkSummary {
+                    index: chunk.index,
+                    message_count: chunk.message_count,
+                    output,
+                });
+            }
+            Err(AiError::RateLimited(message)) => {
+                warn!(
+                    room_id = %room_id,
+                    stage,
+                    chunk = chunk.index + 1,
+                    total_chunks = chunks.len(),
+                    error = %message,
+                    "LLM chunk hit rate limit; queueing retry"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm chunk rate limited room={} stage={} chunk={}/{} error={}",
+                        room_id,
+                        stage,
+                        chunk.index + 1,
+                        chunks.len(),
+                        message
+                    ),
+                );
+                rate_limited.push(chunk);
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some((chunk.index, error));
+                }
+            }
+        }
+    }
+
+    if let Some((index, error)) = first_error {
+        return Err(anyhow::Error::new(error)
+            .context(format!("calling LLM for {stage} chunk {}", index + 1)));
+    }
+
+    rate_limited.sort_by_key(|chunk| chunk.index);
+    for chunk in rate_limited {
+        append_runtime_log(
+            config,
+            &format!(
+                "llm chunk queued retry waiting room={} stage={} chunk={}/{} delay_seconds={}",
+                room_id,
+                stage,
+                chunk.index + 1,
+                chunks.len(),
+                LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS
+            ),
+        );
+        tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS)).await;
+        let output = complete_llm_with_rate_limit_queue(
+            config,
+            llm,
+            room_id,
+            &format!("{stage} chunk {}", chunk.index + 1),
+            system_prompt,
+            chunk.prompt.clone(),
+        )
+        .await?;
+        summaries[chunk.index] = Some(ChunkSummary {
+            index: chunk.index,
+            message_count: chunk.message_count,
+            output,
+        });
+    }
+
+    summaries
+        .into_iter()
+        .enumerate()
+        .map(|(index, summary)| {
+            summary.with_context(|| format!("missing LLM chunk summary {}", index + 1))
+        })
+        .collect()
+}
+
+async fn complete_llm_with_rate_limit_queue(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    stage: &str,
+    system_prompt: &str,
+    prompt: String,
+) -> Result<String> {
+    for attempt in 1..=LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS {
+        match llm.complete(system_prompt, &prompt).await {
+            Ok(output) => return Ok(output),
+            Err(AiError::RateLimited(message)) if attempt < LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS => {
+                warn!(
+                    room_id = %room_id,
+                    stage,
+                    attempt,
+                    max_attempts = LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
+                    delay_seconds = LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
+                    error = %message,
+                    "LLM request rate limited; queued retry waiting"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm rate limited queued retry room={} stage={} attempt={} delay_seconds={} error={}",
+                        room_id,
+                        stage,
+                        attempt,
+                        LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
+                        message
+                    ),
+                );
+                tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS))
+                    .await;
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
+    }
+
+    bail!(
+        "LLM request for {stage} stayed rate limited after {} queued attempts",
+        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS
+    )
+}
+
+fn build_llm_chunk_requests(
+    messages: &[ChatMessage],
+    privacy: &PrivacyFilter,
+    user_prompt_template: &str,
+    max_prompt_chars: usize,
+) -> Vec<LlmChunkRequest> {
+    let mut sorted = messages.to_vec();
+    sorted.sort_by_key(|message| message.timestamp);
+    let prompt_overhead = render_prompt_template(user_prompt_template, "", "", "")
+        .chars()
+        .count();
+    let line_budget = max_prompt_chars
+        .saturating_sub(prompt_overhead)
+        .saturating_sub(CHUNK_PROMPT_HEADROOM_CHARS)
+        .max(1);
+
+    let mut rough_chunks = Vec::<Vec<ChatMessage>>::new();
+    let mut current = Vec::<ChatMessage>::new();
+    let mut current_chars = 0usize;
+    for message in sorted {
+        let line_chars = formatted_chat_line_chars(&message);
+        if !current.is_empty()
+            && current_chars.saturating_add(line_chars).saturating_add(1) > line_budget
+        {
+            rough_chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current_chars = current_chars.saturating_add(line_chars).saturating_add(1);
+        current.push(message);
+    }
+    if !current.is_empty() {
+        rough_chunks.push(current);
+    }
+
+    let mut fitted_chunks = Vec::<Vec<ChatMessage>>::new();
+    for chunk in rough_chunks {
+        push_fitted_llm_chunks(
+            chunk,
+            privacy,
+            user_prompt_template,
+            max_prompt_chars,
+            &mut fitted_chunks,
+        );
+    }
+
+    fitted_chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk_messages)| {
+            let input = private_formatted_chat_input(&chunk_messages, privacy);
+            let prompt = render_prompt_template(user_prompt_template, &input, "", "");
+            LlmChunkRequest {
+                index,
+                message_count: chunk_messages.len(),
+                input_chars: input.chars().count(),
+                prompt_chars: prompt.chars().count(),
+                prompt,
+            }
+        })
+        .collect()
+}
+
+fn push_fitted_llm_chunks(
+    chunk: Vec<ChatMessage>,
+    privacy: &PrivacyFilter,
+    user_prompt_template: &str,
+    max_prompt_chars: usize,
+    output: &mut Vec<Vec<ChatMessage>>,
+) {
+    if chunk.len() <= 1 {
+        output.push(chunk);
+        return;
+    }
+
+    let input = private_formatted_chat_input(&chunk, privacy);
+    let prompt_chars = render_prompt_template(user_prompt_template, &input, "", "")
+        .chars()
+        .count();
+    if prompt_chars <= max_prompt_chars {
+        output.push(chunk);
+        return;
+    }
+
+    let midpoint = chunk.len() / 2;
+    let right = chunk[midpoint..].to_vec();
+    let left = chunk[..midpoint].to_vec();
+    push_fitted_llm_chunks(
+        left,
+        privacy,
+        user_prompt_template,
+        max_prompt_chars,
+        output,
+    );
+    push_fitted_llm_chunks(
+        right,
+        privacy,
+        user_prompt_template,
+        max_prompt_chars,
+        output,
+    );
+}
+
+fn private_formatted_chat_input(messages: &[ChatMessage], privacy: &PrivacyFilter) -> String {
+    privacy.apply(&ChatFormatter::format(messages).merged_input)
+}
+
+fn formatted_chat_line_chars(message: &ChatMessage) -> usize {
+    format!(
+        "[{}] {}: {}",
+        format_beijing_time(message.timestamp),
+        message.display_sender(),
+        message.content.trim()
+    )
+    .chars()
+    .count()
+}
+
+fn format_chunk_summaries_for_final(summaries: &[ChunkSummary]) -> String {
+    let mut parts = vec![
+        "[CHUNK_SUMMARIES]".to_string(),
+        "以下是同一段群聊按时间顺序切分后的分段总结。请综合这些分段总结，输出一份全局总结；如果无法再次请求模型，可直接发送这些分段总结。"
+            .to_string(),
+    ];
+    for summary in summaries {
+        parts.push(format!(
+            "===== 分段 {}/{}，{} 条 =====\n{}",
+            summary.index + 1,
+            summaries.len(),
+            summary.message_count,
+            summary.output.trim()
+        ));
+    }
+    parts.join("\n\n")
+}
+
+fn chat_input_for_followup_prompt(
+    config: &AgentConfig,
+    user_prompt_template: &str,
+    full_chat_input: &str,
+    fallback_chat_input: &str,
+    image_summary: &str,
+) -> String {
+    let full_prompt_chars =
+        render_prompt_template(user_prompt_template, full_chat_input, "", image_summary)
+            .chars()
+            .count();
+    if full_prompt_chars <= config.privacy.max_chars_to_llm {
+        return full_chat_input.to_string();
+    }
+
+    let fallback_prompt_chars =
+        render_prompt_template(user_prompt_template, fallback_chat_input, "", image_summary)
+            .chars()
+            .count();
+    if fallback_prompt_chars <= config.privacy.max_chars_to_llm {
+        return fallback_chat_input.to_string();
+    }
+
+    format!("[IMAGE_SUMMARY]\n{}", image_summary.trim())
 }
 
 async fn generate_summary_image(
@@ -1732,16 +2200,6 @@ fn is_agent_status_content(content: &str) -> bool {
         || content.starts_with("群聊总结（")
 }
 
-fn limit_chars(input: String, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input;
-    }
-
-    let mut truncated = input.chars().take(max_chars).collect::<String>();
-    truncated.push_str("\n\n[内容已按 max_chars_to_llm 截断]");
-    truncated
-}
-
 fn format_summary_reply(summary: &str, range: &ResolvedTimeRange, total_messages: usize) -> String {
     format!(
         "群聊总结（{} - {}，{} 条）\n\n{}",
@@ -1781,13 +2239,6 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
-
-    #[test]
-    fn limit_chars_appends_truncation_note() {
-        let output = limit_chars("abcdef".to_string(), 3);
-        assert!(output.starts_with("abc"));
-        assert!(output.contains("截断"));
-    }
 
     #[test]
     fn current_trigger_message_matches_self_history_row() {
@@ -1937,6 +2388,82 @@ mod tests {
             msg_type: "text".to_string(),
             timestamp,
             is_self: false,
+        }
+    }
+
+    #[test]
+    fn long_chat_splitter_keeps_whole_messages_and_order() {
+        let privacy = PrivacyFilter::new(wechat_summary_core::config::PrivacyConfig::default());
+        let messages = (0..8)
+            .map(|index| {
+                chat_message(
+                    1_716_464_700 + index,
+                    "alice",
+                    &format!("message-{index} {}", "x".repeat(48)),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let chunks = build_llm_chunk_requests(&messages, &privacy, "{chat_input}", 360);
+
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.prompt_chars <= 360 || chunk.message_count == 1);
+        }
+        let joined_prompts = chunks
+            .iter()
+            .map(|chunk| chunk.prompt.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for index in 0..8 {
+            assert!(joined_prompts.contains(&format!("message-{index}")));
+        }
+        assert!(
+            joined_prompts.find("message-0").unwrap() < joined_prompts.find("message-7").unwrap()
+        );
+    }
+
+    #[test]
+    fn long_chat_splitter_keeps_oversized_single_message_intact() {
+        let privacy = PrivacyFilter::new(wechat_summary_core::config::PrivacyConfig::default());
+        let oversized = "single-oversized ".to_string() + &"x".repeat(1_000);
+        let messages = vec![chat_message(1_716_464_700, "alice", &oversized)];
+
+        let chunks = build_llm_chunk_requests(&messages, &privacy, "{chat_input}", 120);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].message_count, 1);
+        assert!(chunks[0].prompt.contains(&oversized));
+    }
+
+    #[test]
+    fn chunk_summary_concat_keeps_chunk_order() {
+        let combined = format_chunk_summaries_for_final(&[
+            ChunkSummary {
+                index: 0,
+                message_count: 2,
+                output: "第一段".into(),
+            },
+            ChunkSummary {
+                index: 1,
+                message_count: 3,
+                output: "第二段".into(),
+            },
+        ]);
+
+        assert!(combined.contains("[CHUNK_SUMMARIES]"));
+        assert!(combined.find("第一段").unwrap() < combined.find("第二段").unwrap());
+        assert!(combined.contains("分段 1/2"));
+        assert!(combined.contains("分段 2/2"));
+    }
+
+    fn chat_message(ts: i64, sender: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            timestamp: Utc.timestamp_opt(ts, 0).unwrap(),
+            sender_id: sender.into(),
+            sender_name: Some(sender.into()),
+            content: content.into(),
+            msg_type: "text".into(),
         }
     }
 
