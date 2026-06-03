@@ -298,6 +298,7 @@ fn query_history_in_store(
     let mut shards_hit = 0usize;
     let mut cache_modes = HashMap::new();
     let mut media_decode_remaining = query.media_decode_limit;
+    let mut image_resolver = ImageResolveContext::default();
 
     for shard in &shards {
         cache_modes.insert(shard.rel_key.clone(), shard.cache_mode);
@@ -318,6 +319,7 @@ fn query_history_in_store(
             &query.msg_types,
             query.limit,
             &mut media_decode_remaining,
+            &mut image_resolver,
         )?;
         if !rows.is_empty() {
             shards_hit += 1;
@@ -515,6 +517,7 @@ fn query_messages(
     msg_types: &[String],
     limit: usize,
     media_decode_remaining: &mut Option<usize>,
+    image_resolver: &mut ImageResolveContext,
 ) -> Result<Vec<HistoryMessage>> {
     let started = Instant::now();
     let budget_before = *media_decode_remaining;
@@ -612,6 +615,7 @@ fn query_messages(
             if consume_media_decode_budget(media_decode_remaining) {
                 stats.media_decode_attempts += 1;
                 let media = resolve_image_media(
+                    image_resolver,
                     account_root,
                     media_cache_dir,
                     chat_username,
@@ -729,7 +733,34 @@ struct ImageMedia {
     decode_error: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct ImageResolveContext {
+    dir_cache: HashMap<PathBuf, Vec<MediaCandidateEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct MediaCandidateEntry {
+    path: PathBuf,
+    modified_secs: i64,
+}
+
+impl ImageResolveContext {
+    fn collect_nearby_files(&mut self, dir: &Path, timestamp: i64, out: &mut Vec<PathBuf>) {
+        let entries = self
+            .dir_cache
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| read_media_candidate_entries(dir));
+        for entry in entries {
+            let delta = (entry.modified_secs - timestamp).abs();
+            if delta <= 300 {
+                out.push(entry.path.clone());
+            }
+        }
+    }
+}
+
 fn resolve_image_media(
+    resolver: &mut ImageResolveContext,
     account_root: Option<&Path>,
     media_cache_dir: &Path,
     chat_username: &str,
@@ -760,19 +791,21 @@ fn resolve_image_media(
         .join("Message")
         .join(&chat_hash);
 
-    collect_nearby_files(&attach_dir, timestamp, &mut candidates);
-    collect_nearby_files(&temp_dir, timestamp, &mut candidates);
-    collect_nearby_files(
-        &cache_message_dir.join("ImageTemp"),
-        timestamp,
-        &mut candidates,
-    );
-    collect_nearby_files(
-        &cache_message_dir.join("Bubble"),
-        timestamp,
-        &mut candidates,
-    );
-    collect_nearby_files(&cache_message_dir.join("Thumb"), timestamp, &mut candidates);
+    resolver.collect_nearby_files(&attach_dir, timestamp, &mut candidates);
+    resolver.collect_nearby_files(&temp_dir, timestamp, &mut candidates);
+    if !has_full_size_candidate(&candidates) {
+        resolver.collect_nearby_files(
+            &cache_message_dir.join("ImageTemp"),
+            timestamp,
+            &mut candidates,
+        );
+        resolver.collect_nearby_files(
+            &cache_message_dir.join("Bubble"),
+            timestamp,
+            &mut candidates,
+        );
+        resolver.collect_nearby_files(&cache_message_dir.join("Thumb"), timestamp, &mut candidates);
+    }
     candidates.sort();
     candidates.dedup();
 
@@ -861,10 +894,15 @@ fn is_caption_friendly_image_format(format: &str) -> bool {
     matches!(format, "jpg" | "png" | "gif" | "webp" | "bmp")
 }
 
-fn collect_nearby_files(dir: &Path, timestamp: i64, out: &mut Vec<PathBuf>) {
+fn has_full_size_candidate(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| !is_thumbnail_candidate(path))
+}
+
+fn read_media_candidate_entries(dir: &Path) -> Vec<MediaCandidateEntry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() || !is_media_candidate_name(&path) {
@@ -876,11 +914,12 @@ fn collect_nearby_files(dir: &Path, timestamp: i64, out: &mut Vec<PathBuf>) {
         let Ok(modified_secs) = modified.duration_since(std::time::UNIX_EPOCH) else {
             continue;
         };
-        let delta = (modified_secs.as_secs() as i64 - timestamp).abs();
-        if delta <= 300 {
-            out.push(path);
-        }
+        out.push(MediaCandidateEntry {
+            path,
+            modified_secs: modified_secs.as_secs() as i64,
+        });
     }
+    out
 }
 
 fn media_candidate_score(

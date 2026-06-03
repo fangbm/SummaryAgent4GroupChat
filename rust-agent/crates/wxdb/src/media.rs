@@ -1,15 +1,18 @@
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 const V1_MAGIC: &[u8; 6] = b"\x07\x08V1\x08\x07";
 const V2_MAGIC: &[u8; 6] = b"\x07\x08V2\x08\x07";
 const PACKED_HEADER_LEN: usize = 15;
+const CACHEABLE_IMAGE_FORMATS: &[&str] = &["jpg", "png", "gif", "webp", "bmp", "hevc", "tif"];
+const V2_KEY_FAILURE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct DecodedMedia {
@@ -31,25 +34,39 @@ struct V2KeyMaterial {
     xor_key: u8,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredV2KeyMaterial {
+    account_root: String,
+    aes_key: String,
+    xor_key: u8,
+}
+
+#[derive(Debug, Clone)]
+struct V2KeyFailure {
+    error: String,
+    at: Instant,
+}
+
 pub fn decode_media_to_cache(
     dat_path: &Path,
     account_root: Option<&Path>,
     cache_dir: &Path,
 ) -> Result<DecodedMedia> {
+    let cache_key = media_cache_key(dat_path);
+    if let Some(cached) = cached_decoded_media(cache_dir, &cache_key) {
+        return Ok(cached);
+    }
+
     let bytes =
         fs::read(dat_path).with_context(|| format!("读取媒体文件 {}", dat_path.display()))?;
-    let decoded = decode_media_bytes(&bytes, account_root)?;
+    let decoded = decode_media_bytes(&bytes, account_root, Some(cache_dir))?;
     if decoded.format == "bin" {
         bail!("解码后不是可识别图片格式");
     }
 
     fs::create_dir_all(cache_dir)
         .with_context(|| format!("创建媒体缓存目录 {}", cache_dir.display()))?;
-    let output_path = cache_dir.join(format!(
-        "{}.{}",
-        media_cache_key(dat_path, &bytes),
-        decoded.format
-    ));
+    let output_path = cache_dir.join(format!("{}.{}", cache_key, decoded.format));
     if !output_path.exists() {
         fs::write(&output_path, &decoded.data)
             .with_context(|| format!("写入解码图片 {}", output_path.display()))?;
@@ -62,7 +79,11 @@ pub fn decode_media_to_cache(
     })
 }
 
-fn decode_media_bytes(bytes: &[u8], account_root: Option<&Path>) -> Result<DecodedBytes> {
+fn decode_media_bytes(
+    bytes: &[u8],
+    account_root: Option<&Path>,
+    cache_dir: Option<&Path>,
+) -> Result<DecodedBytes> {
     if bytes.is_empty() {
         bail!("空媒体文件");
     }
@@ -79,7 +100,7 @@ fn decode_media_bytes(bytes: &[u8], account_root: Option<&Path>) -> Result<Decod
     }
     if bytes.starts_with(V2_MAGIC) {
         let account_root = account_root.ok_or_else(|| anyhow!("V2 图片缺少账号根目录"))?;
-        let key = image_v2_key(account_root)?;
+        let key = image_v2_key(account_root, cache_dir)?;
         return decode_packed_aes_xor(bytes, key.aes_key, key.xor_key, "v2_aes");
     }
     decode_legacy_xor(bytes)
@@ -231,29 +252,136 @@ pub fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn media_cache_key(path: &Path, bytes: &[u8]) -> String {
-    let modified = path
-        .metadata()
-        .and_then(|metadata| metadata.modified())
-        .ok()
+fn media_cache_key(path: &Path) -> String {
+    let metadata = path.metadata().ok();
+    let len = metadata
+        .as_ref()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let modified = metadata
+        .and_then(|metadata| metadata.modified().ok())
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let input = format!("{}:{}:{modified}", path.display(), bytes.len());
+    let input = format!("{}:{len}:{modified}", path.display());
     format!("{:x}", md5::compute(input.as_bytes()))
 }
 
-fn image_v2_key(account_root: &Path) -> Result<V2KeyMaterial> {
+fn cached_decoded_media(cache_dir: &Path, cache_key: &str) -> Option<DecodedMedia> {
+    for &format in CACHEABLE_IMAGE_FORMATS {
+        let path = cache_dir.join(format!("{cache_key}.{format}"));
+        if path.is_file() {
+            return Some(DecodedMedia {
+                path,
+                format,
+                decoder: "cache",
+            });
+        }
+    }
+    None
+}
+
+fn image_v2_key(account_root: &Path, cache_dir: Option<&Path>) -> Result<V2KeyMaterial> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, V2KeyMaterial>>> = OnceLock::new();
+    static FAILURES: OnceLock<Mutex<HashMap<PathBuf, V2KeyFailure>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let failures = FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     let key_path = account_root.to_path_buf();
     if let Some(key) = cache.lock().unwrap().get(&key_path).copied() {
         return Ok(key);
     }
+    if let Some(error) = cached_v2_key_failure(failures, &key_path) {
+        return Err(anyhow!(error));
+    }
+    if let Some(cache_dir) = cache_dir {
+        if let Some(key) = load_cached_v2_key(cache_dir, account_root) {
+            failures.lock().unwrap().remove(&key_path);
+            cache.lock().unwrap().insert(key_path, key);
+            return Ok(key);
+        }
+    }
     let attach_root = account_root.join("msg").join("attach");
-    let key = platform_image_v2_key(&attach_root)?;
+    let key = match platform_image_v2_key(&attach_root) {
+        Ok(key) => key,
+        Err(error) => {
+            failures.lock().unwrap().insert(
+                key_path,
+                V2KeyFailure {
+                    error: error.to_string(),
+                    at: Instant::now(),
+                },
+            );
+            return Err(error);
+        }
+    };
+    if let Some(cache_dir) = cache_dir {
+        store_cached_v2_key(cache_dir, account_root, key);
+    }
+    failures.lock().unwrap().remove(&key_path);
     cache.lock().unwrap().insert(key_path, key);
     Ok(key)
+}
+
+fn cached_v2_key_failure(
+    failures: &Mutex<HashMap<PathBuf, V2KeyFailure>>,
+    key_path: &Path,
+) -> Option<String> {
+    let mut failures = failures.lock().unwrap();
+    match failures.get(key_path) {
+        Some(failure) if failure.at.elapsed() < V2_KEY_FAILURE_CACHE_TTL => {
+            Some(failure.error.clone())
+        }
+        Some(_) => {
+            failures.remove(key_path);
+            None
+        }
+        None => None,
+    }
+}
+
+fn load_cached_v2_key(cache_dir: &Path, account_root: &Path) -> Option<V2KeyMaterial> {
+    let path = v2_key_cache_path(cache_dir);
+    let raw = fs::read_to_string(path).ok()?;
+    let stored: StoredV2KeyMaterial = serde_json::from_str(&raw).ok()?;
+    if stored.account_root != account_root.display().to_string() {
+        return None;
+    }
+    Some(V2KeyMaterial {
+        aes_key: parse_hex_16(&stored.aes_key)?,
+        xor_key: stored.xor_key,
+    })
+}
+
+fn store_cached_v2_key(cache_dir: &Path, account_root: &Path, key: V2KeyMaterial) {
+    let _ = fs::create_dir_all(cache_dir);
+    let stored = StoredV2KeyMaterial {
+        account_root: account_root.display().to_string(),
+        aes_key: hex_bytes(&key.aes_key),
+        xor_key: key.xor_key,
+    };
+    if let Ok(raw) = serde_json::to_string_pretty(&stored) {
+        let _ = fs::write(v2_key_cache_path(cache_dir), raw);
+    }
+}
+
+fn v2_key_cache_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("image-v2-key.json")
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_hex_16(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(chunk).ok()?;
+        out[index] = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(out)
 }
 
 #[cfg(target_os = "windows")]
