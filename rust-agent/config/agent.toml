@@ -369,6 +369,27 @@ size = "2:3"
 resolution = "1k"
 timeout_seconds = 300
 
+[image_caption]
+enabled = false
+provider = "openai_compatible"
+# Optional persistent values. If left empty/commented, the *_env variables below are used.
+# api_key = ""
+# base_url = "https://api.example.com/v1"
+# model = "vision-model-name"
+api_key_env = "IMAGE_CAPTION_API_KEY"
+base_url_env = "IMAGE_CAPTION_BASE_URL"
+model_env = "IMAGE_CAPTION_MODEL"
+timeout_seconds = 120
+max_output_tokens = 500
+temperature = 0.1
+max_images_per_summary = 20
+system_prompt = "你是图片转述助手。请客观描述图片中的可见内容，重点提取与群聊上下文相关的信息；不要推断不可见的私人信息，不要编造。"
+user_prompt = "请用一到三句话中文转述这张聊天图片的可见内容，适合插回聊天记录供群聊总结模型理解。"
+
+[image_caption.request_body_overrides]
+# Extra JSON fields merged into the multimodal chat completion request body.
+# enable_thinking = false
+
 [proxy]
 enabled = false
 http = "http://127.0.0.1:7890"

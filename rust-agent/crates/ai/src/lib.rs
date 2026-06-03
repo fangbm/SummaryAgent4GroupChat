@@ -9,7 +9,7 @@ use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 use wechat_summary_core::{
-    config::{ImageGenConfig, LlmConfig, ProxyConfig},
+    config::{ImageCaptionConfig, ImageGenConfig, LlmConfig, ProxyConfig},
     ImageArtifact,
 };
 
@@ -226,6 +226,153 @@ impl OpenAiCompatibleLlm {
     }
 }
 
+pub struct OpenAiVisionCaptionClient {
+    config: ImageCaptionConfig,
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+impl OpenAiVisionCaptionClient {
+    pub fn new(config: ImageCaptionConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
+        let api_key = config_value_or_env(
+            config.api_key.as_deref(),
+            &config.api_key_env,
+            "image caption API key",
+        )
+        .map_err(|_| missing_api_key(&config.api_key_env))?;
+        let base_url = config_value_or_env(
+            config.base_url.as_deref(),
+            &config.base_url_env,
+            "image caption API base URL",
+        )?;
+        let model = config_value_or_env(
+            config.model.as_deref(),
+            &config.model_env,
+            "image caption model name",
+        )?;
+        let client = http_client(config.timeout_seconds, proxy)?;
+        Ok(Self {
+            config,
+            client,
+            api_key,
+            base_url,
+            model,
+        })
+    }
+
+    pub async fn caption_image(&self, image_source: &str) -> Result<String, AiError> {
+        let image_url = image_url_for_multimodal_request(image_source)?;
+        self.complete_with_image_url(&image_url).await
+    }
+
+    async fn complete_with_image_url(&self, image_url: &str) -> Result<String, AiError> {
+        let endpoint = chat_completions_endpoint(&self.base_url);
+        let mut payload = image_caption_payload(
+            &self.model,
+            &self.config.system_prompt,
+            &self.config.user_prompt,
+            image_url,
+            self.config.temperature,
+            self.config.max_output_tokens,
+        );
+        apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
+
+        for attempt in 1..=CHAT_COMPLETION_MAX_ATTEMPTS {
+            let started = Instant::now();
+            info!(
+                base_url = %self.base_url,
+                model = %self.model,
+                prompt_chars = self.config.user_prompt.chars().count(),
+                max_tokens = self.config.max_output_tokens,
+                timeout_seconds = self.config.timeout_seconds,
+                attempt,
+                max_attempts = CHAT_COMPLETION_MAX_ATTEMPTS,
+                image_source_kind = if image_url.starts_with("data:") { "data_url" } else { "url" },
+                "image caption request started"
+            );
+            let response = match self
+                .client
+                .post(&endpoint)
+                .bearer_auth(&self.api_key)
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let retry = attempt < CHAT_COMPLETION_MAX_ATTEMPTS
+                        && should_retry_chat_completion_transport_error(&error);
+                    warn!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        attempt,
+                        retry,
+                        error = %error,
+                        "image caption transport failed"
+                    );
+                    if retry {
+                        sleep(chat_completion_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+                let snippet = truncate_for_log(&body, 500);
+                let retry = attempt < CHAT_COMPLETION_MAX_ATTEMPTS
+                    && should_retry_chat_completion_failure(status, &snippet);
+                warn!(
+                    status = %status,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    attempt,
+                    retry,
+                    response = %snippet,
+                    "image caption request failed"
+                );
+                if retry {
+                    sleep(chat_completion_retry_delay(attempt)).await;
+                    continue;
+                }
+                let message = format!("image caption API returned {status}: {snippet}");
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(AiError::RateLimited(message));
+                }
+                return Err(AiError::InvalidResponse(message));
+            }
+
+            let body = response.text().await?;
+            let response = serde_json::from_str::<Value>(&body).map_err(|error| {
+                let snippet = truncate_for_log(&body, 500);
+                warn!(
+                    response = %snippet,
+                    "image caption JSON parsing failed"
+                );
+                AiError::InvalidResponse(format!("invalid image caption JSON: {error}"))
+            })?;
+            let content = extract_chat_completion_content(&response).ok_or_else(|| {
+                let finish_reason = chat_completion_finish_reason(&response);
+                AiError::InvalidResponse(format!(
+                    "missing image caption content (finish_reason={finish_reason})"
+                ))
+            })?;
+            info!(
+                output_chars = content.chars().count(),
+                "image caption response parsed"
+            );
+            return Ok(content);
+        }
+
+        unreachable!("image caption retry loop always returns")
+    }
+}
+
 fn should_retry_chat_completion_failure(status: reqwest::StatusCode, body: &str) -> bool {
     status.is_server_error()
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -267,6 +414,80 @@ fn chat_completion_payload(
         }
     }
     payload
+}
+
+fn image_caption_payload(
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    image_url: &str,
+    temperature: f32,
+    max_tokens: u32,
+) -> Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]
+            }
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    })
+}
+
+fn image_url_for_multimodal_request(source: &str) -> Result<String, AiError> {
+    let trimmed = source.trim();
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("data:")
+    {
+        return Ok(trimmed.to_string());
+    }
+    let path = std::path::Path::new(trimmed);
+    let bytes = std::fs::read(path)?;
+    let mime = image_mime_type(path, &bytes).ok_or_else(|| {
+        AiError::InvalidResponse(format!(
+            "unsupported image format for captioning: {}",
+            path.display()
+        ))
+    })?;
+    let encoded = general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+fn image_mime_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 3 && bytes[..3] == [0xff, 0xd8, 0xff] {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 4 && bytes[..4] == [0x89, 0x50, 0x4e, 0x47] {
+        return Some("image/png");
+    }
+    if bytes.len() >= 3 && &bytes[..3] == b"GIF" {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
 }
 
 fn apply_request_body_overrides(
@@ -891,6 +1112,26 @@ mod tests {
         }
     }
 
+    fn image_caption_config() -> ImageCaptionConfig {
+        ImageCaptionConfig {
+            enabled: true,
+            provider: "openai_compatible".into(),
+            api_key: None,
+            api_key_env: "IMAGE_CAPTION_API_KEY".into(),
+            base_url: None,
+            base_url_env: "IMAGE_CAPTION_BASE_URL".into(),
+            model: None,
+            model_env: "IMAGE_CAPTION_MODEL".into(),
+            timeout_seconds: 120,
+            max_output_tokens: 500,
+            temperature: 0.1,
+            system_prompt: "describe".into(),
+            user_prompt: "caption".into(),
+            max_images_per_summary: 20,
+            request_body_overrides: Default::default(),
+        }
+    }
+
     fn image_config() -> ImageGenConfig {
         ImageGenConfig {
             enabled: true,
@@ -924,6 +1165,53 @@ mod tests {
         assert_eq!(payload["size"], "16:9");
         assert_eq!(payload["resolution"], "2k");
         assert!(payload.get("quality").is_none());
+    }
+
+    #[test]
+    fn image_caption_payload_uses_multimodal_content() {
+        let payload = image_caption_payload(
+            "vision-model",
+            "system",
+            "describe image",
+            "data:image/png;base64,abc",
+            0.1,
+            500,
+        );
+
+        assert_eq!(payload["model"], "vision-model");
+        assert_eq!(payload["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(payload["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            payload["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,abc"
+        );
+    }
+
+    #[test]
+    fn image_caption_client_can_use_persistent_config_values() {
+        let mut config = image_caption_config();
+        config.api_key = Some("persisted-key".into());
+        config.base_url = Some("https://api.example.com/v1".into());
+        config.model = Some("vision-model".into());
+        let proxy = ProxyConfig {
+            enabled: false,
+            http: None,
+            https: None,
+        };
+
+        let client = OpenAiVisionCaptionClient::new(config, &proxy).unwrap();
+
+        assert_eq!(client.api_key, "persisted-key");
+        assert_eq!(client.base_url, "https://api.example.com/v1");
+        assert_eq!(client.model, "vision-model");
+    }
+
+    #[test]
+    fn image_mime_type_detects_png() {
+        assert_eq!(
+            image_mime_type(std::path::Path::new("image.bin"), &[0x89, 0x50, 0x4e, 0x47]),
+            Some("image/png")
+        );
     }
 
     #[test]

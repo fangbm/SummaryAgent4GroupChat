@@ -440,6 +440,10 @@ fn query_text_messages_via_builtin_wxdb(
                 thumbnail_path: message
                     .thumbnail_path
                     .map(|path| path.to_string_lossy().into_owned()),
+                decoded_media_path: message
+                    .decoded_media_path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                media_decode_error: message.media_decode_error,
                 is_self: false,
             })
         })
@@ -685,6 +689,8 @@ pub struct Wx4pyHistoryMessage {
     pub msg_type: String,
     pub media_path: Option<String>,
     pub thumbnail_path: Option<String>,
+    pub decoded_media_path: Option<String>,
+    pub media_decode_error: Option<String>,
     pub is_self: bool,
 }
 
@@ -968,6 +974,8 @@ fn normalize_wx_cli_message(value: Value) -> Result<Option<Wx4pyHistoryMessage>>
         msg_type: normalized_type,
         media_path: string_field(object, &["media_path", "path", "file_path"]),
         thumbnail_path: string_field(object, &["thumbnail_path", "thumb_path", "thumb"]),
+        decoded_media_path: string_field(object, &["decoded_media_path", "decoded_path"]),
+        media_decode_error: string_field(object, &["media_decode_error", "decode_error"]),
         is_self: bool_field(object, &["is_self", "isSender"]).unwrap_or(false),
     }))
 }
@@ -1189,7 +1197,8 @@ mod tests {
                     "content": "[图片] local_id=26032",
                     "type": "image",
                     "media_path": "D:\\Temp\\image.dat",
-                    "thumbnail_path": "D:\\Temp\\image_t.dat"
+                    "thumbnail_path": "D:\\Temp\\image_t.dat",
+                    "decoded_media_path": "D:\\Temp\\decoded.jpg"
                 }
             ]
         }"#;
@@ -1206,6 +1215,10 @@ mod tests {
         assert_eq!(
             messages[0].thumbnail_path.as_deref(),
             Some(r"D:\Temp\image_t.dat")
+        );
+        assert_eq!(
+            messages[0].decoded_media_path.as_deref(),
+            Some(r"D:\Temp\decoded.jpg")
         );
     }
 

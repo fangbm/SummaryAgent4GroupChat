@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::cache::{CacheMode, DbCache};
 use crate::config::{self, RuntimeConfig};
 use crate::keyring;
+use crate::media;
 
 #[derive(Debug, Clone)]
 pub struct HistoryQuery {
@@ -43,6 +44,12 @@ pub struct HistoryMessage {
     pub thumbnail_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media_candidates: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoded_media_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_decoder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_decode_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,6 +196,7 @@ fn query_history_in_store(
         HashMap::new()
     };
     let names_map = names.map.clone();
+    let media_cache_dir = config.cache_dir_for(db_dir).join("media");
     let mut all_messages = Vec::new();
     let mut shards_hit = 0usize;
     let mut cache_modes = HashMap::new();
@@ -203,6 +211,7 @@ fn query_history_in_store(
             &names_map,
             &group_nicknames,
             db_dir.parent(),
+            &media_cache_dir,
             query.since.map(|dt| dt.timestamp()),
             query.until.map(|dt| dt.timestamp()),
             query.text_only,
@@ -380,6 +389,7 @@ fn query_messages(
     names_map: &HashMap<String, String>,
     group_nicknames: &HashMap<String, String>,
     account_root: Option<&Path>,
+    media_cache_dir: &Path,
     since: Option<i64>,
     until: Option<i64>,
     text_only: bool,
@@ -457,7 +467,15 @@ fn query_messages(
             continue;
         }
         let image_media = (base_type == 3)
-            .then(|| resolve_image_media(account_root, chat_username, timestamp, &raw_content))
+            .then(|| {
+                resolve_image_media(
+                    account_root,
+                    media_cache_dir,
+                    chat_username,
+                    timestamp,
+                    &raw_content,
+                )
+            })
             .flatten();
         messages.push(HistoryMessage {
             timestamp,
@@ -484,8 +502,16 @@ fn query_messages(
                 .as_ref()
                 .and_then(|media| media.thumbnail_path.clone()),
             media_candidates: image_media
-                .map(|media| media.candidates)
+                .as_ref()
+                .map(|media| media.candidates.clone())
                 .unwrap_or_default(),
+            decoded_media_path: image_media
+                .as_ref()
+                .and_then(|media| media.decoded_path.clone()),
+            media_decoder: image_media.as_ref().and_then(|media| media.decoder.clone()),
+            media_decode_error: image_media
+                .as_ref()
+                .and_then(|media| media.decode_error.clone()),
         });
     }
     Ok(messages)
@@ -496,10 +522,14 @@ struct ImageMedia {
     media_path: Option<PathBuf>,
     thumbnail_path: Option<PathBuf>,
     candidates: Vec<PathBuf>,
+    decoded_path: Option<PathBuf>,
+    decoder: Option<String>,
+    decode_error: Option<String>,
 }
 
 fn resolve_image_media(
     account_root: Option<&Path>,
+    media_cache_dir: &Path,
     chat_username: &str,
     timestamp: i64,
     raw_content: &str,
@@ -555,11 +585,78 @@ fn resolve_image_media(
         .filter(|path| is_thumbnail_candidate(path))
         .min_by_key(|path| media_candidate_score(path, timestamp, image_md5.as_deref()))
         .cloned();
+    let decode_result = decode_first_media_candidate(
+        account_root,
+        media_cache_dir,
+        preferred.as_ref(),
+        thumbnail.as_ref(),
+        &candidates,
+    );
+    let (decoded_path, decoder, decode_error) = match decode_result {
+        Ok(Some(decoded)) => (
+            Some(decoded.path),
+            Some(decoded.decoder.to_string()),
+            None::<String>,
+        ),
+        Ok(None) => (None, None, None),
+        Err(error) => (None, None, Some(error.to_string())),
+    };
     (!candidates.is_empty()).then_some(ImageMedia {
         media_path: preferred,
         thumbnail_path: thumbnail,
         candidates,
+        decoded_path,
+        decoder,
+        decode_error,
     })
+}
+
+fn decode_first_media_candidate(
+    account_root: &Path,
+    media_cache_dir: &Path,
+    preferred: Option<&PathBuf>,
+    thumbnail: Option<&PathBuf>,
+    candidates: &[PathBuf],
+) -> Result<Option<media::DecodedMedia>> {
+    let mut paths = Vec::<&PathBuf>::new();
+    if let Some(path) = preferred {
+        paths.push(path);
+    }
+    if let Some(path) = thumbnail {
+        paths.push(path);
+    }
+    for path in candidates {
+        if !paths.iter().any(|known| *known == path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut errors = Vec::new();
+    let mut fallback = None;
+    for path in paths {
+        match media::decode_media_to_cache(path, Some(account_root), media_cache_dir) {
+            Ok(decoded) if is_caption_friendly_image_format(decoded.format) => {
+                return Ok(Some(decoded))
+            }
+            Ok(decoded) => {
+                if fallback.is_none() {
+                    fallback = Some(decoded);
+                }
+            }
+            Err(error) => errors.push(format!("{}: {error:#}", path.display())),
+        }
+    }
+    if fallback.is_some() {
+        return Ok(fallback);
+    }
+    anyhow::bail!("{}", errors.join(" | "))
+}
+
+fn is_caption_friendly_image_format(format: &str) -> bool {
+    matches!(format, "jpg" | "png" | "gif" | "webp" | "bmp")
 }
 
 fn collect_nearby_files(dir: &Path, timestamp: i64, out: &mut Vec<PathBuf>) {
@@ -948,6 +1045,13 @@ mod tests {
             )),
             3
         );
+    }
+
+    #[test]
+    fn caption_friendly_image_formats_exclude_hevc() {
+        assert!(is_caption_friendly_image_format("jpg"));
+        assert!(is_caption_friendly_image_format("png"));
+        assert!(!is_caption_friendly_image_format("hevc"));
     }
 
     #[test]

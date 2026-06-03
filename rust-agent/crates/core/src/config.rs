@@ -47,6 +47,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub image_prompt: ImagePromptConfig,
     #[serde(default)]
+    pub image_caption: ImageCaptionConfig,
+    #[serde(default)]
     pub proxy: ProxyConfig,
     pub runtime: RuntimeConfig,
 }
@@ -446,6 +448,62 @@ impl Default for ImagePromptConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageCaptionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_image_caption_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_image_caption_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_image_caption_base_url_env")]
+    pub base_url_env: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_image_caption_model_env")]
+    pub model_env: String,
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_image_caption_max_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default = "default_image_caption_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_image_caption_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_image_caption_user_prompt")]
+    pub user_prompt: String,
+    #[serde(default = "default_image_caption_max_images")]
+    pub max_images_per_summary: usize,
+    #[serde(default)]
+    pub request_body_overrides: BTreeMap<String, toml::Value>,
+}
+
+impl Default for ImageCaptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_image_caption_provider(),
+            api_key: None,
+            api_key_env: default_image_caption_api_key_env(),
+            base_url: None,
+            base_url_env: default_image_caption_base_url_env(),
+            model: None,
+            model_env: default_image_caption_model_env(),
+            timeout_seconds: default_llm_timeout(),
+            max_output_tokens: default_image_caption_max_output_tokens(),
+            temperature: default_image_caption_temperature(),
+            system_prompt: default_image_caption_system_prompt(),
+            user_prompt: default_image_caption_user_prompt(),
+            max_images_per_summary: default_image_caption_max_images(),
+            request_body_overrides: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProxyConfig {
     #[serde(default)]
@@ -557,6 +615,22 @@ fn default_image_model_env() -> String {
     "IMAGE_MODEL".to_string()
 }
 
+fn default_image_caption_provider() -> String {
+    "openai_compatible".to_string()
+}
+
+fn default_image_caption_api_key_env() -> String {
+    "IMAGE_CAPTION_API_KEY".to_string()
+}
+
+fn default_image_caption_base_url_env() -> String {
+    "IMAGE_CAPTION_BASE_URL".to_string()
+}
+
+fn default_image_caption_model_env() -> String {
+    "IMAGE_CAPTION_MODEL".to_string()
+}
+
 fn default_image_timeout() -> u64 {
     300
 }
@@ -575,6 +649,18 @@ fn default_max_output_tokens() -> u32 {
 
 fn default_temperature() -> f32 {
     0.3
+}
+
+fn default_image_caption_max_output_tokens() -> u32 {
+    500
+}
+
+fn default_image_caption_temperature() -> f32 {
+    0.1
+}
+
+fn default_image_caption_max_images() -> usize {
+    20
 }
 
 fn default_text_summary_system_prompt() -> String {
@@ -611,6 +697,14 @@ fn default_image_prompt_user_prompt_template() -> String {
 - 不要要求展示真实手机号、邮箱、身份证、地址等隐私信息
 - 只输出最终生图 prompt，不要 Markdown，不要 JSON"#
         .to_string()
+}
+
+fn default_image_caption_system_prompt() -> String {
+    "你是图片转述助手。请客观描述图片中的可见内容，重点提取与群聊上下文相关的信息；不要推断不可见的私人信息，不要编造。".to_string()
+}
+
+fn default_image_caption_user_prompt() -> String {
+    "请用一到三句话中文转述这张聊天图片的可见内容，适合插回聊天记录供群聊总结模型理解。".to_string()
 }
 
 fn default_log_level() -> String {
@@ -698,6 +792,7 @@ mod tests {
         let text_summary: TextSummaryConfig = toml::from_str("").unwrap();
         let image_summary: ImageSummaryConfig = toml::from_str("").unwrap();
         let image_prompt: ImagePromptConfig = toml::from_str("").unwrap();
+        let image_caption: ImageCaptionConfig = toml::from_str("").unwrap();
 
         assert!(text_summary.enabled);
         assert!(text_summary.system_prompt.contains("文字总结"));
@@ -707,6 +802,9 @@ mod tests {
             .user_prompt_template
             .contains("{image_summary}"));
         assert!(image_prompt.user_prompt_template.contains("{chat_input}"));
+        assert!(!image_caption.enabled);
+        assert_eq!(image_caption.model_env, "IMAGE_CAPTION_MODEL");
+        assert!(image_caption.user_prompt.contains("转述"));
     }
 
     #[test]

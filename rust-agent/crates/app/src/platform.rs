@@ -243,6 +243,8 @@ impl DiscordPlatform {
                     content,
                     msg_type: discord_message_msg_type(message).to_string(),
                     media_path: image_url,
+                    decoded_media_path: None,
+                    media_decode_error: None,
                     thumbnail_path: None,
                     is_self: message.author.id == self.bot_user_id,
                 });
@@ -387,6 +389,8 @@ pub struct PlatformHistoryMessage {
     pub msg_type: String,
     pub media_path: Option<String>,
     pub thumbnail_path: Option<String>,
+    pub decoded_media_path: Option<String>,
+    pub media_decode_error: Option<String>,
     pub is_self: bool,
 }
 
@@ -400,6 +404,8 @@ impl From<Wx4pyHistoryMessage> for PlatformHistoryMessage {
             msg_type: message.msg_type,
             media_path: message.media_path,
             thumbnail_path: message.thumbnail_path,
+            decoded_media_path: message.decoded_media_path,
+            media_decode_error: message.media_decode_error,
             is_self: message.is_self,
         }
     }

@@ -85,6 +85,16 @@ struct ConfigView {
     image_size: String,
     image_resolution: String,
     image_timeout: u64,
+    image_caption_enabled: bool,
+    image_caption_provider: String,
+    image_caption_api_key_env: String,
+    image_caption_base_url_env: String,
+    image_caption_model: String,
+    image_caption_model_env: String,
+    image_caption_timeout: u64,
+    image_caption_max_tokens: u32,
+    image_caption_max_images: u32,
+    image_caption_request_body_overrides: String,
     runtime_output_dir: String,
     runtime_log_level: String,
     runtime_cleanup_days: u32,
@@ -815,47 +825,73 @@ fn schedule_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
 
 fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
     ui.heading("模型与图片");
-    two_columns(
-        ui,
-        |ui| {
-            text_field(ui, "LLM Provider", &mut view.llm_provider);
-            text_field(ui, "LLM API Key 环境变量/直接值", &mut view.llm_api_key_env);
-            text_field(
-                ui,
-                "LLM Base URL 环境变量/直接值",
-                &mut view.llm_base_url_env,
-            );
-            text_field(ui, "模型名称", &mut view.llm_model);
-            text_field(ui, "模型环境变量", &mut view.llm_model_env);
-            number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
-            number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
-            number_u32(ui, "LLM 最大输入字符数", &mut view.llm_max_input_chars);
-            multiline_field(
-                ui,
-                "LLM 请求体覆盖(JSON)",
-                &mut view.llm_request_body_overrides,
-                7,
-            );
-        },
-        |ui| {
-            ui.checkbox(&mut view.image_enabled, "启用图片生成");
-            text_field(ui, "图片 Provider", &mut view.image_provider);
-            text_field(
-                ui,
-                "图片 API Key 环境变量/直接值",
-                &mut view.image_api_key_env,
-            );
-            text_field(
-                ui,
-                "图片 Base URL 环境变量/直接值",
-                &mut view.image_base_url_env,
-            );
-            text_field(ui, "图片 Model 环境变量/直接值", &mut view.image_model_env);
-            text_field(ui, "图片尺寸", &mut view.image_size);
-            text_field(ui, "图片分辨率", &mut view.image_resolution);
-            number_u64(ui, "图片超时秒数", &mut view.image_timeout);
-        },
-    );
+    ui.columns(3, |columns| {
+        let ui = &mut columns[0];
+        ui.heading("文字总结");
+        text_field(ui, "LLM Provider", &mut view.llm_provider);
+        text_field(ui, "LLM API Key 环境变量/直接值", &mut view.llm_api_key_env);
+        text_field(
+            ui,
+            "LLM Base URL 环境变量/直接值",
+            &mut view.llm_base_url_env,
+        );
+        text_field(ui, "模型名称", &mut view.llm_model);
+        text_field(ui, "模型环境变量", &mut view.llm_model_env);
+        number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
+        number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
+        number_u32(ui, "LLM 最大输入字符数", &mut view.llm_max_input_chars);
+        multiline_field(
+            ui,
+            "LLM 请求体覆盖(JSON)",
+            &mut view.llm_request_body_overrides,
+            6,
+        );
+
+        let ui = &mut columns[1];
+        ui.heading("图片生成");
+        ui.checkbox(&mut view.image_enabled, "启用图片生成");
+        text_field(ui, "图片 Provider", &mut view.image_provider);
+        text_field(
+            ui,
+            "图片 API Key 环境变量/直接值",
+            &mut view.image_api_key_env,
+        );
+        text_field(
+            ui,
+            "图片 Base URL 环境变量/直接值",
+            &mut view.image_base_url_env,
+        );
+        text_field(ui, "图片 Model 环境变量/直接值", &mut view.image_model_env);
+        text_field(ui, "图片尺寸", &mut view.image_size);
+        text_field(ui, "图片分辨率", &mut view.image_resolution);
+        number_u64(ui, "图片超时秒数", &mut view.image_timeout);
+
+        let ui = &mut columns[2];
+        ui.heading("图片转述");
+        ui.checkbox(&mut view.image_caption_enabled, "启用图片转述");
+        text_field(ui, "转述 Provider", &mut view.image_caption_provider);
+        text_field(
+            ui,
+            "转述 API Key 环境变量/直接值",
+            &mut view.image_caption_api_key_env,
+        );
+        text_field(
+            ui,
+            "转述 Base URL 环境变量/直接值",
+            &mut view.image_caption_base_url_env,
+        );
+        text_field(ui, "转述模型名称", &mut view.image_caption_model);
+        text_field(ui, "转述模型环境变量", &mut view.image_caption_model_env);
+        number_u64(ui, "转述超时秒数", &mut view.image_caption_timeout);
+        number_u32(ui, "转述最大输出 Token", &mut view.image_caption_max_tokens);
+        number_u32(ui, "每次最多转述图片数", &mut view.image_caption_max_images);
+        multiline_field(
+            ui,
+            "转述请求体覆盖(JSON)",
+            &mut view.image_caption_request_body_overrides,
+            6,
+        );
+    });
 }
 
 fn runtime_tab(
@@ -1208,21 +1244,29 @@ fn number_i64(ui: &mut egui::Ui, label: &str, value: &mut i64) {
 }
 
 fn split_llm_model_fields(model: Option<String>, model_env: String) -> (String, String) {
+    split_model_fields(model, model_env, "LLM_MODEL")
+}
+
+fn split_model_fields(
+    model: Option<String>,
+    model_env: String,
+    default_model_env: &str,
+) -> (String, String) {
     let model = model.unwrap_or_default().trim().to_string();
     if !model.is_empty() {
         return (model, model_env);
     }
 
     let trimmed_env = model_env.trim();
-    if should_treat_model_env_as_model_name(trimmed_env) {
-        (trimmed_env.to_string(), "LLM_MODEL".to_string())
+    if should_treat_model_env_as_model_name(trimmed_env, default_model_env) {
+        (trimmed_env.to_string(), default_model_env.to_string())
     } else {
         (String::new(), model_env)
     }
 }
 
-fn should_treat_model_env_as_model_name(value: &str) -> bool {
-    if value.is_empty() || value == "LLM_MODEL" || env::var(value).is_ok() {
+fn should_treat_model_env_as_model_name(value: &str, default_model_env: &str) -> bool {
+    if value.is_empty() || value == default_model_env || env::var(value).is_ok() {
         return false;
     }
 
@@ -1254,6 +1298,13 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             request_body_overrides_to_json(&config.llm.request_body_overrides);
         let (llm_model, llm_model_env) =
             split_llm_model_fields(config.llm.model, config.llm.model_env);
+        let image_caption_request_body_overrides =
+            request_body_overrides_to_json(&config.image_caption.request_body_overrides);
+        let (image_caption_model, image_caption_model_env) = split_model_fields(
+            config.image_caption.model,
+            config.image_caption.model_env,
+            "IMAGE_CAPTION_MODEL",
+        );
         return ConfigView {
             platform_kind: config.platform.kind.as_str().to_string(),
             wx_groups: join_lines(&config.wx4py.groups),
@@ -1299,6 +1350,19 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             image_size: config.image_gen.size,
             image_resolution: config.image_gen.resolution.unwrap_or_default(),
             image_timeout: config.image_gen.timeout_seconds,
+            image_caption_enabled: config.image_caption.enabled,
+            image_caption_provider: config.image_caption.provider,
+            image_caption_api_key_env: config.image_caption.api_key_env,
+            image_caption_base_url_env: config.image_caption.base_url_env,
+            image_caption_model,
+            image_caption_model_env,
+            image_caption_timeout: config.image_caption.timeout_seconds,
+            image_caption_max_tokens: config.image_caption.max_output_tokens,
+            image_caption_max_images: config
+                .image_caption
+                .max_images_per_summary
+                .min(u32::MAX as usize) as u32,
+            image_caption_request_body_overrides,
             runtime_output_dir: config.runtime.output_dir,
             runtime_log_level: config.runtime.log_level,
             runtime_cleanup_days: config.runtime.cleanup_after_days,
@@ -1308,6 +1372,11 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
     let (llm_model, llm_model_env) = split_llm_model_fields(
         non_empty_string(get_str(doc, "llm", "model", "")),
         get_str(doc, "llm", "model_env", "LLM_MODEL"),
+    );
+    let (image_caption_model, image_caption_model_env) = split_model_fields(
+        non_empty_string(get_str(doc, "image_caption", "model", "")),
+        get_str(doc, "image_caption", "model_env", "IMAGE_CAPTION_MODEL"),
+        "IMAGE_CAPTION_MODEL",
     );
 
     ConfigView {
@@ -1377,6 +1446,30 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         image_size: get_str(doc, "image_gen", "size", "2:3"),
         image_resolution: get_str(doc, "image_gen", "resolution", "1k"),
         image_timeout: get_u64(doc, "image_gen", "timeout_seconds", 300),
+        image_caption_enabled: get_bool(doc, "image_caption", "enabled", false),
+        image_caption_provider: get_str(doc, "image_caption", "provider", "openai_compatible"),
+        image_caption_api_key_env: get_str(
+            doc,
+            "image_caption",
+            "api_key_env",
+            "IMAGE_CAPTION_API_KEY",
+        ),
+        image_caption_base_url_env: get_str(
+            doc,
+            "image_caption",
+            "base_url_env",
+            "IMAGE_CAPTION_BASE_URL",
+        ),
+        image_caption_model,
+        image_caption_model_env,
+        image_caption_timeout: get_u64(doc, "image_caption", "timeout_seconds", 120),
+        image_caption_max_tokens: get_u64(doc, "image_caption", "max_output_tokens", 500) as u32,
+        image_caption_max_images: get_u64(doc, "image_caption", "max_images_per_summary", 20)
+            .min(u32::MAX as u64) as u32,
+        image_caption_request_body_overrides: request_body_overrides_from_table_doc(
+            doc,
+            "image_caption",
+        ),
         runtime_output_dir: get_str(doc, "runtime", "output_dir", ".\\runtime\\rust-output"),
         runtime_log_level: get_str(doc, "runtime", "log_level", "info"),
         runtime_cleanup_days: get_u64(doc, "runtime", "cleanup_after_days", 7) as u32,
@@ -1498,6 +1591,46 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     set_str(image_gen, "resolution", &update.image_resolution);
     set_int(image_gen, "timeout_seconds", update.image_timeout as i64);
 
+    let image_caption = table_mut(&mut doc, "image_caption");
+    set_bool(image_caption, "enabled", update.image_caption_enabled);
+    set_str(image_caption, "provider", &update.image_caption_provider);
+    set_str(
+        image_caption,
+        "api_key_env",
+        &update.image_caption_api_key_env,
+    );
+    set_str(
+        image_caption,
+        "base_url_env",
+        &update.image_caption_base_url_env,
+    );
+    if update.image_caption_model.trim().is_empty() {
+        remove_key(image_caption, "model");
+    } else {
+        set_str(image_caption, "model", update.image_caption_model.trim());
+    }
+    set_str(image_caption, "model_env", &update.image_caption_model_env);
+    set_int(
+        image_caption,
+        "timeout_seconds",
+        update.image_caption_timeout as i64,
+    );
+    set_int(
+        image_caption,
+        "max_output_tokens",
+        update.image_caption_max_tokens as i64,
+    );
+    set_int(
+        image_caption,
+        "max_images_per_summary",
+        update.image_caption_max_images as i64,
+    );
+    set_json_object_table(
+        image_caption,
+        "request_body_overrides",
+        &update.image_caption_request_body_overrides,
+    )?;
+
     let runtime = table_mut(&mut doc, "runtime");
     set_str(runtime, "output_dir", &update.runtime_output_dir);
     set_str(runtime, "log_level", &update.runtime_log_level);
@@ -1606,7 +1739,12 @@ fn request_body_overrides_to_json(overrides: &impl serde::Serialize) -> String {
 }
 
 fn request_body_overrides_from_doc(doc: &DocumentMut) -> String {
-    let Some(item) = table(doc, "llm").and_then(|table| table.get("request_body_overrides")) else {
+    request_body_overrides_from_table_doc(doc, "llm")
+}
+
+fn request_body_overrides_from_table_doc(doc: &DocumentMut, table_name: &str) -> String {
+    let Some(item) = table(doc, table_name).and_then(|table| table.get("request_body_overrides"))
+    else {
         return "{}".to_string();
     };
     toml_item_to_json(item)

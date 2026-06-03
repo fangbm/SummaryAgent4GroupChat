@@ -13,7 +13,9 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use wechat_summary_ai::{AiError, OpenAiCompatibleLlm, OpenAiImageClient};
+use wechat_summary_ai::{
+    AiError, OpenAiCompatibleLlm, OpenAiImageClient, OpenAiVisionCaptionClient,
+};
 use wechat_summary_core::{
     config::{PlatformKindConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
@@ -895,6 +897,8 @@ async fn run_summary_pipeline(
         ),
     );
 
+    let image_caption_count = apply_image_captions(config, &trigger.room_id, &mut history).await?;
+
     let chat_messages = history
         .into_iter()
         .map(history_to_chat_message)
@@ -929,6 +933,15 @@ async fn run_summary_pipeline(
             options.image_gen_enabled
         ),
     );
+    if image_caption_count > 0 {
+        append_runtime_log(
+            config,
+            &format!(
+                "image captions inserted room={} count={}",
+                trigger.room_id, image_caption_count
+            ),
+        );
+    }
     let llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
         .context("initializing LLM client")?;
     let mut pending_text_reply = None;
@@ -2224,6 +2237,127 @@ fn format_error_chain(error: &anyhow::Error) -> String {
         .join(": ")
 }
 
+async fn apply_image_captions(
+    config: &AgentConfig,
+    room_id: &str,
+    history: &mut [PlatformHistoryMessage],
+) -> Result<usize> {
+    if !config.image_caption.enabled || config.image_caption.max_images_per_summary == 0 {
+        return Ok(0);
+    }
+    let captioner =
+        match OpenAiVisionCaptionClient::new(config.image_caption.clone(), &config.proxy) {
+            Ok(client) => client,
+            Err(error) => {
+                let error = error.to_string();
+                warn!(
+                    room_id = %room_id,
+                    error = %error,
+                    "image caption client initialization failed; continuing without captions"
+                );
+                append_runtime_log(
+                    config,
+                    &format!("image caption init failed room={} error={}", room_id, error),
+                );
+                return Ok(0);
+            }
+        };
+
+    let mut inserted = 0usize;
+    let mut attempted = 0usize;
+    for message in history.iter_mut() {
+        if attempted >= config.image_caption.max_images_per_summary {
+            break;
+        }
+        if !is_image_message_type(&message.msg_type) {
+            continue;
+        }
+        let Some(source) = image_caption_source(message) else {
+            if let Some(error) = message.media_decode_error.as_deref() {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "image caption skipped room={} reason=decode_failed error={}",
+                        room_id, error
+                    ),
+                );
+            }
+            continue;
+        };
+        attempted += 1;
+        match captioner.caption_image(&source).await {
+            Ok(caption) => {
+                let caption = caption.trim();
+                if caption.is_empty() {
+                    continue;
+                }
+                message.content = format!("{}（图片转述：{}）", message.content.trim(), caption);
+                inserted += 1;
+                info!(
+                    room_id = %room_id,
+                    inserted,
+                    attempted,
+                    "image caption inserted into history"
+                );
+            }
+            Err(error) => {
+                let error = error.to_string();
+                warn!(
+                    room_id = %room_id,
+                    attempted,
+                    error = %error,
+                    "image caption failed; keeping image placeholder"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "image caption failed room={} attempted={} error={}",
+                        room_id, attempted, error
+                    ),
+                );
+            }
+        }
+    }
+
+    if attempted > 0 {
+        append_runtime_log(
+            config,
+            &format!(
+                "image caption completed room={} attempted={} inserted={}",
+                room_id, attempted, inserted
+            ),
+        );
+    }
+    Ok(inserted)
+}
+
+fn image_caption_source(message: &PlatformHistoryMessage) -> Option<String> {
+    message
+        .decoded_media_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            message
+                .media_path
+                .as_deref()
+                .filter(|path| {
+                    let path = path.trim();
+                    path.starts_with("http://")
+                        || path.starts_with("https://")
+                        || path.starts_with("data:")
+                })
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn is_image_message_type(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "image" | "img" | "3" | "图片"
+    )
+}
+
 fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
     ChatMessage {
         timestamp: message.timestamp,
@@ -2251,6 +2385,8 @@ mod tests {
             msg_type: "text".to_string(),
             media_path: None,
             thumbnail_path: None,
+            decoded_media_path: None,
+            media_decode_error: None,
             is_self: true,
         };
         let incoming = IncomingMessage {
@@ -2302,10 +2438,42 @@ mod tests {
             msg_type: "text".into(),
             media_path: None,
             thumbnail_path: None,
+            decoded_media_path: None,
+            media_decode_error: None,
             is_self: true,
         };
 
         assert!(is_agent_status_message(&message));
+    }
+
+    #[test]
+    fn image_caption_source_prefers_decoded_local_path_and_accepts_urls() {
+        let mut message = PlatformHistoryMessage {
+            timestamp: Utc::now(),
+            sender_id: "u".into(),
+            sender_name: None,
+            content: "[图片] local_id=1".into(),
+            msg_type: "image".into(),
+            media_path: Some("https://cdn.example/image.png".into()),
+            thumbnail_path: None,
+            decoded_media_path: Some(r"D:\Temp\decoded.jpg".into()),
+            media_decode_error: None,
+            is_self: false,
+        };
+
+        assert_eq!(
+            image_caption_source(&message).as_deref(),
+            Some(r"D:\Temp\decoded.jpg")
+        );
+
+        message.decoded_media_path = None;
+        assert_eq!(
+            image_caption_source(&message).as_deref(),
+            Some("https://cdn.example/image.png")
+        );
+
+        message.media_path = Some(r"D:\Temp\raw.dat".into());
+        assert_eq!(image_caption_source(&message), None);
     }
 
     #[test]
