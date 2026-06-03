@@ -433,7 +433,13 @@ fn query_text_messages_via_builtin_wxdb(
                     .unwrap_or_else(|| message.sender.clone()),
                 sender_name: (!message.sender.is_empty()).then_some(message.sender),
                 content: message.content,
-                msg_type: "text".into(),
+                msg_type: message.msg_type,
+                media_path: message
+                    .media_path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                thumbnail_path: message
+                    .thumbnail_path
+                    .map(|path| path.to_string_lossy().into_owned()),
                 is_self: false,
             })
         })
@@ -484,7 +490,8 @@ fn query_builtin_wxdb_history(
         since: Some(since),
         until: Some(until),
         limit: limit as usize,
-        text_only: true,
+        text_only: false,
+        msg_types: vec!["text".to_string(), "image".to_string()],
     })
     .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb failed: {error:#}")))
 }
@@ -676,6 +683,8 @@ pub struct Wx4pyHistoryMessage {
     pub sender_name: Option<String>,
     pub content: String,
     pub msg_type: String,
+    pub media_path: Option<String>,
+    pub thumbnail_path: Option<String>,
     pub is_self: bool,
 }
 
@@ -945,9 +954,10 @@ fn normalize_wx_cli_message(value: Value) -> Result<Option<Wx4pyHistoryMessage>>
     }
 
     let msg_type = string_field(object, &["type", "msg_type"]).unwrap_or_else(|| "text".into());
-    if !is_text_msg_type(&msg_type) {
+    if !is_supported_history_msg_type(&msg_type) {
         return Ok(None);
     }
+    let normalized_type = normalize_history_msg_type(&msg_type);
 
     Ok(Some(Wx4pyHistoryMessage {
         timestamp: parse_timestamp(object)?,
@@ -955,7 +965,9 @@ fn normalize_wx_cli_message(value: Value) -> Result<Option<Wx4pyHistoryMessage>>
             .unwrap_or_else(|| "unknown".into()),
         sender_name: string_field(object, &["sender_name", "sender"]),
         content,
-        msg_type: "text".into(),
+        msg_type: normalized_type,
+        media_path: string_field(object, &["media_path", "path", "file_path"]),
+        thumbnail_path: string_field(object, &["thumbnail_path", "thumb_path", "thumb"]),
         is_self: bool_field(object, &["is_self", "isSender"]).unwrap_or(false),
     }))
 }
@@ -1037,11 +1049,18 @@ fn bool_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<
     })
 }
 
-fn is_text_msg_type(value: &str) -> bool {
+fn is_supported_history_msg_type(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "text" | "1" | "文本" | "文字"
+        "text" | "1" | "文本" | "文字" | "image" | "img" | "3" | "图片"
     )
+}
+
+fn normalize_history_msg_type(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "image" | "img" | "3" | "图片" => "image".to_string(),
+        _ => "text".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1158,6 +1177,36 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].sender_id, "fbm");
         assert_eq!(messages[0].msg_type, "text");
+    }
+
+    #[test]
+    fn normalizes_wx_cli_image_messages_with_media_paths() {
+        let payload = r#"{
+            "messages": [
+                {
+                    "timestamp": 1780471359,
+                    "sender": "muzimi",
+                    "content": "[图片] local_id=26032",
+                    "type": "image",
+                    "media_path": "D:\\Temp\\image.dat",
+                    "thumbnail_path": "D:\\Temp\\image_t.dat"
+                }
+            ]
+        }"#;
+
+        let messages = normalize_wx_cli_messages(payload).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].msg_type, "image");
+        assert_eq!(messages[0].content, "[图片] local_id=26032");
+        assert_eq!(
+            messages[0].media_path.as_deref(),
+            Some(r"D:\Temp\image.dat")
+        );
+        assert_eq!(
+            messages[0].thumbnail_path.as_deref(),
+            Some(r"D:\Temp\image_t.dat")
+        );
     }
 
     #[test]

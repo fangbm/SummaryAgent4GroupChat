@@ -2249,6 +2249,8 @@ mod tests {
             sender_name: Some("我".to_string()),
             content: "/总结".to_string(),
             msg_type: "text".to_string(),
+            media_path: None,
+            thumbnail_path: None,
             is_self: true,
         };
         let incoming = IncomingMessage {
@@ -2298,6 +2300,8 @@ mod tests {
             sender_name: None,
             content: "收到 /总结，正在整理文字总结。".into(),
             msg_type: "text".into(),
+            media_path: None,
+            thumbnail_path: None,
             is_self: true,
         };
 

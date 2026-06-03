@@ -11,8 +11,8 @@ use anyhow::{bail, Context as AnyhowContext, Result};
 use chrono::{DateTime, Utc};
 use serenity::{
     all::{
-        ChannelId, CreateAttachment, CreateMessage, GatewayIntents, GetMessages, Message,
-        MessageId, UserId,
+        Attachment, ChannelId, CreateAttachment, CreateMessage, GatewayIntents, GetMessages,
+        Message, MessageId, UserId,
     },
     async_trait,
     client::{Client, Context as SerenityContext, EventHandler},
@@ -234,13 +234,16 @@ impl DiscordPlatform {
                 if content.trim().is_empty() {
                     continue;
                 }
+                let image_url = discord_image_attachment_url(message);
 
                 collected.push(PlatformHistoryMessage {
                     timestamp,
                     sender_id: message.author.id.to_string(),
                     sender_name: Some(message.author.name.clone()),
                     content,
-                    msg_type: "text".to_string(),
+                    msg_type: discord_message_msg_type(message).to_string(),
+                    media_path: image_url,
+                    thumbnail_path: None,
                     is_self: message.author.id == self.bot_user_id,
                 });
             }
@@ -315,6 +318,7 @@ impl EventHandler for DiscordHandler {
         if content.trim().is_empty() {
             return;
         }
+        let msg_type = discord_message_msg_type(&message).to_string();
 
         let room_name = message.channel_id.name(&ctx.http).await.ok();
         let event = PlatformEvent {
@@ -323,7 +327,7 @@ impl EventHandler for DiscordHandler {
             sender_id: message.author.id.to_string(),
             sender_name: Some(message.author.name),
             content,
-            msg_type: "text".to_string(),
+            msg_type,
             timestamp: message.timestamp.to_utc(),
             is_self: false,
         };
@@ -381,6 +385,8 @@ pub struct PlatformHistoryMessage {
     pub sender_name: Option<String>,
     pub content: String,
     pub msg_type: String,
+    pub media_path: Option<String>,
+    pub thumbnail_path: Option<String>,
     pub is_self: bool,
 }
 
@@ -392,6 +398,8 @@ impl From<Wx4pyHistoryMessage> for PlatformHistoryMessage {
             sender_name: message.sender_name,
             content: message.content,
             msg_type: message.msg_type,
+            media_path: message.media_path,
+            thumbnail_path: message.thumbnail_path,
             is_self: message.is_self,
         }
     }
@@ -428,7 +436,7 @@ fn discord_message_content(message: &Message) -> String {
     let attachment_tags = message
         .attachments
         .iter()
-        .map(|attachment| format!("[附件:{}]", attachment.filename))
+        .map(discord_attachment_tag)
         .collect::<Vec<_>>();
 
     match (content.is_empty(), attachment_tags.is_empty()) {
@@ -437,6 +445,63 @@ fn discord_message_content(message: &Message) -> String {
         (true, false) => attachment_tags.join(" "),
         (false, false) => format!("{content}\n{}", attachment_tags.join(" ")),
     }
+}
+
+fn discord_message_msg_type(message: &Message) -> &'static str {
+    if message.attachments.iter().any(is_discord_image_attachment) {
+        "image"
+    } else {
+        "text"
+    }
+}
+
+fn discord_image_attachment_url(message: &Message) -> Option<String> {
+    message
+        .attachments
+        .iter()
+        .find(|attachment| is_discord_image_attachment(attachment))
+        .map(|attachment| attachment.url.clone())
+}
+
+fn discord_attachment_tag(attachment: &Attachment) -> String {
+    if is_discord_image_attachment(attachment) {
+        format!("[图片:{} {}]", attachment.filename, attachment.url)
+    } else {
+        format!("[附件:{}]", attachment.filename)
+    }
+}
+
+fn is_discord_image_attachment(attachment: &Attachment) -> bool {
+    is_discord_image_attachment_parts(
+        &attachment.filename,
+        attachment.content_type.as_deref(),
+        attachment.width,
+        attachment.height,
+    )
+}
+
+fn is_discord_image_attachment_parts(
+    filename: &str,
+    content_type: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> bool {
+    content_type.is_some_and(|content_type| content_type.to_ascii_lowercase().starts_with("image/"))
+        || width.is_some()
+        || height.is_some()
+        || has_image_extension(filename)
+}
+
+fn has_image_extension(filename: &str) -> bool {
+    matches!(
+        filename
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "avif"
+    )
 }
 
 fn discord_text_chunks(text: &str) -> Vec<String> {
@@ -548,6 +613,34 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|chunk| chunk.chars().count() <= DISCORD_TEXT_LIMIT));
+    }
+
+    #[test]
+    fn discord_image_attachment_detection_accepts_mime_dimensions_and_extension() {
+        assert!(is_discord_image_attachment_parts(
+            "file.bin",
+            Some("image/png"),
+            None,
+            None
+        ));
+        assert!(is_discord_image_attachment_parts(
+            "file.bin",
+            Some("application/octet-stream"),
+            Some(640),
+            None
+        ));
+        assert!(is_discord_image_attachment_parts(
+            "shot.webp",
+            Some("application/octet-stream"),
+            None,
+            None
+        ));
+        assert!(!is_discord_image_attachment_parts(
+            "logs.zip",
+            Some("application/zip"),
+            None,
+            None
+        ));
     }
 
     #[test]

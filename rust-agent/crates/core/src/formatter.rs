@@ -112,7 +112,7 @@ fn format_beijing_message_time(value: DateTime<Utc>) -> String {
 fn is_text_message_type(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "text" | "1" | "文本" | "文字"
+        "text" | "1" | "文本" | "文字" | "image" | "img" | "3" | "图片"
     )
 }
 

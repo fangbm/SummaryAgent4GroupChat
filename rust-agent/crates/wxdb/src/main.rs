@@ -87,6 +87,10 @@ fn main() -> Result<()> {
                 until: until.as_deref().map(parse_time_end).transpose()?,
                 limit,
                 text_only: msg_type.as_deref().map(is_text_type).unwrap_or(false),
+                msg_types: msg_type
+                    .as_deref()
+                    .map(history_type_filter)
+                    .unwrap_or_default(),
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -122,6 +126,7 @@ fn main() -> Result<()> {
                 until: until.as_deref().map(parse_time_end).transpose()?,
                 limit,
                 text_only: false,
+                msg_types: Vec::new(),
             })?;
             if let Some(parent) = output.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -169,4 +174,12 @@ fn is_text_type(value: &str) -> bool {
         value.to_lowercase().as_str(),
         "text" | "1" | "文本" | "文字"
     )
+}
+
+fn history_type_filter(value: &str) -> Vec<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "all" | "*" => Vec::new(),
+        "txt" => vec!["text".to_string()],
+        other => vec![other.to_string()],
+    }
 }

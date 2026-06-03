@@ -16,6 +16,7 @@ pub struct HistoryQuery {
     pub until: Option<DateTime<Utc>>,
     pub limit: usize,
     pub text_only: bool,
+    pub msg_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,14 @@ pub struct HistoryMessage {
     pub sender_group_nickname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_md5: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_candidates: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,9 +202,11 @@ fn query_history_in_store(
             is_group,
             &names_map,
             &group_nicknames,
+            db_dir.parent(),
             query.since.map(|dt| dt.timestamp()),
             query.until.map(|dt| dt.timestamp()),
             query.text_only,
+            &query.msg_types,
             query.limit,
         )?;
         if !rows.is_empty() {
@@ -368,9 +379,11 @@ fn query_messages(
     is_group: bool,
     names_map: &HashMap<String, String>,
     group_nicknames: &HashMap<String, String>,
+    account_root: Option<&Path>,
     since: Option<i64>,
     until: Option<i64>,
     text_only: bool,
+    msg_types: &[String],
     limit: usize,
 ) -> Result<Vec<HistoryMessage>> {
     let conn = Connection::open(db_path)?;
@@ -385,9 +398,16 @@ fn query_messages(
         clauses.push("create_time <= ?".to_string());
         params.push(Box::new(until));
     }
-    if text_only {
-        clauses.push("(local_type & 4294967295) = ?".to_string());
-        params.push(Box::new(1i64));
+    let msg_type_values = msg_type_filter_values(text_only, msg_types);
+    if !msg_type_values.is_empty() {
+        let placeholders = std::iter::repeat("?")
+            .take(msg_type_values.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("(local_type & 4294967295) IN ({placeholders})"));
+        for value in msg_type_values {
+            params.push(Box::new(value));
+        }
     }
     let where_clause = if clauses.is_empty() {
         String::new()
@@ -419,6 +439,7 @@ fn query_messages(
     for row in rows.flatten() {
         let (local_id, local_type, timestamp, real_sender_id, content_bytes, ct) = row;
         let raw_content = decompress_message(&content_bytes, ct);
+        let base_type = base_msg_type(local_type);
         let sender_username =
             sender_username(real_sender_id, &raw_content, is_group, chat_username, &id2u);
         let sender = sender_label(
@@ -435,6 +456,9 @@ fn query_messages(
         if content.trim().is_empty() {
             continue;
         }
+        let image_media = (base_type == 3)
+            .then(|| resolve_image_media(account_root, chat_username, timestamp, &raw_content))
+            .flatten();
         messages.push(HistoryMessage {
             timestamp,
             time: fmt_time(timestamp),
@@ -450,9 +474,185 @@ fn query_messages(
             }),
             sender_group_nickname: group_nicknames.get(&sender_username).cloned(),
             local_id: Some(local_id),
+            image_md5: (base_type == 3)
+                .then(|| xml_attr(&raw_content, "md5"))
+                .flatten(),
+            media_path: image_media
+                .as_ref()
+                .and_then(|media| media.media_path.clone()),
+            thumbnail_path: image_media
+                .as_ref()
+                .and_then(|media| media.thumbnail_path.clone()),
+            media_candidates: image_media
+                .map(|media| media.candidates)
+                .unwrap_or_default(),
         });
     }
     Ok(messages)
+}
+
+#[derive(Debug, Clone, Default)]
+struct ImageMedia {
+    media_path: Option<PathBuf>,
+    thumbnail_path: Option<PathBuf>,
+    candidates: Vec<PathBuf>,
+}
+
+fn resolve_image_media(
+    account_root: Option<&Path>,
+    chat_username: &str,
+    timestamp: i64,
+    raw_content: &str,
+) -> Option<ImageMedia> {
+    let account_root = account_root?;
+    let chat_hash = format!("{:x}", md5::compute(chat_username.as_bytes()));
+    let month = Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m").to_string())?;
+    let mut candidates = Vec::new();
+    let attach_dir = account_root
+        .join("msg")
+        .join("attach")
+        .join(&chat_hash)
+        .join(&month)
+        .join("Img");
+    let temp_dir = account_root
+        .join("temp")
+        .join(&chat_hash)
+        .join(&month)
+        .join("Img");
+    let cache_message_dir = account_root
+        .join("cache")
+        .join(&month)
+        .join("Message")
+        .join(&chat_hash);
+
+    collect_nearby_files(&attach_dir, timestamp, &mut candidates);
+    collect_nearby_files(&temp_dir, timestamp, &mut candidates);
+    collect_nearby_files(
+        &cache_message_dir.join("ImageTemp"),
+        timestamp,
+        &mut candidates,
+    );
+    collect_nearby_files(
+        &cache_message_dir.join("Bubble"),
+        timestamp,
+        &mut candidates,
+    );
+    collect_nearby_files(&cache_message_dir.join("Thumb"), timestamp, &mut candidates);
+    candidates.sort();
+    candidates.dedup();
+
+    let image_md5 = xml_attr(raw_content, "md5");
+    let preferred = candidates
+        .iter()
+        .filter(|path| !is_thumbnail_candidate(path))
+        .min_by_key(|path| media_candidate_score(path, timestamp, image_md5.as_deref()))
+        .cloned();
+    let thumbnail = candidates
+        .iter()
+        .filter(|path| is_thumbnail_candidate(path))
+        .min_by_key(|path| media_candidate_score(path, timestamp, image_md5.as_deref()))
+        .cloned();
+    (!candidates.is_empty()).then_some(ImageMedia {
+        media_path: preferred,
+        thumbnail_path: thumbnail,
+        candidates,
+    })
+}
+
+fn collect_nearby_files(dir: &Path, timestamp: i64, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !is_media_candidate_name(&path) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        let Ok(modified_secs) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        let delta = (modified_secs.as_secs() as i64 - timestamp).abs();
+        if delta <= 300 {
+            out.push(path);
+        }
+    }
+}
+
+fn media_candidate_score(
+    path: &Path,
+    timestamp: i64,
+    image_md5: Option<&str>,
+) -> (u8, u8, i64, u64) {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let md5_score = if image_md5.is_some_and(|md5| name.contains(&md5.to_ascii_lowercase())) {
+        0
+    } else {
+        1
+    };
+    let kind_score = media_candidate_kind_score(path);
+    let mtime_delta = path
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| (duration.as_secs() as i64 - timestamp).abs())
+        .unwrap_or(i64::MAX);
+    let size_rank = path
+        .metadata()
+        .map(|meta| u64::MAX - meta.len())
+        .unwrap_or(0);
+    (md5_score, kind_score, mtime_delta, size_rank)
+}
+
+fn media_candidate_kind_score(path: &Path) -> u8 {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    if text.contains("\\msg\\attach\\") || text.contains("/msg/attach/") {
+        if is_thumbnail_candidate(path) {
+            3
+        } else {
+            0
+        }
+    } else if text.contains("\\imagetemp\\") || text.contains("/imagetemp/") {
+        1
+    } else if text.contains("\\bubble\\") || text.contains("/bubble/") {
+        2
+    } else if is_thumbnail_candidate(path) {
+        3
+    } else {
+        4
+    }
+}
+
+fn is_media_candidate_name(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".dat")
+        || name.ends_with(".jpg")
+        || name.ends_with(".jpeg")
+        || name.ends_with(".png")
+        || name.ends_with(".gif")
+        || name.ends_with(".webp")
+}
+
+fn is_thumbnail_candidate(path: &Path) -> bool {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    text.contains("\\thumb\\")
+        || text.contains("/thumb/")
+        || text.contains("_thumb")
+        || text.contains("_t.")
 }
 
 fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
@@ -598,8 +798,7 @@ fn decompress_message(data: &[u8], ct: i64) -> String {
 }
 
 fn format_content(local_id: i64, local_type: i64, content: &str, is_group: bool) -> String {
-    let base = (local_type as u64 & 0xFFFF_FFFF) as i64;
-    match base {
+    match base_msg_type(local_type) {
         3 => return format!("[图片] local_id={local_id}"),
         34 => return "[语音]".to_string(),
         43 => return "[视频]".to_string(),
@@ -621,7 +820,7 @@ fn format_content(local_id: i64, local_type: i64, content: &str, is_group: bool)
 }
 
 fn fmt_type(local_type: i64) -> String {
-    match (local_type as u64 & 0xFFFF_FFFF) as i64 {
+    match base_msg_type(local_type) {
         1 => "text".to_string(),
         3 => "image".to_string(),
         34 => "voice".to_string(),
@@ -631,6 +830,49 @@ fn fmt_type(local_type: i64) -> String {
         10000 | 10002 => "system".to_string(),
         other => other.to_string(),
     }
+}
+
+fn base_msg_type(local_type: i64) -> i64 {
+    (local_type as u64 & 0xFFFF_FFFF) as i64
+}
+
+fn msg_type_filter_values(text_only: bool, msg_types: &[String]) -> Vec<i64> {
+    let mut values = if msg_types.is_empty() {
+        if text_only {
+            vec![1]
+        } else {
+            Vec::new()
+        }
+    } else {
+        msg_types
+            .iter()
+            .filter_map(|value| msg_type_name_to_local_type(value))
+            .collect::<Vec<_>>()
+    };
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn msg_type_name_to_local_type(value: &str) -> Option<i64> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "all" | "*" => None,
+        "text" | "文本" | "文字" | "1" => Some(1),
+        "image" | "img" | "图片" | "3" => Some(3),
+        "voice" | "语音" | "34" => Some(34),
+        "video" | "视频" | "43" => Some(43),
+        "sticker" | "emoji" | "表情" | "47" => Some(47),
+        "link" | "链接" | "49" => Some(49),
+        "system" | "系统" | "10000" => Some(10000),
+        _ => value.parse::<i64>().ok(),
+    }
+}
+
+fn xml_attr(text: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let (_, rest) = text.split_once(&needle)?;
+    let (value, _) = rest.split_once('"')?;
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn fmt_time(timestamp: i64) -> String {
@@ -661,6 +903,62 @@ mod tests {
         assert_eq!(
             format_content(1, 1, "wxid_abc:\nhello", true),
             "hello".to_string()
+        );
+    }
+
+    #[test]
+    fn formats_image_placeholder_with_local_id() {
+        assert_eq!(
+            format_content(26032, 3, r#"<msg><img md5="abc" /></msg>"#, true),
+            "[图片] local_id=26032"
+        );
+        assert_eq!(fmt_type(3), "image");
+    }
+
+    #[test]
+    fn message_type_filter_supports_text_and_image() {
+        assert_eq!(
+            msg_type_filter_values(false, &["text".to_string(), "image".to_string()]),
+            vec![1, 3]
+        );
+        assert_eq!(
+            msg_type_filter_values(false, &["图片".to_string()]),
+            vec![3]
+        );
+        assert!(msg_type_filter_values(false, &["all".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn image_media_candidates_prefer_attach_over_bubble() {
+        assert_eq!(
+            media_candidate_kind_score(Path::new(
+                r"\\?\D:\Temp\xwechat_files\wxid_x\msg\attach\chat\2026-06\Img\a.dat"
+            )),
+            0
+        );
+        assert_eq!(
+            media_candidate_kind_score(Path::new(
+                r"\\?\D:\Temp\xwechat_files\wxid_x\cache\2026-06\Message\chat\Bubble\a_b.dat"
+            )),
+            2
+        );
+        assert_eq!(
+            media_candidate_kind_score(Path::new(
+                r"\\?\D:\Temp\xwechat_files\wxid_x\msg\attach\chat\2026-06\Img\a_t.dat"
+            )),
+            3
+        );
+    }
+
+    #[test]
+    fn extracts_xml_attribute_values() {
+        assert_eq!(
+            xml_attr(r#"<img md5="0ebf" aeskey="abc" />"#, "md5").as_deref(),
+            Some("0ebf")
+        );
+        assert_eq!(
+            xml_attr(r#"<img md5="0ebf" aeskey="abc" />"#, "aeskey").as_deref(),
+            Some("abc")
         );
     }
 
