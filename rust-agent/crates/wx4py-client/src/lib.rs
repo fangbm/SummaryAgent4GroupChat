@@ -5,7 +5,7 @@ use std::{
     process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio},
     sync::{
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, TryLockError,
     },
     thread,
     time::{Duration as StdDuration, Instant},
@@ -235,15 +235,44 @@ impl Wx4pyClient {
         );
 
         thread::spawn(move || {
-            let result = query_text_messages_inner(
-                &wx_cli,
-                &chat_name,
-                since,
-                until,
-                limit,
-                media_decode_limit,
-                &output,
-            );
+            let result = if should_use_builtin_wxdb(&wx_cli) {
+                match WXDB_HISTORY_QUERY_LOCK
+                    .get_or_init(|| Mutex::new(()))
+                    .try_lock()
+                {
+                    Ok(_guard) => query_text_messages_inner(
+                        &wx_cli,
+                        &chat_name,
+                        since,
+                        until,
+                        limit,
+                        media_decode_limit,
+                        &output,
+                    ),
+                    Err(TryLockError::WouldBlock) => {
+                        tracing::warn!(
+                            chat_name,
+                            "builtin wxdb history worker rejected because another query is still running"
+                        );
+                        Err(Wx4pyError::WxCli(
+                            "previous builtin wxdb history query is still running; wait for it to finish or restart the agent before retrying".to_string(),
+                        ))
+                    }
+                    Err(TryLockError::Poisoned(_)) => Err(Wx4pyError::WxCli(
+                        "builtin wxdb history query lock poisoned".to_string(),
+                    )),
+                }
+            } else {
+                query_text_messages_inner(
+                    &wx_cli,
+                    &chat_name,
+                    since,
+                    until,
+                    limit,
+                    media_decode_limit,
+                    &output,
+                )
+            };
             let _ = sender.send(result);
         });
 
@@ -327,6 +356,8 @@ impl Wx4pyClient {
         ))
     }
 }
+
+static WXDB_HISTORY_QUERY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 impl Wx4pySender {
     pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {

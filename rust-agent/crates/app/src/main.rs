@@ -2391,6 +2391,21 @@ async fn apply_image_captions(
                         room_id, attempted, error
                     ),
                 );
+                if is_image_caption_auth_error(&error) {
+                    warn!(
+                        room_id = %room_id,
+                        attempted,
+                        "image caption stopped after authentication failure"
+                    );
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "image caption stopped room={} reason=authentication_failed attempted={}",
+                            room_id, attempted
+                        ),
+                    );
+                    break;
+                }
             }
         }
     }
@@ -2405,6 +2420,14 @@ async fn apply_image_captions(
         );
     }
     Ok(inserted)
+}
+
+fn is_image_caption_auth_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid_platform_key")
+        || lower.contains("missing or invalid platform key")
 }
 
 fn image_caption_source(message: &PlatformHistoryMessage) -> Option<String> {
@@ -2564,6 +2587,19 @@ mod tests {
         assert_eq!(image_caption_media_decode_limit(&config), Some(7));
         assert_eq!(format_media_decode_limit(Some(7)), "7");
         assert_eq!(format_media_decode_limit(None), "unlimited");
+    }
+
+    #[test]
+    fn image_caption_auth_errors_are_detected() {
+        assert!(is_image_caption_auth_error(
+            r#"invalid response: image caption API returned 401 Unauthorized: {"code":"INVALID_PLATFORM_KEY"}"#
+        ));
+        assert!(is_image_caption_auth_error(
+            "missing or invalid platform key"
+        ));
+        assert!(!is_image_caption_auth_error(
+            "remote image download returned 404"
+        ));
     }
 
     #[test]
