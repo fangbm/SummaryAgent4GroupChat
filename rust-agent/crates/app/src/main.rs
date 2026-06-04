@@ -1231,13 +1231,7 @@ async fn run_summary_pipeline(
         ),
     );
 
-    let image_caption_count = apply_image_captions(
-        config,
-        &trigger.room_id,
-        &mut history,
-        Some(retry_notifier.clone()),
-    )
-    .await?;
+    let image_caption_count = apply_image_captions(config, &trigger.room_id, &mut history).await?;
 
     let chat_messages = history
         .into_iter()
@@ -2611,12 +2605,11 @@ async fn apply_image_captions(
     config: &AgentConfig,
     room_id: &str,
     history: &mut [PlatformHistoryMessage],
-    retry_notifier: Option<RetryNotifier>,
 ) -> Result<usize> {
     if !config.image_caption.enabled || config.image_caption.max_images_per_summary == 0 {
         return Ok(0);
     }
-    let mut captioner =
+    let captioner =
         match OpenAiVisionCaptionClient::new(config.image_caption.clone(), &config.proxy) {
             Ok(client) => client,
             Err(error) => {
@@ -2633,9 +2626,6 @@ async fn apply_image_captions(
                 return Ok(0);
             }
         };
-    if let Some(retry_notifier) = retry_notifier {
-        captioner = captioner.with_retry_notifier(retry_notifier);
-    }
 
     let mut inserted = 0usize;
     let mut attempted = 0usize;

@@ -566,10 +566,25 @@ fn should_retry_chat_completion_failure(status: reqwest::StatusCode, body: &str)
 }
 
 fn should_retry_http_failure(status: reqwest::StatusCode, body: &str) -> bool {
+    if is_content_policy_block(status, body) {
+        return false;
+    }
     status.is_server_error()
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || body.contains("UPSTREAM_FAILED")
         || body.contains("UPSTREAM_REQUEST_FAILED")
+}
+
+fn is_content_policy_block(status: reqwest::StatusCode, body: &str) -> bool {
+    if status == reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS {
+        return true;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("censorship_blocked")
+        || lower.contains("content_filter")
+        || lower.contains("content policy")
+        || lower.contains("machine outputted is blocked")
+        || lower.contains("content you provided")
 }
 
 fn should_retry_http_transport_error(error: &reqwest::Error) -> bool {
@@ -2005,6 +2020,18 @@ reasoning_effort = "none"
         assert!(should_retry_chat_completion_failure(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             ""
+        ));
+    }
+
+    #[test]
+    fn chat_completion_retry_policy_does_not_retry_content_policy_blocks() {
+        assert!(!should_retry_chat_completion_failure(
+            reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            r#"{"code":"UPSTREAM_REQUEST_FAILED","message":"{\"type\":\"censorship_blocked\"}"}"#
+        ));
+        assert!(!should_retry_chat_completion_failure(
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"code":"UPSTREAM_REQUEST_FAILED","message":"The content you provided or machine outputted is blocked."}"#
         ));
     }
 
