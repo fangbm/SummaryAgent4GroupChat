@@ -1289,6 +1289,7 @@ async fn run_summary_pipeline(
             &config.text_summary.system_prompt,
             &config.text_summary.user_prompt_template,
             &chat_messages,
+            LlmOutputLimit::Configured,
             &privacy,
         )
         .await
@@ -1353,6 +1354,7 @@ async fn run_summary_pipeline(
             &config.image_summary.system_prompt,
             &config.image_summary.user_prompt_template,
             &chat_messages,
+            LlmOutputLimit::Unlimited,
             &privacy,
         )
         .await
@@ -1644,6 +1646,7 @@ async fn run_background_image_pipeline_inner(
         &config.image_summary.system_prompt,
         &config.image_summary.user_prompt_template,
         chat_messages,
+        LlmOutputLimit::Unlimited,
         &privacy,
     )
     .await
@@ -1740,6 +1743,21 @@ struct ChunkSummary {
     output: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LlmOutputLimit {
+    Configured,
+    Unlimited,
+}
+
+impl LlmOutputLimit {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Unlimited => "unlimited",
+        }
+    }
+}
+
 async fn complete_chat_summary_with_fallback(
     config: &AgentConfig,
     llm: &OpenAiCompatibleLlm,
@@ -1748,6 +1766,7 @@ async fn complete_chat_summary_with_fallback(
     system_prompt: &str,
     user_prompt_template: &str,
     chat_messages: &[ChatMessage],
+    output_limit: LlmOutputLimit,
     privacy: &PrivacyFilter,
 ) -> Result<LongChatCompletion> {
     let max_prompt_chars = config.privacy.max_chars_to_llm.max(1);
@@ -1758,8 +1777,11 @@ async fn complete_chat_summary_with_fallback(
         append_runtime_log(
             config,
             &format!(
-                "calling llm {} room={} prompt_chars={} mode=direct",
-                stage, room_id, full_prompt_chars
+                "calling llm {} room={} prompt_chars={} mode=direct output_limit={}",
+                stage,
+                room_id,
+                full_prompt_chars,
+                output_limit.label()
             ),
         );
         let output = complete_llm_with_rate_limit_queue(
@@ -1769,6 +1791,7 @@ async fn complete_chat_summary_with_fallback(
             stage,
             system_prompt,
             full_prompt,
+            output_limit,
         )
         .await?;
         return Ok(LongChatCompletion {
@@ -1802,8 +1825,16 @@ async fn complete_chat_summary_with_fallback(
             chunks.len()
         ),
     );
-    let chunk_summaries =
-        complete_chunk_requests(config, llm, room_id, stage, system_prompt, &chunks).await?;
+    let chunk_summaries = complete_chunk_requests(
+        config,
+        llm,
+        room_id,
+        stage,
+        system_prompt,
+        &chunks,
+        output_limit,
+    )
+    .await?;
     let combined_input = format_chunk_summaries_for_final(&chunk_summaries);
     let final_prompt = render_prompt_template(user_prompt_template, &combined_input, "", "");
     let final_prompt_chars = final_prompt.chars().count();
@@ -1836,11 +1867,12 @@ async fn complete_chat_summary_with_fallback(
     append_runtime_log(
         config,
         &format!(
-            "calling llm {} final room={} prompt_chars={} chunks={}",
+            "calling llm {} final room={} prompt_chars={} chunks={} output_limit={}",
             stage,
             room_id,
             final_prompt_chars,
-            chunk_summaries.len()
+            chunk_summaries.len(),
+            output_limit.label()
         ),
     );
     let output = complete_llm_with_rate_limit_queue(
@@ -1850,6 +1882,7 @@ async fn complete_chat_summary_with_fallback(
         &format!("{stage} final"),
         system_prompt,
         final_prompt,
+        output_limit,
     )
     .await?;
     Ok(LongChatCompletion {
@@ -1865,6 +1898,7 @@ async fn complete_chunk_requests(
     stage: &str,
     system_prompt: &str,
     chunks: &[LlmChunkRequest],
+    output_limit: LlmOutputLimit,
 ) -> Result<Vec<ChunkSummary>> {
     let mut join_set = JoinSet::new();
     for chunk in chunks.iter().cloned() {
@@ -1884,7 +1918,8 @@ async fn complete_chunk_requests(
         let llm = llm.clone();
         let system_prompt = system_prompt.to_string();
         join_set.spawn(async move {
-            let result = llm.complete(&system_prompt, &chunk.prompt).await;
+            let result =
+                complete_llm_request(&llm, &system_prompt, &chunk.prompt, output_limit).await;
             (chunk, result)
         });
     }
@@ -1970,6 +2005,7 @@ async fn complete_chunk_requests(
             &format!("{stage} chunk {}", chunk.index + 1),
             system_prompt,
             chunk.prompt.clone(),
+            output_limit,
         )
         .await?;
         summaries[chunk.index] = Some(ChunkSummary {
@@ -1995,9 +2031,10 @@ async fn complete_llm_with_rate_limit_queue(
     stage: &str,
     system_prompt: &str,
     prompt: String,
+    output_limit: LlmOutputLimit,
 ) -> Result<String> {
     for attempt in 1..=LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS {
-        match llm.complete(system_prompt, &prompt).await {
+        match complete_llm_request(llm, system_prompt, &prompt, output_limit).await {
             Ok(output) => return Ok(output),
             Err(AiError::RateLimited(message)) if attempt < LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS => {
                 warn!(
@@ -2031,6 +2068,18 @@ async fn complete_llm_with_rate_limit_queue(
         "LLM request for {stage} stayed rate limited after {} queued attempts",
         LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS
     )
+}
+
+async fn complete_llm_request(
+    llm: &OpenAiCompatibleLlm,
+    system_prompt: &str,
+    prompt: &str,
+    output_limit: LlmOutputLimit,
+) -> std::result::Result<String, AiError> {
+    match output_limit {
+        LlmOutputLimit::Configured => llm.complete(system_prompt, prompt).await,
+        LlmOutputLimit::Unlimited => llm.complete_without_max_tokens(system_prompt, prompt).await,
+    }
 }
 
 fn build_llm_chunk_requests(
