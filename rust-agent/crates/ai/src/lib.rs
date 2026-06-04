@@ -1,4 +1,4 @@
-use std::{env, fs, path::Path, time::Duration};
+use std::{env, fs, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose, Engine};
 use reqwest::header::CONTENT_TYPE;
@@ -14,7 +14,8 @@ use wechat_summary_core::{
     ImageArtifact,
 };
 
-const HTTP_5XX_RETRY_DELAYS_MS: [u64; 5] = [1_000, 2_000, 5_000, 10_000, 15_000];
+const HTTP_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
+const HTTP_RETRY_MAX_DELAY_MS: u64 = 30_000;
 
 #[derive(Debug, Error)]
 pub enum AiError {
@@ -38,6 +39,18 @@ pub enum AiError {
     Base64(#[from] base64::DecodeError),
 }
 
+#[derive(Debug, Clone)]
+pub struct AiRetryNotice {
+    pub operation: &'static str,
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub retry_after_ms: u64,
+    pub reason: String,
+}
+
+pub type RetryNotifier =
+    Arc<dyn Fn(AiRetryNotice) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+
 #[derive(Clone)]
 pub struct OpenAiCompatibleLlm {
     config: LlmConfig,
@@ -45,6 +58,7 @@ pub struct OpenAiCompatibleLlm {
     api_key: String,
     base_url: String,
     model: String,
+    retry_notifier: Option<RetryNotifier>,
 }
 
 impl OpenAiCompatibleLlm {
@@ -69,7 +83,13 @@ impl OpenAiCompatibleLlm {
             api_key,
             base_url,
             model,
+            retry_notifier: None,
         })
+    }
+
+    pub fn with_retry_notifier(mut self, retry_notifier: RetryNotifier) -> Self {
+        self.retry_notifier = Some(retry_notifier);
+        self
     }
 
     pub async fn summarize(&self, merged_input: &str) -> Result<String, AiError> {
@@ -152,6 +172,15 @@ impl OpenAiCompatibleLlm {
                         "LLM chat completion transport failed"
                     );
                     if retry {
+                        notify_retry(
+                            &self.retry_notifier,
+                            "LLM chat completion",
+                            attempt,
+                            max_attempts,
+                            retry_after_ms,
+                            retry_reason_from_transport_error(&error),
+                        )
+                        .await;
                         sleep(http_retry_delay(attempt)).await;
                         continue;
                     }
@@ -180,6 +209,15 @@ impl OpenAiCompatibleLlm {
                     "LLM chat completion request failed"
                 );
                 if retry {
+                    notify_retry(
+                        &self.retry_notifier,
+                        "LLM chat completion",
+                        attempt,
+                        max_attempts,
+                        retry_after_ms,
+                        retry_reason_from_status(status, &snippet),
+                    )
+                    .await;
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
@@ -236,6 +274,7 @@ pub struct OpenAiVisionCaptionClient {
     api_key: String,
     base_url: String,
     model: String,
+    retry_notifier: Option<RetryNotifier>,
 }
 
 impl OpenAiVisionCaptionClient {
@@ -263,7 +302,13 @@ impl OpenAiVisionCaptionClient {
             api_key,
             base_url,
             model,
+            retry_notifier: None,
         })
+    }
+
+    pub fn with_retry_notifier(mut self, retry_notifier: RetryNotifier) -> Self {
+        self.retry_notifier = Some(retry_notifier);
+        self
     }
 
     pub async fn caption_image(&self, image_source: &str) -> Result<String, AiError> {
@@ -312,6 +357,15 @@ impl OpenAiVisionCaptionClient {
                         "image caption remote image download transport failed"
                     );
                     if retry {
+                        notify_retry(
+                            &self.retry_notifier,
+                            "image caption remote image download",
+                            attempt,
+                            max_attempts,
+                            retry_after_ms,
+                            retry_reason_from_transport_error(&error),
+                        )
+                        .await;
                         sleep(http_retry_delay(attempt)).await;
                         continue;
                     }
@@ -344,6 +398,15 @@ impl OpenAiVisionCaptionClient {
                     "image caption remote image download failed"
                 );
                 if retry {
+                    notify_retry(
+                        &self.retry_notifier,
+                        "image caption remote image download",
+                        attempt,
+                        max_attempts,
+                        retry_after_ms,
+                        retry_reason_from_status(status, &snippet),
+                    )
+                    .await;
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
@@ -416,6 +479,15 @@ impl OpenAiVisionCaptionClient {
                         "image caption transport failed"
                     );
                     if retry {
+                        notify_retry(
+                            &self.retry_notifier,
+                            "image caption request",
+                            attempt,
+                            max_attempts,
+                            retry_after_ms,
+                            retry_reason_from_transport_error(&error),
+                        )
+                        .await;
                         sleep(http_retry_delay(attempt)).await;
                         continue;
                     }
@@ -444,6 +516,15 @@ impl OpenAiVisionCaptionClient {
                     "image caption request failed"
                 );
                 if retry {
+                    notify_retry(
+                        &self.retry_notifier,
+                        "image caption request",
+                        attempt,
+                        max_attempts,
+                        retry_after_ms,
+                        retry_reason_from_status(status, &snippet),
+                    )
+                    .await;
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
@@ -504,10 +585,42 @@ fn http_retry_delay(attempt: usize) -> Duration {
 }
 
 fn http_retry_delay_ms(attempt: usize) -> u64 {
-    HTTP_5XX_RETRY_DELAYS_MS
-        .get(attempt.saturating_sub(1))
-        .copied()
-        .unwrap_or_else(|| *HTTP_5XX_RETRY_DELAYS_MS.last().unwrap_or(&1_000))
+    let mut delay = HTTP_RETRY_INITIAL_DELAY_MS;
+    for _ in 1..attempt {
+        delay = delay.saturating_mul(2).min(HTTP_RETRY_MAX_DELAY_MS);
+        if delay == HTTP_RETRY_MAX_DELAY_MS {
+            break;
+        }
+    }
+    delay
+}
+
+async fn notify_retry(
+    notifier: &Option<RetryNotifier>,
+    operation: &'static str,
+    attempt: usize,
+    max_attempts: usize,
+    retry_after_ms: u64,
+    reason: String,
+) {
+    if let Some(notifier) = notifier {
+        notifier(AiRetryNotice {
+            operation,
+            attempt,
+            max_attempts,
+            retry_after_ms,
+            reason,
+        })
+        .await;
+    }
+}
+
+fn retry_reason_from_transport_error(error: &reqwest::Error) -> String {
+    truncate_for_log(&error.to_string(), 300)
+}
+
+fn retry_reason_from_status(status: reqwest::StatusCode, snippet: &str) -> String {
+    truncate_for_log(&format!("{status}: {snippet}"), 300)
 }
 
 fn chat_completion_payload(
@@ -744,6 +857,7 @@ pub struct OpenAiImageClient {
     api_key: String,
     base_url: String,
     model: String,
+    retry_notifier: Option<RetryNotifier>,
 }
 
 impl OpenAiImageClient {
@@ -771,7 +885,13 @@ impl OpenAiImageClient {
             api_key,
             base_url,
             model,
+            retry_notifier: None,
         })
+    }
+
+    pub fn with_retry_notifier(mut self, retry_notifier: RetryNotifier) -> Self {
+        self.retry_notifier = Some(retry_notifier);
+        self
     }
 
     pub async fn generate(
@@ -833,6 +953,15 @@ impl OpenAiImageClient {
                         "image generation transport failed"
                     );
                     if retry {
+                        notify_retry(
+                            &self.retry_notifier,
+                            "image generation request",
+                            attempt,
+                            max_attempts,
+                            retry_after_ms,
+                            retry_reason_from_transport_error(&error),
+                        )
+                        .await;
                         sleep(http_retry_delay(attempt)).await;
                         continue;
                     }
@@ -860,6 +989,15 @@ impl OpenAiImageClient {
                     "image generation request failed"
                 );
                 if retry {
+                    notify_retry(
+                        &self.retry_notifier,
+                        "image generation request",
+                        attempt,
+                        max_attempts,
+                        retry_after_ms,
+                        retry_reason_from_status(status, &snippet),
+                    )
+                    .await;
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
@@ -986,6 +1124,15 @@ impl OpenAiImageClient {
                                 "image task poll transport failed"
                             );
                             if retry {
+                                notify_retry(
+                                    &self.retry_notifier,
+                                    "image task poll",
+                                    http_attempt,
+                                    max_attempts,
+                                    retry_after_ms,
+                                    retry_reason_from_transport_error(&error),
+                                )
+                                .await;
                                 sleep(http_retry_delay(http_attempt)).await;
                                 continue;
                             }
@@ -1017,6 +1164,15 @@ impl OpenAiImageClient {
                             "image task poll failed"
                         );
                         if retry {
+                            notify_retry(
+                                &self.retry_notifier,
+                                "image task poll",
+                                http_attempt,
+                                max_attempts,
+                                retry_after_ms,
+                                retry_reason_from_status(status, &snippet),
+                            )
+                            .await;
                             sleep(http_retry_delay(http_attempt)).await;
                             continue;
                         }
@@ -1090,6 +1246,15 @@ impl OpenAiImageClient {
                         "image download transport failed"
                     );
                     if retry {
+                        notify_retry(
+                            &self.retry_notifier,
+                            "image download",
+                            attempt,
+                            max_attempts,
+                            retry_after_ms,
+                            retry_reason_from_transport_error(&error),
+                        )
+                        .await;
                         sleep(http_retry_delay(attempt)).await;
                         continue;
                     }
@@ -1118,6 +1283,15 @@ impl OpenAiImageClient {
                     "image download failed"
                 );
                 if retry {
+                    notify_retry(
+                        &self.retry_notifier,
+                        "image download",
+                        attempt,
+                        max_attempts,
+                        retry_after_ms,
+                        retry_reason_from_status(status, &snippet),
+                    )
+                    .await;
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
@@ -1466,6 +1640,7 @@ mod tests {
             api_key: "test-key".into(),
             base_url: "https://api.apimart.ai/v1".into(),
             model: "gpt-image-2".into(),
+            retry_notifier: None,
         }
     }
 
@@ -1838,8 +2013,9 @@ reasoning_effort = "none"
         assert_eq!(http_max_attempts(0), 1);
         assert_eq!(http_max_attempts(5), 6);
         assert_eq!(http_retry_delay_ms(1), 1_000);
-        assert_eq!(http_retry_delay_ms(5), 15_000);
-        assert_eq!(http_retry_delay_ms(6), 15_000);
+        assert_eq!(http_retry_delay_ms(5), 16_000);
+        assert_eq!(http_retry_delay_ms(6), 30_000);
+        assert_eq!(http_retry_delay_ms(7), 30_000);
     }
 
     #[test]
