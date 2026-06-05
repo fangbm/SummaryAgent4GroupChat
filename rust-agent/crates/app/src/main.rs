@@ -36,6 +36,13 @@ const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
 const LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS: u64 = 60;
 const LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS: usize = 3;
 const CHUNK_PROMPT_HEADROOM_CHARS: usize = 4_096;
+const TEXT_SUMMARY_REFUSAL_RETRY_PROMPT: &str = r#"
+如果聊天记录包含成人、擦边、隐私、争议或其他敏感内容，请只做高层次、中性、脱敏总结：
+- 可以概括为“围绕服饰/购物/玩梗/生活闲聊等话题展开”，不要复述露骨细节。
+- 不输出违法、露骨、隐私或可识别个人的信息。
+- 不要拒绝总结，不要输出“无法给出总结/无法提供内容/无法给到相关内容”。
+- 只输出适合直接发回群聊的中文文字总结。
+"#;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1281,15 +1288,11 @@ async fn run_summary_pipeline(
         .with_retry_notifier(retry_notifier.clone());
     let mut pending_text_reply = None;
     if options.text_summary_enabled {
-        let summary_result = complete_chat_summary_with_fallback(
+        let summary_result = complete_text_summary_with_refusal_retry(
             config,
             &llm,
             &trigger.room_id,
-            "text summary",
-            &config.text_summary.system_prompt,
-            &config.text_summary.user_prompt_template,
             &chat_messages,
-            LlmOutputLimit::Configured,
             &privacy,
         )
         .await
@@ -1756,6 +1759,68 @@ impl LlmOutputLimit {
             Self::Unlimited => "unlimited",
         }
     }
+}
+
+async fn complete_text_summary_with_refusal_retry(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    chat_messages: &[ChatMessage],
+    privacy: &PrivacyFilter,
+) -> Result<LongChatCompletion> {
+    let summary_result = complete_chat_summary_with_fallback(
+        config,
+        llm,
+        room_id,
+        "text summary",
+        &config.text_summary.system_prompt,
+        &config.text_summary.user_prompt_template,
+        chat_messages,
+        LlmOutputLimit::Configured,
+        privacy,
+    )
+    .await?;
+    if !looks_like_text_summary_refusal(&summary_result.output) {
+        return Ok(summary_result);
+    }
+
+    warn!(
+        room_id = %room_id,
+        output_chars = summary_result.output.chars().count(),
+        "LLM text summary looked like a refusal; retrying with safety-aware prompt"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm text summary refusal detected room={} output_chars={} retry=safety_prompt",
+            room_id,
+            summary_result.output.chars().count()
+        ),
+    );
+
+    let retry_system_prompt = format!(
+        "{}\n\n{}",
+        config.text_summary.system_prompt.trim(),
+        TEXT_SUMMARY_REFUSAL_RETRY_PROMPT.trim()
+    );
+    let retry_result = complete_chat_summary_with_fallback(
+        config,
+        llm,
+        room_id,
+        "text summary safety retry",
+        &retry_system_prompt,
+        &config.text_summary.user_prompt_template,
+        chat_messages,
+        LlmOutputLimit::Configured,
+        privacy,
+    )
+    .await?;
+
+    if looks_like_text_summary_refusal(&retry_result.output) {
+        bail!("LLM returned refusal-like text summary after safety-aware retry");
+    }
+
+    Ok(retry_result)
 }
 
 async fn complete_chat_summary_with_fallback(
@@ -2794,6 +2859,44 @@ fn is_image_message_type(value: &str) -> bool {
     )
 }
 
+fn looks_like_text_summary_refusal(summary: &str) -> bool {
+    let normalized: String = summary.chars().filter(|c| !c.is_whitespace()).collect();
+    if normalized.is_empty() || normalized.chars().count() > 160 {
+        return false;
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let starts_like_refusal = [
+        "抱歉",
+        "对不起",
+        "不好意思",
+        "sorry",
+        "i'msorry",
+        "iamsorry",
+    ]
+    .iter()
+    .any(|marker| lower.starts_with(marker));
+    let contains_refusal = [
+        "我无法",
+        "我不能",
+        "无法给出总结",
+        "无法给到相关内容",
+        "无法提供相关内容",
+        "无法提供该内容",
+        "不能提供相关内容",
+        "不能协助",
+        "无法协助",
+        "can'tassist",
+        "cannotassist",
+        "can'tprovide",
+        "cannotprovide",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+
+    starts_like_refusal || contains_refusal
+}
+
 fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
     ChatMessage {
         timestamp: message.timestamp,
@@ -2863,6 +2966,22 @@ mod tests {
             rendered,
             "chat=chat-input; text=text-result; image=image-result"
         );
+    }
+
+    #[test]
+    fn detects_short_text_summary_refusals() {
+        assert!(looks_like_text_summary_refusal(
+            "你好，我无法给到相关内容。"
+        ));
+        assert!(looks_like_text_summary_refusal(
+            "抱歉，我不能提供相关内容。"
+        ));
+        assert!(!looks_like_text_summary_refusal(
+            "大家围绕服饰购买、发货时间、游戏和日常玩梗展开聊天，讨论较分散。"
+        ));
+        assert!(!looks_like_text_summary_refusal(
+            "有人提到商家无法提供明确发货时间，随后大家转向讨论物流和海关问题。"
+        ));
     }
 
     #[test]
