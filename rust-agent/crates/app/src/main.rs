@@ -49,6 +49,13 @@ const TEXT_SUMMARY_REFUSAL_RETRY_PROMPT: &str = r#"
 - 不要拒绝总结，不要输出“无法给出总结/无法提供内容/无法给到相关内容”。
 - 只输出适合直接发回群聊的中文文字总结。
 "#;
+const IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT: &str = r#"
+如果聊天记录或上一步摘要包含成人、擦边、隐私、争议或其他敏感内容，请改为高层次、中性、脱敏的图片总结材料：
+- 只保留抽象主题、活跃度、时间线、关键词、情绪趋势、话题分布等安全视觉元素。
+- 不复述露骨、违法、隐私或可识别个人的信息。
+- 不要拒绝，不要输出“无法给出总结/无法提供内容/无法给到相关内容”。
+- 输出必须可直接供下一步图片总结或生图使用。
+"#;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -980,6 +987,7 @@ struct PipelineOptions {
     send_progress: bool,
     defer_text_until_image_ready: bool,
     send_disabled_message: bool,
+    send_retry_notifications: bool,
 }
 
 #[derive(Clone)]
@@ -1004,6 +1012,7 @@ impl PipelineOptions {
             send_progress: true,
             defer_text_until_image_ready: false,
             send_disabled_message: true,
+            send_retry_notifications: true,
         }
     }
 
@@ -1014,6 +1023,7 @@ impl PipelineOptions {
             send_progress: false,
             defer_text_until_image_ready: true,
             send_disabled_message: false,
+            send_retry_notifications: false,
         }
     }
 }
@@ -1056,7 +1066,9 @@ async fn run_summary_pipeline(
         return Ok(PipelineOutcome::NoSummary);
     }
 
-    let retry_notifier = retry_message_notifier(config, client.sender(), trigger.room_id.clone());
+    let retry_notifier = options
+        .send_retry_notifications
+        .then(|| retry_message_notifier(config, client.sender(), trigger.room_id.clone()));
 
     let history_message_limit = config.history_message_limit();
     let history_query_limit = history_message_limit.min(u32::MAX as usize) as u32;
@@ -1300,9 +1312,11 @@ async fn run_summary_pipeline(
             ),
         );
     }
-    let llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
-        .context("initializing LLM client")?
-        .with_retry_notifier(retry_notifier.clone());
+    let mut llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
+        .context("initializing LLM client")?;
+    if let Some(retry_notifier) = retry_notifier.clone() {
+        llm = llm.with_retry_notifier(retry_notifier);
+    }
     let mut pending_text_reply = None;
     if options.text_summary_enabled {
         let summary_result = complete_text_summary_with_refusal_retry(
@@ -1366,7 +1380,7 @@ async fn run_summary_pipeline(
     }
 
     if options.image_gen_enabled {
-        let image_summary_result = match complete_chat_summary_with_fallback(
+        let image_summary_result = match complete_image_summary_with_refusal_retry(
             config,
             &llm,
             &trigger.room_id,
@@ -1374,7 +1388,6 @@ async fn run_summary_pipeline(
             &config.image_summary.system_prompt,
             &config.image_summary.user_prompt_template,
             &chat_messages,
-            LlmOutputLimit::Unlimited,
             &privacy,
         )
         .await
@@ -1412,27 +1425,6 @@ async fn run_summary_pipeline(
             }
         };
         let image_summary = image_summary_result.output;
-        if let Err(error) = ensure_image_pipeline_output_not_refusal(
-            config,
-            &trigger.room_id,
-            "image summary",
-            &image_summary,
-        ) {
-            let error_message = format_error_chain(&error);
-            send_deferred_summary_text(
-                config,
-                client,
-                &trigger.room_id,
-                &mut pending_text_reply,
-                "after image summary refusal",
-            )
-            .await?;
-            if options.text_summary_enabled {
-                send_image_failure_message(config, client, &trigger.room_id, &error_message).await;
-                return Ok(PipelineOutcome::SummaryProduced);
-            }
-            return Err(error);
-        }
         let image_prompt_chat_input = chat_input_for_followup_prompt(
             config,
             &config.image_prompt.user_prompt_template,
@@ -1472,10 +1464,16 @@ async fn run_summary_pipeline(
                 image_prompt_request.chars().count()
             ),
         );
-        let image_prompt = match llm
-            .complete_without_max_tokens(&config.image_prompt.system_prompt, &image_prompt_request)
-            .await
-            .context("calling LLM for image prompt")
+        let image_prompt = match complete_image_prompt_with_refusal_retry(
+            config,
+            &llm,
+            &trigger.room_id,
+            "image prompt",
+            &config.image_prompt.system_prompt,
+            &image_prompt_request,
+        )
+        .await
+        .context("calling LLM for image prompt")
         {
             Ok(prompt) => prompt,
             Err(error) => {
@@ -1508,27 +1506,6 @@ async fn run_summary_pipeline(
                 return Err(error);
             }
         };
-        if let Err(error) = ensure_image_pipeline_output_not_refusal(
-            config,
-            &trigger.room_id,
-            "image prompt",
-            &image_prompt,
-        ) {
-            let error_message = format_error_chain(&error);
-            send_deferred_summary_text(
-                config,
-                client,
-                &trigger.room_id,
-                &mut pending_text_reply,
-                "after image prompt refusal",
-            )
-            .await?;
-            if options.text_summary_enabled {
-                send_image_failure_message(config, client, &trigger.room_id, &error_message).await;
-                return Ok(PipelineOutcome::SummaryProduced);
-            }
-            return Err(error);
-        }
         info!(
             room_id = %trigger.room_id,
             output_chars = image_prompt.chars().count(),
@@ -1547,7 +1524,7 @@ async fn run_summary_pipeline(
             config,
             &trigger.room_id,
             &image_prompt,
-            Some(retry_notifier.clone()),
+            retry_notifier.clone(),
         )
         .await
         {
@@ -1700,7 +1677,7 @@ async fn run_background_image_pipeline_inner(
         .context("initializing LLM client for background image pipeline")?
         .with_retry_notifier(retry_notifier.clone());
     let privacy = PrivacyFilter::new(config.privacy.clone());
-    let image_summary_result = complete_chat_summary_with_fallback(
+    let image_summary_result = complete_image_summary_with_refusal_retry(
         config,
         &llm,
         room_id,
@@ -1708,7 +1685,6 @@ async fn run_background_image_pipeline_inner(
         &config.image_summary.system_prompt,
         &config.image_summary.user_prompt_template,
         chat_messages,
-        LlmOutputLimit::Unlimited,
         &privacy,
     )
     .await
@@ -1727,12 +1703,6 @@ async fn run_background_image_pipeline_inner(
             image_summary.chars().count()
         ),
     );
-    ensure_image_pipeline_output_not_refusal(
-        config,
-        room_id,
-        "background image summary",
-        &image_summary,
-    )?;
 
     let image_prompt_chat_input = chat_input_for_followup_prompt(
         config,
@@ -1760,10 +1730,16 @@ async fn run_background_image_pipeline_inner(
             image_prompt_request.chars().count()
         ),
     );
-    let image_prompt = llm
-        .complete_without_max_tokens(&config.image_prompt.system_prompt, &image_prompt_request)
-        .await
-        .context("calling LLM for background image prompt")?;
+    let image_prompt = complete_image_prompt_with_refusal_retry(
+        config,
+        &llm,
+        room_id,
+        "background image prompt",
+        &config.image_prompt.system_prompt,
+        &image_prompt_request,
+    )
+    .await
+    .context("calling LLM for background image prompt")?;
     info!(
         room_id = %room_id,
         output_chars = image_prompt.chars().count(),
@@ -1777,12 +1753,6 @@ async fn run_background_image_pipeline_inner(
             image_prompt.chars().count()
         ),
     );
-    ensure_image_pipeline_output_not_refusal(
-        config,
-        room_id,
-        "background image prompt",
-        &image_prompt,
-    )?;
 
     let artifact =
         generate_summary_image(config, room_id, &image_prompt, Some(retry_notifier)).await?;
@@ -1892,6 +1862,128 @@ async fn complete_text_summary_with_refusal_retry(
     }
 
     Ok(retry_result)
+}
+
+async fn complete_image_summary_with_refusal_retry(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    stage: &str,
+    system_prompt: &str,
+    user_prompt_template: &str,
+    chat_messages: &[ChatMessage],
+    privacy: &PrivacyFilter,
+) -> Result<LongChatCompletion> {
+    let summary_result = complete_chat_summary_with_fallback(
+        config,
+        llm,
+        room_id,
+        stage,
+        system_prompt,
+        user_prompt_template,
+        chat_messages,
+        LlmOutputLimit::Unlimited,
+        privacy,
+    )
+    .await?;
+    if !looks_like_text_summary_refusal(&summary_result.output) {
+        return Ok(summary_result);
+    }
+
+    log_image_pipeline_refusal_retry(
+        config,
+        room_id,
+        stage,
+        summary_result.output.chars().count(),
+    );
+    let retry_system_prompt = image_pipeline_retry_system_prompt(system_prompt);
+    let retry_stage = format!("{stage} safety retry");
+    let retry_result = complete_chat_summary_with_fallback(
+        config,
+        llm,
+        room_id,
+        &retry_stage,
+        &retry_system_prompt,
+        user_prompt_template,
+        chat_messages,
+        LlmOutputLimit::Unlimited,
+        privacy,
+    )
+    .await?;
+
+    if looks_like_text_summary_refusal(&retry_result.output) {
+        let retry_failure_stage = format!("{stage} after safety-aware retry");
+        ensure_image_pipeline_output_not_refusal(
+            config,
+            room_id,
+            &retry_failure_stage,
+            &retry_result.output,
+        )?;
+    }
+
+    Ok(retry_result)
+}
+
+async fn complete_image_prompt_with_refusal_retry(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    stage: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String> {
+    let prompt = llm
+        .complete_without_max_tokens(system_prompt, user_prompt)
+        .await?;
+    if !looks_like_text_summary_refusal(&prompt) {
+        return Ok(prompt);
+    }
+
+    log_image_pipeline_refusal_retry(config, room_id, stage, prompt.chars().count());
+    let retry_system_prompt = image_pipeline_retry_system_prompt(system_prompt);
+    let retry_prompt = llm
+        .complete_without_max_tokens(&retry_system_prompt, user_prompt)
+        .await?;
+    if looks_like_text_summary_refusal(&retry_prompt) {
+        let retry_failure_stage = format!("{stage} after safety-aware retry");
+        ensure_image_pipeline_output_not_refusal(
+            config,
+            room_id,
+            &retry_failure_stage,
+            &retry_prompt,
+        )?;
+    }
+
+    Ok(retry_prompt)
+}
+
+fn image_pipeline_retry_system_prompt(system_prompt: &str) -> String {
+    format!(
+        "{}\n\n{}",
+        system_prompt.trim(),
+        IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT.trim()
+    )
+}
+
+fn log_image_pipeline_refusal_retry(
+    config: &AgentConfig,
+    room_id: &str,
+    stage: &str,
+    output_chars: usize,
+) {
+    warn!(
+        room_id = %room_id,
+        stage,
+        output_chars,
+        "LLM image pipeline output looked like a refusal; retrying with safety-aware prompt"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm image pipeline refusal detected room={} stage={} output_chars={} retry=safety_prompt",
+            room_id, stage, output_chars
+        ),
+    );
 }
 
 async fn complete_chat_summary_with_fallback(
@@ -4327,6 +4419,20 @@ mod tests {
 
         assert!(PipelineOptions::manual(&config, false).image_gen_enabled);
         assert!(!PipelineOptions::manual(&config, true).image_gen_enabled);
+    }
+
+    #[test]
+    fn manual_pipeline_sends_retry_notifications() {
+        let config = test_config();
+
+        assert!(PipelineOptions::manual(&config, false).send_retry_notifications);
+    }
+
+    #[test]
+    fn scheduled_pipeline_suppresses_retry_notifications() {
+        let config = test_config();
+
+        assert!(!PipelineOptions::scheduled(&config).send_retry_notifications);
     }
 
     fn test_config() -> AgentConfig {
