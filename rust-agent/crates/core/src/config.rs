@@ -355,6 +355,8 @@ pub struct LlmConfig {
     pub retry_5xx_attempts: usize,
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
+    #[serde(default = "default_llm_max_concurrent_chunk_requests")]
+    pub max_concurrent_chunk_requests: usize,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default)]
@@ -661,6 +663,10 @@ fn default_max_output_tokens() -> u32 {
     2_000
 }
 
+fn default_llm_max_concurrent_chunk_requests() -> usize {
+    4
+}
+
 fn default_temperature() -> f32 {
     0.3
 }
@@ -807,11 +813,17 @@ mod tests {
 
     #[test]
     fn summary_and_image_prompt_configs_have_defaults() {
+        let llm: LlmConfig = toml::from_str(
+            r#"provider = "openai_compatible"
+api_key_env = "LLM_API_KEY""#,
+        )
+        .unwrap();
         let text_summary: TextSummaryConfig = toml::from_str("").unwrap();
         let image_summary: ImageSummaryConfig = toml::from_str("").unwrap();
         let image_prompt: ImagePromptConfig = toml::from_str("").unwrap();
         let image_caption: ImageCaptionConfig = toml::from_str("").unwrap();
 
+        assert_eq!(llm.max_concurrent_chunk_requests, 4);
         assert!(text_summary.enabled);
         assert!(text_summary.system_prompt.contains("文字总结"));
         assert!(text_summary.user_prompt_template.contains("{chat_input}"));

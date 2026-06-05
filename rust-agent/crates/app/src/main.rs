@@ -1966,27 +1966,31 @@ async fn complete_chunk_requests(
     output_limit: LlmOutputLimit,
 ) -> Result<Vec<ChunkSummary>> {
     let mut join_set = JoinSet::new();
-    for chunk in chunks.iter().cloned() {
-        append_runtime_log(
+    let max_concurrent = config.llm.max_concurrent_chunk_requests.max(1);
+    append_runtime_log(
+        config,
+        &format!(
+            "llm chunk batch started room={} stage={} chunks={} max_concurrent={}",
+            room_id,
+            stage,
+            chunks.len(),
+            max_concurrent
+        ),
+    );
+    let mut next_chunk = 0usize;
+    while next_chunk < chunks.len() && join_set.len() < max_concurrent {
+        spawn_llm_chunk_request(
+            &mut join_set,
             config,
-            &format!(
-                "llm chunk scheduled room={} stage={} chunk={}/{} message_count={} input_chars={} prompt_chars={}",
-                room_id,
-                stage,
-                chunk.index + 1,
-                chunks.len(),
-                chunk.message_count,
-                chunk.input_chars,
-                chunk.prompt_chars
-            ),
+            llm,
+            room_id,
+            stage,
+            system_prompt,
+            chunks,
+            chunks[next_chunk].clone(),
+            output_limit,
         );
-        let llm = llm.clone();
-        let system_prompt = system_prompt.to_string();
-        join_set.spawn(async move {
-            let result =
-                complete_llm_request(&llm, &system_prompt, &chunk.prompt, output_limit).await;
-            (chunk, result)
-        });
+        next_chunk += 1;
     }
 
     let mut summaries = vec![None; chunks.len()];
@@ -2042,6 +2046,21 @@ async fn complete_chunk_requests(
                 }
             }
         }
+
+        while next_chunk < chunks.len() && join_set.len() < max_concurrent {
+            spawn_llm_chunk_request(
+                &mut join_set,
+                config,
+                llm,
+                room_id,
+                stage,
+                system_prompt,
+                chunks,
+                chunks[next_chunk].clone(),
+                output_limit,
+            );
+            next_chunk += 1;
+        }
     }
 
     if let Some((index, error)) = first_error {
@@ -2087,6 +2106,38 @@ async fn complete_chunk_requests(
             summary.with_context(|| format!("missing LLM chunk summary {}", index + 1))
         })
         .collect()
+}
+
+fn spawn_llm_chunk_request(
+    join_set: &mut JoinSet<(LlmChunkRequest, Result<String, AiError>)>,
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    stage: &str,
+    system_prompt: &str,
+    chunks: &[LlmChunkRequest],
+    chunk: LlmChunkRequest,
+    output_limit: LlmOutputLimit,
+) {
+    append_runtime_log(
+        config,
+        &format!(
+            "llm chunk scheduled room={} stage={} chunk={}/{} message_count={} input_chars={} prompt_chars={}",
+            room_id,
+            stage,
+            chunk.index + 1,
+            chunks.len(),
+            chunk.message_count,
+            chunk.input_chars,
+            chunk.prompt_chars
+        ),
+    );
+    let llm = llm.clone();
+    let system_prompt = system_prompt.to_string();
+    join_set.spawn(async move {
+        let result = complete_llm_request(&llm, &system_prompt, &chunk.prompt, output_limit).await;
+        (chunk, result)
+    });
 }
 
 async fn complete_llm_with_rate_limit_queue(

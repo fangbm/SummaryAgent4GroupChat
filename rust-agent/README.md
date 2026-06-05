@@ -84,7 +84,9 @@ Scheduled summaries still use `scheduled_summary.send_image`.
 
 `history.max_messages` limits how many messages are read from any platform before
 formatting. LLM input is not capped by message count; it is capped only by
-`privacy.max_chars_to_llm`.
+`privacy.max_chars_to_llm`. When long chat input exceeds that limit, the app
+splits it into whole-message chunks and sends up to
+`llm.max_concurrent_chunk_requests` chunk requests at the same time.
 
 Provider-specific chat completion request fields can be added or overridden through
 `llm.request_body_overrides`, for example `enable_thinking = false`.

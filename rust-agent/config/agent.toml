@@ -103,6 +103,8 @@ model_env = "LLM_MODEL"
 timeout_seconds = 120
 retry_5xx_attempts = 5
 max_output_tokens = 2000
+# Maximum concurrent requests when long chat input is split into multiple LLM chunks.
+max_concurrent_chunk_requests = 4
 temperature = 0.3
 
 [llm.request_body_overrides]

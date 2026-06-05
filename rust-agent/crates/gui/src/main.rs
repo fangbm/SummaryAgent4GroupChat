@@ -76,6 +76,7 @@ struct ConfigView {
     llm_timeout: u64,
     llm_retry_5xx_attempts: u32,
     llm_max_tokens: u32,
+    llm_max_concurrent_chunk_requests: u32,
     llm_max_input_chars: u32,
     llm_request_body_overrides: String,
     image_enabled: bool,
@@ -844,6 +845,11 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
         number_u32(ui, "5xx 重试次数", &mut view.llm_retry_5xx_attempts);
         number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
+        number_u32(
+            ui,
+            "超长分段最大并发请求数",
+            &mut view.llm_max_concurrent_chunk_requests,
+        );
         number_u32(ui, "LLM 最大输入字符数", &mut view.llm_max_input_chars);
         multiline_field(
             ui,
@@ -1357,6 +1363,10 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             llm_timeout: config.llm.timeout_seconds,
             llm_retry_5xx_attempts: config.llm.retry_5xx_attempts.min(u32::MAX as usize) as u32,
             llm_max_tokens: config.llm.max_output_tokens,
+            llm_max_concurrent_chunk_requests: config
+                .llm
+                .max_concurrent_chunk_requests
+                .min(u32::MAX as usize) as u32,
             llm_max_input_chars: config.privacy.max_chars_to_llm.min(u32::MAX as usize) as u32,
             llm_request_body_overrides,
             image_enabled: config.image_gen.enabled,
@@ -1464,6 +1474,8 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         llm_retry_5xx_attempts: get_u64(doc, "llm", "retry_5xx_attempts", 5).min(u32::MAX as u64)
             as u32,
         llm_max_tokens: get_u64(doc, "llm", "max_output_tokens", 2000) as u32,
+        llm_max_concurrent_chunk_requests: get_u64(doc, "llm", "max_concurrent_chunk_requests", 4)
+            .min(u32::MAX as u64) as u32,
         llm_max_input_chars: get_u64(doc, "privacy", "max_chars_to_llm", 20_000)
             .min(u32::MAX as u64) as u32,
         llm_request_body_overrides: request_body_overrides_from_doc(doc),
@@ -1620,6 +1632,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         update.llm_retry_5xx_attempts as i64,
     );
     set_int(llm, "max_output_tokens", update.llm_max_tokens as i64);
+    set_int(
+        llm,
+        "max_concurrent_chunk_requests",
+        update.llm_max_concurrent_chunk_requests.max(1) as i64,
+    );
     set_json_object_table(
         llm,
         "request_body_overrides",
