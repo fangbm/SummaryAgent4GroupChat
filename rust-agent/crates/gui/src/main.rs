@@ -618,7 +618,16 @@ impl eframe::App for GuiApp {
                 egui::Frame::group(ui.style()).show(ui, |ui| schedule_tab(ui, &mut self.view));
             }
             Tab::Model => {
-                egui::Frame::group(ui.style()).show(ui, |ui| model_tab(ui, &mut self.view));
+                egui::ScrollArea::vertical()
+                    .id_salt("model-tab-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            model_tab(ui, &mut self.view);
+                        });
+                    });
             }
             Tab::Runtime => {
                 egui::Frame::group(ui.style()).show(ui, |ui| {

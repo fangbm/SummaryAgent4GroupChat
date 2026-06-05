@@ -403,6 +403,10 @@ provider = "openai_compatible"
 # api_key = ""
 # base_url = "https://api.example.com/v1"
 # model = "whisper-1"
+# For StepFun stepaudio-2.5-asr:
+# provider = "stepfun"
+# base_url = "https://api.stepfun.com/v1"
+# model = "stepaudio-2.5-asr"
 api_key_env = "VOICE_TRANSCRIPTION_API_KEY"
 base_url_env = "VOICE_TRANSCRIPTION_BASE_URL"
 model_env = "VOICE_TRANSCRIPTION_MODEL"
@@ -420,8 +424,13 @@ max_voices_per_summary = 20
 max_concurrent_requests = 2
 
 [voice_transcription.request_body_overrides]
-# Extra multipart fields merged into the audio transcription request.
+# Extra fields merged into the audio transcription request.
+# OpenAI-compatible transcription uses these as multipart fields.
+# StepFun ASR uses a JSON body; nested values are deep-merged with the generated audio.data/input body.
 # temperature = 0
+# [voice_transcription.request_body_overrides.audio.input.transcription]
+# hotwords = ["群聊", "总结"]
+# enable_timestamp = true
 
 [proxy]
 enabled = false

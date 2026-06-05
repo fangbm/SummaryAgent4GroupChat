@@ -1,7 +1,7 @@
 use std::{env, fs, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose, Engine};
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -608,6 +608,10 @@ impl OpenAiAudioTranscriptionClient {
             .filter(|value| !value.is_empty())
             .unwrap_or("voice.audio")
             .to_string();
+        if self.uses_stepfun_asr() {
+            return self.transcribe_audio_stepfun(path, bytes, file_name).await;
+        }
+
         let endpoint = audio_transcriptions_endpoint(&self.base_url);
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
 
@@ -720,6 +724,110 @@ impl OpenAiAudioTranscriptionClient {
 
         unreachable!("voice transcription retry loop always returns")
     }
+
+    fn uses_stepfun_asr(&self) -> bool {
+        let provider = self.config.provider.trim().to_ascii_lowercase();
+        let base_url = self.base_url.to_ascii_lowercase();
+        let model = self.model.to_ascii_lowercase();
+        provider == "stepfun"
+            || provider == "step"
+            || model.contains("stepaudio")
+            || base_url.contains("api.stepfun.com")
+    }
+
+    async fn transcribe_audio_stepfun(
+        &self,
+        path: &Path,
+        bytes: Vec<u8>,
+        file_name: String,
+    ) -> Result<String, AiError> {
+        let endpoint = stepfun_asr_endpoint(&self.base_url);
+        let payload = stepfun_asr_payload(&self.model, &self.config, path, &bytes)?;
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+
+        for attempt in 1..=max_attempts {
+            let started = Instant::now();
+            info!(
+                base_url = %self.base_url,
+                model = %self.model,
+                file = %file_name,
+                bytes = bytes.len(),
+                timeout_seconds = self.config.timeout_seconds,
+                attempt,
+                max_attempts,
+                "StepFun voice transcription request started"
+            );
+            let response = match self
+                .client
+                .post(&endpoint)
+                .bearer_auth(&self.api_key)
+                .header(ACCEPT, "text/event-stream")
+                .header(CONTENT_TYPE, "application/json")
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    warn!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        attempt,
+                        max_attempts,
+                        retry,
+                        retry_after_ms,
+                        error = %error,
+                        "StepFun voice transcription transport failed"
+                    );
+                    if retry {
+                        sleep(http_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                let snippet = truncate_for_log(&body, 500);
+                let retry = attempt < max_attempts
+                    && should_retry_chat_completion_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                warn!(
+                    status = %status,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    attempt,
+                    max_attempts,
+                    retry,
+                    retry_after_ms,
+                    response = %snippet,
+                    "StepFun voice transcription request failed"
+                );
+                if retry {
+                    sleep(http_retry_delay(attempt)).await;
+                    continue;
+                }
+                let message =
+                    format!("StepFun voice transcription API returned {status}: {snippet}");
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(AiError::RateLimited(message));
+                }
+                return Err(AiError::InvalidResponse(message));
+            }
+
+            let text = extract_stepfun_asr_text(&body)?;
+            info!(
+                output_chars = text.chars().count(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "StepFun voice transcription response parsed"
+            );
+            return Ok(text);
+        }
+
+        unreachable!("StepFun voice transcription retry loop always returns")
+    }
 }
 
 fn audio_transcriptions_endpoint(base_url: &str) -> String {
@@ -728,6 +836,66 @@ fn audio_transcriptions_endpoint(base_url: &str) -> String {
         base.to_string()
     } else {
         format!("{base}/audio/transcriptions")
+    }
+}
+
+fn stepfun_asr_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/audio/asr/sse") {
+        base.to_string()
+    } else {
+        format!("{base}/audio/asr/sse")
+    }
+}
+
+fn stepfun_asr_payload(
+    model: &str,
+    config: &VoiceTranscriptionConfig,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<Value, AiError> {
+    let mut transcription = Map::new();
+    transcription.insert("model".into(), json!(model));
+    if !config.language.trim().is_empty() {
+        transcription.insert("language".into(), json!(config.language.trim()));
+    }
+
+    let format = stepfun_audio_format(path)?;
+    let mut payload = json!({
+        "audio": {
+            "data": general_purpose::STANDARD.encode(bytes),
+            "input": {
+                "transcription": Value::Object(transcription),
+                "format": format
+            }
+        }
+    });
+    apply_request_body_overrides(&mut payload, &config.request_body_overrides);
+    Ok(payload)
+}
+
+fn stepfun_audio_format(path: &Path) -> Result<Value, AiError> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "mp3" => Ok(json!({ "type": "mp3" })),
+        "wav" => Ok(json!({ "type": "wav" })),
+        "ogg" => Ok(json!({ "type": "ogg" })),
+        "pcm" => Ok(json!({
+            "type": "pcm",
+            "codec": "pcm_s16le",
+            "rate": 16000,
+            "bits": 16,
+            "channel": 1
+        })),
+        _ => Err(AiError::InvalidResponse(format!(
+            "StepFun ASR supports ogg/mp3/wav/pcm audio, got '{}'; enable MP3 transcoding or configure voice_transcription.request_body_overrides.audio.input.format",
+            extension
+        ))),
     }
 }
 
@@ -797,6 +965,107 @@ fn extract_transcription_text(body: &str, response_format: &str) -> Result<Strin
             ))
         }
         Err(_) => Ok(trimmed.to_string()),
+    }
+}
+
+fn extract_stepfun_asr_text(body: &str) -> Result<String, AiError> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(AiError::InvalidResponse(
+            "empty StepFun voice transcription response".into(),
+        ));
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|event_type| event_type == "error")
+        {
+            let message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("StepFun ASR error event");
+            return Err(AiError::InvalidResponse(message.to_string()));
+        }
+        return extract_stepfun_asr_event_text(&value, &mut String::new())
+            .ok_or_else(|| AiError::InvalidResponse("missing StepFun ASR text".into()));
+    }
+
+    let mut delta_text = String::new();
+    let mut done_text = None;
+    for event in stepfun_sse_json_events(trimmed) {
+        if event
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|event_type| event_type == "error")
+        {
+            let message = event
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("StepFun ASR error event");
+            return Err(AiError::InvalidResponse(message.to_string()));
+        }
+        if let Some(text) = extract_stepfun_asr_event_text(&event, &mut delta_text) {
+            done_text = Some(text);
+        }
+    }
+
+    done_text
+        .or_else(|| (!delta_text.trim().is_empty()).then(|| delta_text.trim().to_string()))
+        .ok_or_else(|| AiError::InvalidResponse("missing StepFun ASR text".into()))
+}
+
+fn stepfun_sse_json_events(body: &str) -> Vec<Value> {
+    let mut events = Vec::new();
+    let mut data_lines = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            push_stepfun_sse_event(&mut events, &mut data_lines);
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    push_stepfun_sse_event(&mut events, &mut data_lines);
+    events
+}
+
+fn push_stepfun_sse_event(events: &mut Vec<Value>, data_lines: &mut Vec<String>) {
+    if data_lines.is_empty() {
+        return;
+    }
+    let data = data_lines.join("\n");
+    data_lines.clear();
+    let trimmed = data.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        events.push(value);
+    }
+}
+
+fn extract_stepfun_asr_event_text(event: &Value, delta_text: &mut String) -> Option<String> {
+    match event.get("type").and_then(Value::as_str) {
+        Some("transcript.text.done") => event
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()),
+        Some("transcript.text.delta") => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                delta_text.push_str(delta);
+            }
+            None
+        }
+        _ => event
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()),
     }
 }
 
@@ -1101,7 +1370,28 @@ fn apply_request_body_overrides(
         return;
     };
     for (key, value) in override_object {
-        payload_object.insert(key, value);
+        match payload_object.get_mut(&key) {
+            Some(existing) => merge_json_override(existing, value),
+            None => {
+                payload_object.insert(key, value);
+            }
+        }
+    }
+}
+
+fn merge_json_override(target: &mut Value, override_value: Value) {
+    match (target, override_value) {
+        (Value::Object(target), Value::Object(overrides)) => {
+            for (key, value) in overrides {
+                match target.get_mut(&key) {
+                    Some(existing) => merge_json_override(existing, value),
+                    None => {
+                        target.insert(key, value);
+                    }
+                }
+            }
+        }
+        (target, override_value) => *target = override_value,
     }
 }
 
@@ -2037,6 +2327,63 @@ mod tests {
             extract_transcription_text("plain text", "text").unwrap(),
             "plain text"
         );
+    }
+
+    #[test]
+    fn stepfun_asr_payload_uses_documented_json_shape() {
+        let mut config = voice_transcription_config();
+        config.provider = "stepfun".into();
+        config.language = "zh".into();
+        config.request_body_overrides = toml::from_str(
+            r#"
+[audio.input.transcription]
+hotwords = ["群聊", "总结"]
+enable_timestamp = true
+"#,
+        )
+        .unwrap();
+
+        let payload =
+            stepfun_asr_payload("stepaudio-2.5-asr", &config, Path::new("voice.mp3"), b"abc")
+                .unwrap();
+
+        assert_eq!(
+            stepfun_asr_endpoint("https://api.stepfun.com/v1"),
+            "https://api.stepfun.com/v1/audio/asr/sse"
+        );
+        assert_eq!(payload["audio"]["data"], json!("YWJj"));
+        assert_eq!(
+            payload["audio"]["input"]["transcription"]["model"],
+            json!("stepaudio-2.5-asr")
+        );
+        assert_eq!(
+            payload["audio"]["input"]["transcription"]["language"],
+            json!("zh")
+        );
+        assert_eq!(
+            payload["audio"]["input"]["transcription"]["hotwords"],
+            json!(["群聊", "总结"])
+        );
+        assert_eq!(
+            payload["audio"]["input"]["transcription"]["enable_timestamp"],
+            json!(true)
+        );
+        assert_eq!(payload["audio"]["input"]["format"]["type"], json!("mp3"));
+    }
+
+    #[test]
+    fn stepfun_asr_sse_text_prefers_done_and_can_use_delta() {
+        let sse = r#"data: {"type":"transcript.text.delta","delta":"识别的"}
+
+data: {"type":"transcript.text.done","text":"识别的完整文字内容"}
+"#;
+        assert_eq!(extract_stepfun_asr_text(sse).unwrap(), "识别的完整文字内容");
+
+        let delta_only = r#"data: {"type":"transcript.text.delta","delta":"识别的"}
+
+data: {"type":"transcript.text.delta","delta":"文字"}
+"#;
+        assert_eq!(extract_stepfun_asr_text(delta_only).unwrap(), "识别的文字");
     }
 
     #[test]
