@@ -396,6 +396,28 @@ user_prompt = "请用一到三句话中文转述这张聊天图片的可见内�
 # Extra JSON fields merged into the multimodal chat completion request body.
 # enable_thinking = false
 
+[voice_transcription]
+enabled = false
+provider = "openai_compatible"
+# Optional persistent values. If left empty/commented, the *_env variables below are used.
+# api_key = ""
+# base_url = "https://api.example.com/v1"
+# model = "whisper-1"
+api_key_env = "VOICE_TRANSCRIPTION_API_KEY"
+base_url_env = "VOICE_TRANSCRIPTION_BASE_URL"
+model_env = "VOICE_TRANSCRIPTION_MODEL"
+timeout_seconds = 120
+retry_5xx_attempts = 5
+language = "zh"
+prompt = ""
+response_format = "json"
+max_voices_per_summary = 20
+max_concurrent_requests = 2
+
+[voice_transcription.request_body_overrides]
+# Extra multipart fields merged into the audio transcription request.
+# temperature = 0
+
 [proxy]
 enabled = false
 http = "http://127.0.0.1:7890"

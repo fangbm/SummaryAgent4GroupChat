@@ -578,7 +578,7 @@ fn query_builtin_wxdb_history(
         until: Some(until),
         limit: limit as usize,
         text_only: false,
-        msg_types: vec!["text".to_string(), "image".to_string()],
+        msg_types: vec!["text".to_string(), "image".to_string(), "voice".to_string()],
         media_decode_limit,
     })
     .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb failed: {error:#}")))
@@ -1144,13 +1144,14 @@ fn bool_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<
 fn is_supported_history_msg_type(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "text" | "1" | "文本" | "文字" | "image" | "img" | "3" | "图片"
+        "text" | "1" | "文本" | "文字" | "image" | "img" | "3" | "图片" | "voice" | "语音" | "34"
     )
 }
 
 fn normalize_history_msg_type(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "image" | "img" | "3" | "图片" => "image".to_string(),
+        "voice" | "语音" | "34" => "voice".to_string(),
         _ => "text".to_string(),
     }
 }

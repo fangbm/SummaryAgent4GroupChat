@@ -91,6 +91,11 @@ splits it into whole-message chunks and sends up to
 Provider-specific chat completion request fields can be added or overridden through
 `llm.request_body_overrides`, for example `enable_thinking = false`.
 
+Optional image and voice preprocessing can enrich the chat input before summarizing:
+`image_caption` describes decoded images, while `voice_transcription` sends decoded
+voice files to an OpenAI-compatible `/audio/transcriptions` endpoint and inserts
+the transcript back into the original voice-message line.
+
 The text and image paths use separate prompts:
 
 - `text_summary.system_prompt`: direct text summary sent back to the group.

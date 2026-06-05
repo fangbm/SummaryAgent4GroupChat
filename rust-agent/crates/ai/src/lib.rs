@@ -10,7 +10,9 @@ use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 use wechat_summary_core::{
-    config::{ImageCaptionConfig, ImageGenConfig, LlmConfig, ProxyConfig},
+    config::{
+        ImageCaptionConfig, ImageGenConfig, LlmConfig, ProxyConfig, VoiceTranscriptionConfig,
+    },
     ImageArtifact,
 };
 
@@ -558,6 +560,220 @@ impl OpenAiVisionCaptionClient {
         }
 
         unreachable!("image caption retry loop always returns")
+    }
+}
+
+pub struct OpenAiAudioTranscriptionClient {
+    config: VoiceTranscriptionConfig,
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+impl OpenAiAudioTranscriptionClient {
+    pub fn new(config: VoiceTranscriptionConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
+        let api_key = config_value_or_env(
+            config.api_key.as_deref(),
+            &config.api_key_env,
+            "voice transcription API key",
+        )
+        .map_err(|_| missing_api_key(&config.api_key_env))?;
+        let base_url = config_value_or_env(
+            config.base_url.as_deref(),
+            &config.base_url_env,
+            "voice transcription API base URL",
+        )?;
+        let model = config_value_or_env(
+            config.model.as_deref(),
+            &config.model_env,
+            "voice transcription model name",
+        )?;
+        let client = http_client(config.timeout_seconds, proxy)?;
+        Ok(Self {
+            config,
+            client,
+            api_key,
+            base_url,
+            model,
+        })
+    }
+
+    pub async fn transcribe_audio(&self, audio_path: &str) -> Result<String, AiError> {
+        let path = Path::new(audio_path.trim());
+        let bytes = fs::read(path)?;
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("voice.audio")
+            .to_string();
+        let endpoint = audio_transcriptions_endpoint(&self.base_url);
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+
+        for attempt in 1..=max_attempts {
+            let started = Instant::now();
+            let mut form = reqwest::multipart::Form::new()
+                .text("model", self.model.clone())
+                .part(
+                    "file",
+                    reqwest::multipart::Part::bytes(bytes.clone()).file_name(file_name.clone()),
+                );
+            if !self.config.language.trim().is_empty() {
+                form = form.text("language", self.config.language.trim().to_string());
+            }
+            if !self.config.prompt.trim().is_empty() {
+                form = form.text("prompt", self.config.prompt.trim().to_string());
+            }
+            if !self.config.response_format.trim().is_empty() {
+                form = form.text(
+                    "response_format",
+                    self.config.response_format.trim().to_string(),
+                );
+            }
+            for (key, value) in &self.config.request_body_overrides {
+                if key == "file" || key == "model" {
+                    continue;
+                }
+                form = form.text(key.clone(), toml_value_to_multipart_string(value));
+            }
+
+            info!(
+                base_url = %self.base_url,
+                model = %self.model,
+                file = %file_name,
+                bytes = bytes.len(),
+                timeout_seconds = self.config.timeout_seconds,
+                attempt,
+                max_attempts,
+                "voice transcription request started"
+            );
+            let response = match self
+                .client
+                .post(&endpoint)
+                .bearer_auth(&self.api_key)
+                .multipart(form)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    warn!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        attempt,
+                        max_attempts,
+                        retry,
+                        retry_after_ms,
+                        error = %error,
+                        "voice transcription transport failed"
+                    );
+                    if retry {
+                        sleep(http_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                let snippet = truncate_for_log(&body, 500);
+                let retry = attempt < max_attempts
+                    && should_retry_chat_completion_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                warn!(
+                    status = %status,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    attempt,
+                    max_attempts,
+                    retry,
+                    retry_after_ms,
+                    response = %snippet,
+                    "voice transcription request failed"
+                );
+                if retry {
+                    sleep(http_retry_delay(attempt)).await;
+                    continue;
+                }
+                let message = format!("voice transcription API returned {status}: {snippet}");
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(AiError::RateLimited(message));
+                }
+                return Err(AiError::InvalidResponse(message));
+            }
+
+            let text = extract_transcription_text(&body, &self.config.response_format)?;
+            info!(
+                output_chars = text.chars().count(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "voice transcription response parsed"
+            );
+            return Ok(text);
+        }
+
+        unreachable!("voice transcription retry loop always returns")
+    }
+}
+
+fn audio_transcriptions_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/audio/transcriptions") {
+        base.to_string()
+    } else {
+        format!("{base}/audio/transcriptions")
+    }
+}
+
+fn toml_value_to_multipart_string(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(value) => value.clone(),
+        toml::Value::Integer(value) => value.to_string(),
+        toml::Value::Float(value) => value.to_string(),
+        toml::Value::Boolean(value) => value.to_string(),
+        toml::Value::Datetime(value) => value.to_string(),
+        toml::Value::Array(_) | toml::Value::Table(_) => value.to_string(),
+    }
+}
+
+fn extract_transcription_text(body: &str, response_format: &str) -> Result<String, AiError> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(AiError::InvalidResponse(
+            "empty voice transcription response".into(),
+        ));
+    }
+
+    let format = response_format.trim().to_ascii_lowercase();
+    if matches!(format.as_str(), "text" | "srt" | "vtt") {
+        return Ok(trimmed.to_string());
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => {
+            if let Some(text) = value.get("text").and_then(Value::as_str) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    return Ok(text.to_string());
+                }
+            }
+            if let Some(text) = value
+                .pointer("/data/text")
+                .and_then(Value::as_str)
+                .or_else(|| value.pointer("/result/text").and_then(Value::as_str))
+            {
+                let text = text.trim();
+                if !text.is_empty() {
+                    return Ok(text.to_string());
+                }
+            }
+            Err(AiError::InvalidResponse(
+                "missing voice transcription text".into(),
+            ))
+        }
+        Err(_) => Ok(trimmed.to_string()),
     }
 }
 
@@ -1681,6 +1897,27 @@ mod tests {
         }
     }
 
+    fn voice_transcription_config() -> VoiceTranscriptionConfig {
+        VoiceTranscriptionConfig {
+            enabled: true,
+            provider: "openai_compatible".into(),
+            api_key: None,
+            api_key_env: "VOICE_TRANSCRIPTION_API_KEY".into(),
+            base_url: None,
+            base_url_env: "VOICE_TRANSCRIPTION_BASE_URL".into(),
+            model: None,
+            model_env: "VOICE_TRANSCRIPTION_MODEL".into(),
+            timeout_seconds: 120,
+            retry_5xx_attempts: 5,
+            language: "zh".into(),
+            prompt: String::new(),
+            response_format: "json".into(),
+            max_voices_per_summary: 20,
+            max_concurrent_requests: 2,
+            request_body_overrides: Default::default(),
+        }
+    }
+
     fn image_config() -> ImageGenConfig {
         ImageGenConfig {
             enabled: true,
@@ -1754,6 +1991,45 @@ mod tests {
         assert_eq!(client.api_key, "persisted-key");
         assert_eq!(client.base_url, "https://api.example.com/v1");
         assert_eq!(client.model, "vision-model");
+    }
+
+    #[test]
+    fn voice_transcription_helpers_accept_openai_style_outputs() {
+        assert_eq!(
+            audio_transcriptions_endpoint("https://api.example.com/v1"),
+            "https://api.example.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            audio_transcriptions_endpoint("https://api.example.com/v1/audio/transcriptions"),
+            "https://api.example.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            extract_transcription_text(r#"{"text":"你好世界"}"#, "json").unwrap(),
+            "你好世界"
+        );
+        assert_eq!(
+            extract_transcription_text("plain text", "text").unwrap(),
+            "plain text"
+        );
+    }
+
+    #[test]
+    fn voice_transcription_client_can_use_persistent_config_values() {
+        let mut config = voice_transcription_config();
+        config.api_key = Some("persisted-voice-key".into());
+        config.base_url = Some("https://voice.example.com/v1".into());
+        config.model = Some("whisper-model".into());
+        let proxy = ProxyConfig {
+            enabled: false,
+            http: None,
+            https: None,
+        };
+
+        let client = OpenAiAudioTranscriptionClient::new(config, &proxy).unwrap();
+
+        assert_eq!(client.api_key, "persisted-voice-key");
+        assert_eq!(client.base_url, "https://voice.example.com/v1");
+        assert_eq!(client.model, "whisper-model");
     }
 
     #[test]

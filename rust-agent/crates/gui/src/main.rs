@@ -100,6 +100,20 @@ struct ConfigView {
     image_caption_max_images: u32,
     image_caption_max_concurrent_requests: u32,
     image_caption_request_body_overrides: String,
+    voice_transcription_enabled: bool,
+    voice_transcription_provider: String,
+    voice_transcription_api_key_env: String,
+    voice_transcription_base_url_env: String,
+    voice_transcription_model: String,
+    voice_transcription_model_env: String,
+    voice_transcription_timeout: u64,
+    voice_transcription_retry_5xx_attempts: u32,
+    voice_transcription_language: String,
+    voice_transcription_prompt: String,
+    voice_transcription_response_format: String,
+    voice_transcription_max_voices: u32,
+    voice_transcription_max_concurrent_requests: u32,
+    voice_transcription_request_body_overrides: String,
     runtime_output_dir: String,
     runtime_log_level: String,
     runtime_cleanup_days: u32,
@@ -913,6 +927,55 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             &mut view.image_caption_request_body_overrides,
             6,
         );
+        ui.separator();
+        ui.heading("语音转写");
+        ui.checkbox(&mut view.voice_transcription_enabled, "启用语音转写");
+        text_field(ui, "语音 Provider", &mut view.voice_transcription_provider);
+        text_field(
+            ui,
+            "语音 API Key 环境变量/直接值",
+            &mut view.voice_transcription_api_key_env,
+        );
+        text_field(
+            ui,
+            "语音 Base URL 环境变量/直接值",
+            &mut view.voice_transcription_base_url_env,
+        );
+        text_field(ui, "语音模型名称", &mut view.voice_transcription_model);
+        text_field(
+            ui,
+            "语音模型环境变量",
+            &mut view.voice_transcription_model_env,
+        );
+        number_u64(ui, "语音超时秒数", &mut view.voice_transcription_timeout);
+        number_u32(
+            ui,
+            "5xx 重试次数",
+            &mut view.voice_transcription_retry_5xx_attempts,
+        );
+        text_field(ui, "语音语言", &mut view.voice_transcription_language);
+        text_field(ui, "语音提示词", &mut view.voice_transcription_prompt);
+        text_field(
+            ui,
+            "语音响应格式",
+            &mut view.voice_transcription_response_format,
+        );
+        number_u32(
+            ui,
+            "每次最多转写语音数",
+            &mut view.voice_transcription_max_voices,
+        );
+        number_u32(
+            ui,
+            "语音最大并发请求数",
+            &mut view.voice_transcription_max_concurrent_requests,
+        );
+        multiline_field(
+            ui,
+            "语音请求体覆盖(JSON)",
+            &mut view.voice_transcription_request_body_overrides,
+            4,
+        );
     });
 }
 
@@ -1327,6 +1390,13 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             config.image_caption.model_env,
             "IMAGE_CAPTION_MODEL",
         );
+        let voice_transcription_request_body_overrides =
+            request_body_overrides_to_json(&config.voice_transcription.request_body_overrides);
+        let (voice_transcription_model, voice_transcription_model_env) = split_model_fields(
+            config.voice_transcription.model,
+            config.voice_transcription.model_env,
+            "VOICE_TRANSCRIPTION_MODEL",
+        );
         return ConfigView {
             platform_kind: config.platform.kind.as_str().to_string(),
             wx_groups: join_lines(&config.wx4py.groups),
@@ -1400,6 +1470,30 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
                 .max_concurrent_requests
                 .min(u32::MAX as usize) as u32,
             image_caption_request_body_overrides,
+            voice_transcription_enabled: config.voice_transcription.enabled,
+            voice_transcription_provider: config.voice_transcription.provider,
+            voice_transcription_api_key_env: config.voice_transcription.api_key_env,
+            voice_transcription_base_url_env: config.voice_transcription.base_url_env,
+            voice_transcription_model,
+            voice_transcription_model_env,
+            voice_transcription_timeout: config.voice_transcription.timeout_seconds,
+            voice_transcription_retry_5xx_attempts: config
+                .voice_transcription
+                .retry_5xx_attempts
+                .min(u32::MAX as usize) as u32,
+            voice_transcription_language: config.voice_transcription.language,
+            voice_transcription_prompt: config.voice_transcription.prompt,
+            voice_transcription_response_format: config.voice_transcription.response_format,
+            voice_transcription_max_voices: config
+                .voice_transcription
+                .max_voices_per_summary
+                .min(u32::MAX as usize) as u32,
+            voice_transcription_max_concurrent_requests: config
+                .voice_transcription
+                .max_concurrent_requests
+                .min(u32::MAX as usize)
+                as u32,
+            voice_transcription_request_body_overrides,
             runtime_output_dir: config.runtime.output_dir,
             runtime_log_level: config.runtime.log_level,
             runtime_cleanup_days: config.runtime.cleanup_after_days,
@@ -1414,6 +1508,16 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         non_empty_string(get_str(doc, "image_caption", "model", "")),
         get_str(doc, "image_caption", "model_env", "IMAGE_CAPTION_MODEL"),
         "IMAGE_CAPTION_MODEL",
+    );
+    let (voice_transcription_model, voice_transcription_model_env) = split_model_fields(
+        non_empty_string(get_str(doc, "voice_transcription", "model", "")),
+        get_str(
+            doc,
+            "voice_transcription",
+            "model_env",
+            "VOICE_TRANSCRIPTION_MODEL",
+        ),
+        "VOICE_TRANSCRIPTION_MODEL",
     );
 
     ConfigView {
@@ -1521,6 +1625,61 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         image_caption_request_body_overrides: request_body_overrides_from_table_doc(
             doc,
             "image_caption",
+        ),
+        voice_transcription_enabled: get_bool(doc, "voice_transcription", "enabled", false),
+        voice_transcription_provider: get_str(
+            doc,
+            "voice_transcription",
+            "provider",
+            "openai_compatible",
+        ),
+        voice_transcription_api_key_env: get_str(
+            doc,
+            "voice_transcription",
+            "api_key_env",
+            "VOICE_TRANSCRIPTION_API_KEY",
+        ),
+        voice_transcription_base_url_env: get_str(
+            doc,
+            "voice_transcription",
+            "base_url_env",
+            "VOICE_TRANSCRIPTION_BASE_URL",
+        ),
+        voice_transcription_model,
+        voice_transcription_model_env,
+        voice_transcription_timeout: get_u64(doc, "voice_transcription", "timeout_seconds", 120),
+        voice_transcription_retry_5xx_attempts: get_u64(
+            doc,
+            "voice_transcription",
+            "retry_5xx_attempts",
+            5,
+        )
+        .min(u32::MAX as u64) as u32,
+        voice_transcription_language: get_str(doc, "voice_transcription", "language", "zh"),
+        voice_transcription_prompt: get_str(doc, "voice_transcription", "prompt", ""),
+        voice_transcription_response_format: get_str(
+            doc,
+            "voice_transcription",
+            "response_format",
+            "json",
+        ),
+        voice_transcription_max_voices: get_u64(
+            doc,
+            "voice_transcription",
+            "max_voices_per_summary",
+            20,
+        )
+        .min(u32::MAX as u64) as u32,
+        voice_transcription_max_concurrent_requests: get_u64(
+            doc,
+            "voice_transcription",
+            "max_concurrent_requests",
+            2,
+        )
+        .min(u32::MAX as u64) as u32,
+        voice_transcription_request_body_overrides: request_body_overrides_from_table_doc(
+            doc,
+            "voice_transcription",
         ),
         runtime_output_dir: get_str(doc, "runtime", "output_dir", ".\\runtime\\rust-output"),
         runtime_log_level: get_str(doc, "runtime", "log_level", "info"),
@@ -1706,6 +1865,82 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         image_caption,
         "request_body_overrides",
         &update.image_caption_request_body_overrides,
+    )?;
+
+    let voice_transcription = table_mut(&mut doc, "voice_transcription");
+    set_bool(
+        voice_transcription,
+        "enabled",
+        update.voice_transcription_enabled,
+    );
+    set_str(
+        voice_transcription,
+        "provider",
+        &update.voice_transcription_provider,
+    );
+    set_str(
+        voice_transcription,
+        "api_key_env",
+        &update.voice_transcription_api_key_env,
+    );
+    set_str(
+        voice_transcription,
+        "base_url_env",
+        &update.voice_transcription_base_url_env,
+    );
+    if update.voice_transcription_model.trim().is_empty() {
+        remove_key(voice_transcription, "model");
+    } else {
+        set_str(
+            voice_transcription,
+            "model",
+            update.voice_transcription_model.trim(),
+        );
+    }
+    set_str(
+        voice_transcription,
+        "model_env",
+        &update.voice_transcription_model_env,
+    );
+    set_int(
+        voice_transcription,
+        "timeout_seconds",
+        update.voice_transcription_timeout as i64,
+    );
+    set_int(
+        voice_transcription,
+        "retry_5xx_attempts",
+        update.voice_transcription_retry_5xx_attempts as i64,
+    );
+    set_str(
+        voice_transcription,
+        "language",
+        &update.voice_transcription_language,
+    );
+    set_str(
+        voice_transcription,
+        "prompt",
+        &update.voice_transcription_prompt,
+    );
+    set_str(
+        voice_transcription,
+        "response_format",
+        &update.voice_transcription_response_format,
+    );
+    set_int(
+        voice_transcription,
+        "max_voices_per_summary",
+        update.voice_transcription_max_voices as i64,
+    );
+    set_int(
+        voice_transcription,
+        "max_concurrent_requests",
+        update.voice_transcription_max_concurrent_requests.max(1) as i64,
+    );
+    set_json_object_table(
+        voice_transcription,
+        "request_body_overrides",
+        &update.voice_transcription_request_body_overrides,
     )?;
 
     let runtime = table_mut(&mut doc, "runtime");

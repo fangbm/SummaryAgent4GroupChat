@@ -16,8 +16,8 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
 use wechat_summary_ai::{
-    AiError, AiRetryNotice, OpenAiCompatibleLlm, OpenAiImageClient, OpenAiVisionCaptionClient,
-    RetryNotifier,
+    AiError, AiRetryNotice, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm, OpenAiImageClient,
+    OpenAiVisionCaptionClient, RetryNotifier,
 };
 use wechat_summary_core::{
     config::{PlatformKindConfig, TimeRangeMode},
@@ -1054,7 +1054,7 @@ async fn run_summary_pipeline(
 
     let history_message_limit = config.history_message_limit();
     let history_query_limit = history_message_limit.min(u32::MAX as usize) as u32;
-    let media_decode_limit = image_caption_media_decode_limit(config);
+    let media_decode_limit = summary_media_decode_limit(config);
     info!(
         room_id = %trigger.room_id,
         since = %range.since,
@@ -1239,6 +1239,8 @@ async fn run_summary_pipeline(
     );
 
     let image_caption_count = apply_image_captions(config, &trigger.room_id, &mut history).await?;
+    let voice_transcription_count =
+        apply_voice_transcriptions(config, &trigger.room_id, &mut history).await?;
 
     let chat_messages = history
         .into_iter()
@@ -1280,6 +1282,15 @@ async fn run_summary_pipeline(
             &format!(
                 "image captions inserted room={} count={}",
                 trigger.room_id, image_caption_count
+            ),
+        );
+    }
+    if voice_transcription_count > 0 {
+        append_runtime_log(
+            config,
+            &format!(
+                "voice transcriptions inserted room={} count={}",
+                trigger.room_id, voice_transcription_count
             ),
         );
     }
@@ -2752,12 +2763,15 @@ fn format_error_chain(error: &anyhow::Error) -> String {
         .join(": ")
 }
 
-fn image_caption_media_decode_limit(config: &AgentConfig) -> Option<usize> {
+fn summary_media_decode_limit(config: &AgentConfig) -> Option<usize> {
+    let mut limit = 0usize;
     if config.image_caption.enabled {
-        Some(config.image_caption.max_images_per_summary)
-    } else {
-        Some(0)
+        limit = limit.saturating_add(config.image_caption.max_images_per_summary);
     }
+    if config.voice_transcription.enabled {
+        limit = limit.saturating_add(config.voice_transcription.max_voices_per_summary);
+    }
+    Some(limit)
 }
 
 fn format_media_decode_limit(limit: Option<usize>) -> String {
@@ -2977,6 +2991,221 @@ fn is_image_message_type(value: &str) -> bool {
     )
 }
 
+async fn apply_voice_transcriptions(
+    config: &AgentConfig,
+    room_id: &str,
+    history: &mut [PlatformHistoryMessage],
+) -> Result<usize> {
+    if !config.voice_transcription.enabled || config.voice_transcription.max_voices_per_summary == 0
+    {
+        return Ok(0);
+    }
+    let transcriber = match OpenAiAudioTranscriptionClient::new(
+        config.voice_transcription.clone(),
+        &config.proxy,
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            let error = error.to_string();
+            warn!(
+                room_id = %room_id,
+                error = %error,
+                "voice transcription client initialization failed; continuing without transcriptions"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "voice transcription init failed room={} error={}",
+                    room_id, error
+                ),
+            );
+            return Ok(0);
+        }
+    };
+    let transcriber = Arc::new(transcriber);
+    let max_concurrent = config.voice_transcription.max_concurrent_requests.max(1);
+
+    let mut candidates = Vec::new();
+    for (history_index, message) in history.iter().enumerate() {
+        if candidates.len() >= config.voice_transcription.max_voices_per_summary {
+            break;
+        }
+        if !is_voice_message_type(&message.msg_type) {
+            continue;
+        }
+        let Some(source) = voice_transcription_source(message) else {
+            if let Some(error) = message.media_decode_error.as_deref() {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "voice transcription skipped room={} reason=decode_failed error={}",
+                        room_id, error
+                    ),
+                );
+            }
+            continue;
+        };
+        candidates.push((history_index, candidates.len() + 1, source));
+    }
+
+    let attempted = candidates.len();
+    if attempted == 0 {
+        return Ok(0);
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "voice transcription batch started room={} attempted={} max_concurrent={}",
+            room_id, attempted, max_concurrent
+        ),
+    );
+
+    let mut inserted = 0usize;
+    let mut next_candidate = 0usize;
+    let mut join_set = JoinSet::new();
+    while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+        spawn_voice_transcription_task(
+            &mut join_set,
+            Arc::clone(&transcriber),
+            &candidates[next_candidate],
+        );
+        next_candidate += 1;
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let VoiceTranscriptionTaskResult {
+            history_index,
+            attempted,
+            result,
+        } = joined.context("joining voice transcription request task")?;
+        match result {
+            Ok(transcription) => {
+                let transcription = transcription.trim();
+                if !transcription.is_empty() {
+                    history[history_index].content = format!(
+                        "{}（语音转写：{}）",
+                        history[history_index].content.trim(),
+                        transcription
+                    );
+                    inserted += 1;
+                    info!(
+                        room_id = %room_id,
+                        inserted,
+                        attempted,
+                        "voice transcription inserted into history"
+                    );
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                warn!(
+                    room_id = %room_id,
+                    attempted,
+                    error = %error,
+                    "voice transcription failed; keeping voice placeholder"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "voice transcription failed room={} attempted={} error={}",
+                        room_id, attempted, error
+                    ),
+                );
+                if is_voice_transcription_auth_error(&error) {
+                    warn!(
+                        room_id = %room_id,
+                        attempted,
+                        "voice transcription stopped after authentication failure"
+                    );
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "voice transcription stopped room={} reason=authentication_failed attempted={}",
+                            room_id, attempted
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+
+        while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+            spawn_voice_transcription_task(
+                &mut join_set,
+                Arc::clone(&transcriber),
+                &candidates[next_candidate],
+            );
+            next_candidate += 1;
+        }
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "voice transcription completed room={} attempted={} inserted={}",
+            room_id, attempted, inserted
+        ),
+    );
+    Ok(inserted)
+}
+
+struct VoiceTranscriptionTaskResult {
+    history_index: usize,
+    attempted: usize,
+    result: std::result::Result<String, AiError>,
+}
+
+fn spawn_voice_transcription_task(
+    join_set: &mut JoinSet<VoiceTranscriptionTaskResult>,
+    transcriber: Arc<OpenAiAudioTranscriptionClient>,
+    candidate: &(usize, usize, String),
+) {
+    let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
+    join_set.spawn(async move {
+        VoiceTranscriptionTaskResult {
+            history_index,
+            attempted,
+            result: transcriber.transcribe_audio(&source).await,
+        }
+    });
+}
+
+fn is_voice_transcription_auth_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid_platform_key")
+        || lower.contains("missing or invalid platform key")
+}
+
+fn voice_transcription_source(message: &PlatformHistoryMessage) -> Option<String> {
+    message
+        .decoded_media_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            message
+                .media_path
+                .as_deref()
+                .filter(|path| {
+                    let path = path.trim();
+                    !path.starts_with("http://")
+                        && !path.starts_with("https://")
+                        && !path.starts_with("data:")
+                })
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn is_voice_message_type(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "voice" | "语音" | "34"
+    )
+}
+
 fn looks_like_text_summary_refusal(summary: &str) -> bool {
     let normalized: String = summary.chars().filter(|c| !c.is_whitespace()).collect();
     if normalized.is_empty() || normalized.chars().count() > 160 {
@@ -3155,11 +3384,16 @@ mod tests {
         let mut config = test_config();
         config.image_caption.enabled = false;
         config.image_caption.max_images_per_summary = 20;
-        assert_eq!(image_caption_media_decode_limit(&config), Some(0));
+        config.voice_transcription.enabled = false;
+        config.voice_transcription.max_voices_per_summary = 20;
+        assert_eq!(summary_media_decode_limit(&config), Some(0));
 
         config.image_caption.enabled = true;
         config.image_caption.max_images_per_summary = 7;
-        assert_eq!(image_caption_media_decode_limit(&config), Some(7));
+        assert_eq!(summary_media_decode_limit(&config), Some(7));
+        config.voice_transcription.enabled = true;
+        config.voice_transcription.max_voices_per_summary = 3;
+        assert_eq!(summary_media_decode_limit(&config), Some(10));
         assert_eq!(format_media_decode_limit(Some(7)), "7");
         assert_eq!(format_media_decode_limit(None), "unlimited");
     }

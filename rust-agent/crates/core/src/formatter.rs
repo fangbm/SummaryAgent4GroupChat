@@ -112,7 +112,7 @@ fn format_beijing_message_time(value: DateTime<Utc>) -> String {
 fn is_text_message_type(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "text" | "1" | "文本" | "文字" | "image" | "img" | "3" | "图片"
+        "text" | "1" | "文本" | "文字" | "image" | "img" | "3" | "图片" | "voice" | "语音" | "34"
     )
 }
 
@@ -159,5 +159,16 @@ mod tests {
 
         assert_eq!(formatted.total_messages, 1);
         assert!(formatted.chat_records.contains("中文文本类型也应该保留"));
+    }
+
+    #[test]
+    fn formats_voice_message_type() {
+        let mut message = chat(1_716_464_700, "Alice", "[语音]（语音转写：你好）");
+        message.msg_type = "voice".into();
+
+        let formatted = ChatFormatter::format(&[message]);
+
+        assert_eq!(formatted.total_messages, 1);
+        assert!(formatted.chat_records.contains("语音转写：你好"));
     }
 }

@@ -49,6 +49,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub image_caption: ImageCaptionConfig,
     #[serde(default)]
+    pub voice_transcription: VoiceTranscriptionConfig,
+    #[serde(default)]
     pub proxy: ProxyConfig,
     pub runtime: RuntimeConfig,
 }
@@ -516,6 +518,65 @@ impl Default for ImageCaptionConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceTranscriptionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_voice_transcription_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_voice_transcription_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_voice_transcription_base_url_env")]
+    pub base_url_env: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_voice_transcription_model_env")]
+    pub model_env: String,
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_retry_5xx_attempts")]
+    pub retry_5xx_attempts: usize,
+    #[serde(default = "default_voice_transcription_language")]
+    pub language: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default = "default_voice_transcription_response_format")]
+    pub response_format: String,
+    #[serde(default = "default_voice_transcription_max_voices")]
+    pub max_voices_per_summary: usize,
+    #[serde(default = "default_voice_transcription_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    #[serde(default)]
+    pub request_body_overrides: BTreeMap<String, toml::Value>,
+}
+
+impl Default for VoiceTranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_voice_transcription_provider(),
+            api_key: None,
+            api_key_env: default_voice_transcription_api_key_env(),
+            base_url: None,
+            base_url_env: default_voice_transcription_base_url_env(),
+            model: None,
+            model_env: default_voice_transcription_model_env(),
+            timeout_seconds: default_llm_timeout(),
+            retry_5xx_attempts: default_retry_5xx_attempts(),
+            language: default_voice_transcription_language(),
+            prompt: String::new(),
+            response_format: default_voice_transcription_response_format(),
+            max_voices_per_summary: default_voice_transcription_max_voices(),
+            max_concurrent_requests: default_voice_transcription_max_concurrent_requests(),
+            request_body_overrides: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProxyConfig {
     #[serde(default)]
@@ -647,6 +708,22 @@ fn default_image_caption_model_env() -> String {
     "IMAGE_CAPTION_MODEL".to_string()
 }
 
+fn default_voice_transcription_provider() -> String {
+    "openai_compatible".to_string()
+}
+
+fn default_voice_transcription_api_key_env() -> String {
+    "VOICE_TRANSCRIPTION_API_KEY".to_string()
+}
+
+fn default_voice_transcription_base_url_env() -> String {
+    "VOICE_TRANSCRIPTION_BASE_URL".to_string()
+}
+
+fn default_voice_transcription_model_env() -> String {
+    "VOICE_TRANSCRIPTION_MODEL".to_string()
+}
+
 fn default_image_timeout() -> u64 {
     300
 }
@@ -685,6 +762,22 @@ fn default_image_caption_max_images() -> usize {
 
 fn default_image_caption_max_concurrent_requests() -> usize {
     4
+}
+
+fn default_voice_transcription_language() -> String {
+    "zh".to_string()
+}
+
+fn default_voice_transcription_response_format() -> String {
+    "json".to_string()
+}
+
+fn default_voice_transcription_max_voices() -> usize {
+    20
+}
+
+fn default_voice_transcription_max_concurrent_requests() -> usize {
+    2
 }
 
 fn default_text_summary_system_prompt() -> String {
@@ -822,6 +915,7 @@ api_key_env = "LLM_API_KEY""#,
         let image_summary: ImageSummaryConfig = toml::from_str("").unwrap();
         let image_prompt: ImagePromptConfig = toml::from_str("").unwrap();
         let image_caption: ImageCaptionConfig = toml::from_str("").unwrap();
+        let voice_transcription: VoiceTranscriptionConfig = toml::from_str("").unwrap();
 
         assert_eq!(llm.max_concurrent_chunk_requests, 4);
         assert!(text_summary.enabled);
@@ -837,6 +931,10 @@ api_key_env = "LLM_API_KEY""#,
         assert_eq!(image_caption.retry_5xx_attempts, 5);
         assert_eq!(image_caption.max_concurrent_requests, 4);
         assert!(image_caption.user_prompt.contains("转述"));
+        assert!(!voice_transcription.enabled);
+        assert_eq!(voice_transcription.model_env, "VOICE_TRANSCRIPTION_MODEL");
+        assert_eq!(voice_transcription.max_concurrent_requests, 2);
+        assert_eq!(voice_transcription.language, "zh");
     }
 
     #[test]

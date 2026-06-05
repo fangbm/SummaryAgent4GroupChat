@@ -610,31 +610,45 @@ fn query_messages(
             stats.empty_content += 1;
             continue;
         }
-        let image_media = if base_type == 3 {
-            stats.image_messages += 1;
-            if consume_media_decode_budget(media_decode_remaining) {
-                stats.media_decode_attempts += 1;
-                let media = resolve_image_media(
-                    image_resolver,
-                    account_root,
-                    media_cache_dir,
-                    chat_username,
-                    timestamp,
-                    &raw_content,
-                );
-                match &media {
-                    Some(media) if media.decoded_path.is_some() => stats.media_decode_success += 1,
-                    Some(media) if media.decode_error.is_some() => stats.media_decode_errors += 1,
-                    Some(_) => stats.media_decode_unresolved += 1,
-                    None => stats.media_decode_no_candidates += 1,
+        let media = match base_type {
+            3 => {
+                stats.image_messages += 1;
+                if consume_media_decode_budget(media_decode_remaining) {
+                    stats.media_decode_attempts += 1;
+                    let media = resolve_image_media(
+                        image_resolver,
+                        account_root,
+                        media_cache_dir,
+                        chat_username,
+                        timestamp,
+                        &raw_content,
+                    );
+                    record_media_decode_stats(&mut stats, &media);
+                    media
+                } else {
+                    stats.media_decode_skipped_budget += 1;
+                    None
                 }
-                media
-            } else {
-                stats.media_decode_skipped_budget += 1;
-                None
             }
-        } else {
-            None
+            34 => {
+                stats.voice_messages += 1;
+                if consume_media_decode_budget(media_decode_remaining) {
+                    stats.media_decode_attempts += 1;
+                    let media = resolve_voice_media(
+                        image_resolver,
+                        account_root,
+                        media_cache_dir,
+                        chat_username,
+                        timestamp,
+                    );
+                    record_media_decode_stats(&mut stats, &media);
+                    media
+                } else {
+                    stats.media_decode_skipped_budget += 1;
+                    None
+                }
+            }
+            _ => None,
         };
         stats.messages_kept += 1;
         messages.push(HistoryMessage {
@@ -655,23 +669,17 @@ fn query_messages(
             image_md5: (base_type == 3)
                 .then(|| xml_attr(&raw_content, "md5"))
                 .flatten(),
-            media_path: image_media
-                .as_ref()
-                .and_then(|media| media.media_path.clone()),
-            thumbnail_path: image_media
+            media_path: media.as_ref().and_then(|media| media.media_path.clone()),
+            thumbnail_path: media
                 .as_ref()
                 .and_then(|media| media.thumbnail_path.clone()),
-            media_candidates: image_media
+            media_candidates: media
                 .as_ref()
                 .map(|media| media.candidates.clone())
                 .unwrap_or_default(),
-            decoded_media_path: image_media
-                .as_ref()
-                .and_then(|media| media.decoded_path.clone()),
-            media_decoder: image_media.as_ref().and_then(|media| media.decoder.clone()),
-            media_decode_error: image_media
-                .as_ref()
-                .and_then(|media| media.decode_error.clone()),
+            decoded_media_path: media.as_ref().and_then(|media| media.decoded_path.clone()),
+            media_decoder: media.as_ref().and_then(|media| media.decoder.clone()),
+            media_decode_error: media.as_ref().and_then(|media| media.decode_error.clone()),
         });
     }
     tracing::info!(
@@ -683,6 +691,7 @@ fn query_messages(
         empty_content = stats.empty_content,
         messages = stats.messages_kept,
         image_messages = stats.image_messages,
+        voice_messages = stats.voice_messages,
         media_decode_attempts = stats.media_decode_attempts,
         media_decode_success = stats.media_decode_success,
         media_decode_errors = stats.media_decode_errors,
@@ -704,12 +713,22 @@ struct QueryMessageStats {
     empty_content: usize,
     messages_kept: usize,
     image_messages: usize,
+    voice_messages: usize,
     media_decode_attempts: usize,
     media_decode_success: usize,
     media_decode_errors: usize,
     media_decode_unresolved: usize,
     media_decode_no_candidates: usize,
     media_decode_skipped_budget: usize,
+}
+
+fn record_media_decode_stats(stats: &mut QueryMessageStats, media: &Option<ImageMedia>) {
+    match media {
+        Some(media) if media.decoded_path.is_some() => stats.media_decode_success += 1,
+        Some(media) if media.decode_error.is_some() => stats.media_decode_errors += 1,
+        Some(_) => stats.media_decode_unresolved += 1,
+        None => stats.media_decode_no_candidates += 1,
+    }
 }
 
 fn consume_media_decode_budget(media_decode_remaining: &mut Option<usize>) -> bool {
@@ -846,6 +865,84 @@ fn resolve_image_media(
     })
 }
 
+fn resolve_voice_media(
+    resolver: &mut ImageResolveContext,
+    account_root: Option<&Path>,
+    media_cache_dir: &Path,
+    chat_username: &str,
+    timestamp: i64,
+) -> Option<ImageMedia> {
+    let account_root = account_root?;
+    let chat_hash = format!("{:x}", md5::compute(chat_username.as_bytes()));
+    let month = Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m").to_string())?;
+    let mut candidates = Vec::new();
+
+    for leaf in ["Voice", "Audio", "Record", "voice", "audio", "record"] {
+        resolver.collect_nearby_files(
+            &account_root
+                .join("msg")
+                .join("attach")
+                .join(&chat_hash)
+                .join(&month)
+                .join(leaf),
+            timestamp,
+            &mut candidates,
+        );
+        resolver.collect_nearby_files(
+            &account_root
+                .join("temp")
+                .join(&chat_hash)
+                .join(&month)
+                .join(leaf),
+            timestamp,
+            &mut candidates,
+        );
+        resolver.collect_nearby_files(
+            &account_root
+                .join("cache")
+                .join(&month)
+                .join("Message")
+                .join(&chat_hash)
+                .join(leaf),
+            timestamp,
+            &mut candidates,
+        );
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    let preferred = candidates
+        .iter()
+        .min_by_key(|path| media_candidate_score(path, timestamp, None))
+        .cloned();
+    let decode_result = decode_first_voice_candidate(
+        account_root,
+        media_cache_dir,
+        preferred.as_ref(),
+        &candidates,
+    );
+    let (decoded_path, decoder, decode_error) = match decode_result {
+        Ok(Some(decoded)) => (
+            Some(decoded.path),
+            Some(decoded.decoder.to_string()),
+            None::<String>,
+        ),
+        Ok(None) => (None, None, None),
+        Err(error) => (None, None, Some(error.to_string())),
+    };
+    (!candidates.is_empty()).then_some(ImageMedia {
+        media_path: preferred,
+        thumbnail_path: None,
+        candidates,
+        decoded_path,
+        decoder,
+        decode_error,
+    })
+}
+
 fn decode_first_media_candidate(
     account_root: &Path,
     media_cache_dir: &Path,
@@ -886,6 +983,35 @@ fn decode_first_media_candidate(
     }
     if fallback.is_some() {
         return Ok(fallback);
+    }
+    anyhow::bail!("{}", errors.join(" | "))
+}
+
+fn decode_first_voice_candidate(
+    account_root: &Path,
+    media_cache_dir: &Path,
+    preferred: Option<&PathBuf>,
+    candidates: &[PathBuf],
+) -> Result<Option<media::DecodedMedia>> {
+    let mut paths = Vec::<&PathBuf>::new();
+    if let Some(path) = preferred {
+        paths.push(path);
+    }
+    for path in candidates {
+        if !paths.iter().any(|known| *known == path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut errors = Vec::new();
+    for path in paths {
+        match media::decode_voice_to_cache(path, Some(account_root), media_cache_dir) {
+            Ok(decoded) => return Ok(Some(decoded)),
+            Err(error) => errors.push(format!("{}: {error:#}", path.display())),
+        }
     }
     anyhow::bail!("{}", errors.join(" | "))
 }
@@ -978,6 +1104,15 @@ fn is_media_candidate_name(path: &Path) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     name.ends_with(".dat")
+        || name.ends_with(".aud")
+        || name.ends_with(".silk")
+        || name.ends_with(".amr")
+        || name.ends_with(".mp3")
+        || name.ends_with(".wav")
+        || name.ends_with(".m4a")
+        || name.ends_with(".aac")
+        || name.ends_with(".ogg")
+        || name.ends_with(".flac")
         || name.ends_with(".jpg")
         || name.ends_with(".jpeg")
         || name.ends_with(".png")
@@ -1254,14 +1389,21 @@ mod tests {
     }
 
     #[test]
-    fn message_type_filter_supports_text_and_image() {
+    fn message_type_filter_supports_text_image_and_voice() {
         assert_eq!(
-            msg_type_filter_values(false, &["text".to_string(), "image".to_string()]),
-            vec![1, 3]
+            msg_type_filter_values(
+                false,
+                &["text".to_string(), "image".to_string(), "voice".to_string()]
+            ),
+            vec![1, 3, 34]
         );
         assert_eq!(
             msg_type_filter_values(false, &["图片".to_string()]),
             vec![3]
+        );
+        assert_eq!(
+            msg_type_filter_values(false, &["语音".to_string()]),
+            vec![34]
         );
         assert!(msg_type_filter_values(false, &["all".to_string()]).is_empty());
     }
@@ -1293,6 +1435,14 @@ mod tests {
         assert!(is_caption_friendly_image_format("jpg"));
         assert!(is_caption_friendly_image_format("png"));
         assert!(!is_caption_friendly_image_format("hevc"));
+    }
+
+    #[test]
+    fn media_candidate_names_include_voice_files() {
+        assert!(is_media_candidate_name(Path::new("msg.aud")));
+        assert!(is_media_candidate_name(Path::new("msg.silk")));
+        assert!(is_media_candidate_name(Path::new("msg.amr")));
+        assert!(is_media_candidate_name(Path::new("msg.wav")));
     }
 
     #[test]

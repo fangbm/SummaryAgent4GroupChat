@@ -79,6 +79,38 @@ pub fn decode_media_to_cache(
     })
 }
 
+pub fn decode_voice_to_cache(
+    voice_path: &Path,
+    account_root: Option<&Path>,
+    cache_dir: &Path,
+) -> Result<DecodedMedia> {
+    let cache_key = media_cache_key(voice_path);
+    if let Some(cached) = cached_decoded_media(cache_dir, &cache_key) {
+        return Ok(cached);
+    }
+
+    let bytes =
+        fs::read(voice_path).with_context(|| format!("读取语音文件 {}", voice_path.display()))?;
+    let decoded = decode_voice_bytes(&bytes, account_root, Some(cache_dir))?;
+    if decoded.format == "bin" {
+        bail!("解码后不是可识别语音格式");
+    }
+
+    fs::create_dir_all(cache_dir)
+        .with_context(|| format!("创建媒体缓存目录 {}", cache_dir.display()))?;
+    let output_path = cache_dir.join(format!("{}.{}", cache_key, decoded.format));
+    if !output_path.exists() {
+        fs::write(&output_path, &decoded.data)
+            .with_context(|| format!("写入解码语音 {}", output_path.display()))?;
+    }
+
+    Ok(DecodedMedia {
+        path: output_path,
+        format: decoded.format,
+        decoder: decoded.decoder,
+    })
+}
+
 fn decode_media_bytes(
     bytes: &[u8],
     account_root: Option<&Path>,
@@ -104,6 +136,33 @@ fn decode_media_bytes(
         return decode_packed_aes_xor(bytes, key.aes_key, key.xor_key, "v2_aes");
     }
     decode_legacy_xor(bytes)
+}
+
+fn decode_voice_bytes(
+    bytes: &[u8],
+    account_root: Option<&Path>,
+    cache_dir: Option<&Path>,
+) -> Result<DecodedBytes> {
+    if bytes.is_empty() {
+        bail!("空语音文件");
+    }
+    if let Some(format) = detect_audio_format(bytes) {
+        return Ok(DecodedBytes {
+            data: bytes.to_vec(),
+            format,
+            decoder: "plain",
+        });
+    }
+    if bytes.starts_with(V1_MAGIC) {
+        let key = *b"cfcd208495d565ef";
+        return decode_packed_audio_aes_xor(bytes, key, 0x88, "v1_aes");
+    }
+    if bytes.starts_with(V2_MAGIC) {
+        let account_root = account_root.ok_or_else(|| anyhow!("V2 语音缺少账号根目录"))?;
+        let key = image_v2_key(account_root, cache_dir)?;
+        return decode_packed_audio_aes_xor(bytes, key.aes_key, key.xor_key, "v2_aes");
+    }
+    decode_legacy_audio_xor(bytes)
 }
 
 fn decode_packed_aes_xor(
@@ -141,6 +200,49 @@ fn decode_packed_aes_xor(
     let format = detect_image_format(&data).unwrap_or("bin");
     if format == "bin" {
         bail!("{decoder}: 解密成功但图片 magic 不识别，可能 image key 不匹配");
+    }
+    Ok(DecodedBytes {
+        data,
+        format,
+        decoder,
+    })
+}
+
+fn decode_packed_audio_aes_xor(
+    bytes: &[u8],
+    aes_key: [u8; 16],
+    xor_key: u8,
+    decoder: &'static str,
+) -> Result<DecodedBytes> {
+    if bytes.len() < PACKED_HEADER_LEN {
+        bail!("packed 语音文件过短: {}", bytes.len());
+    }
+    let aes_size = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
+    let xor_size = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+    let aligned_aes_size = aes_size + (16 - (aes_size % 16));
+    let aes_end = PACKED_HEADER_LEN
+        .checked_add(aligned_aes_size)
+        .ok_or_else(|| anyhow!("AES 段长度溢出"))?;
+    let raw_end = bytes
+        .len()
+        .checked_sub(xor_size)
+        .ok_or_else(|| anyhow!("XOR 段长度溢出"))?;
+    if aes_end > bytes.len() || aes_end > raw_end {
+        bail!(
+            "packed 语音长度不合法: aes_size={} aligned={} xor_size={} file_len={}",
+            aes_size,
+            aligned_aes_size,
+            xor_size,
+            bytes.len()
+        );
+    }
+
+    let mut data = aes128_ecb_decrypt_pkcs7(&aes_key, &bytes[PACKED_HEADER_LEN..aes_end])?;
+    data.extend_from_slice(&bytes[aes_end..raw_end]);
+    data.extend(bytes[raw_end..].iter().map(|byte| byte ^ xor_key));
+    let format = detect_audio_format(&data).unwrap_or("bin");
+    if format == "bin" {
+        bail!("{decoder}: 解密成功但语音 magic 不识别，可能 media key 不匹配");
     }
     Ok(DecodedBytes {
         data,
@@ -189,6 +291,44 @@ fn decode_legacy_xor(bytes: &[u8]) -> Result<DecodedBytes> {
         format,
         decoder: "legacy_xor",
     })
+}
+
+fn decode_legacy_audio_xor(bytes: &[u8]) -> Result<DecodedBytes> {
+    let key = detect_legacy_audio_xor_key(bytes)
+        .ok_or_else(|| anyhow!("legacy audio XOR key 探测失败"))?;
+    let data = bytes.iter().map(|byte| byte ^ key).collect::<Vec<_>>();
+    let format = detect_audio_format(&data).unwrap_or("bin");
+    if format == "bin" {
+        bail!("legacy audio XOR key=0x{key:02x} 解码后语音 magic 不识别");
+    }
+    Ok(DecodedBytes {
+        data,
+        format,
+        decoder: "legacy_xor",
+    })
+}
+
+fn detect_legacy_audio_xor_key(bytes: &[u8]) -> Option<u8> {
+    let header = &bytes[..bytes.len().min(16)];
+    for magic in [
+        b"#!SI" as &[u8],
+        b"\x02#!S",
+        b"#!AM",
+        b"ID3",
+        &[0xff, 0xfb],
+        &[0xff, 0xf3],
+        &[0xff, 0xf2],
+        b"OggS",
+        b"fLaC",
+        b"RIFF",
+        &[0xff, 0xf1],
+        &[0xff, 0xf9],
+    ] {
+        if let Some(key) = xor_key_for_magic(header, magic) {
+            return Some(key);
+        }
+    }
+    None
 }
 
 fn detect_legacy_xor_key(bytes: &[u8]) -> Option<u8> {
@@ -248,6 +388,36 @@ pub fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
     }
     if bytes.len() >= 2 && &bytes[..2] == b"BM" {
         return Some("bmp");
+    }
+    None
+}
+
+pub fn detect_audio_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"#!SILK") || bytes.starts_with(b"\x02#!SILK") {
+        return Some("silk");
+    }
+    if bytes.starts_with(b"#!AMR") {
+        return Some("amr");
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return Some("wav");
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xff && matches!(bytes[1], 0xf1 | 0xf9) {
+        return Some("aac");
+    }
+    if bytes.starts_with(b"ID3")
+        || bytes.len() >= 2 && bytes[0] == 0xff && matches!(bytes[1], 0xfb | 0xf3 | 0xf2)
+    {
+        return Some("mp3");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("ogg");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("flac");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return Some("m4a");
     }
     None
 }
@@ -707,12 +877,37 @@ mod tests {
     }
 
     #[test]
+    fn detects_common_audio_formats() {
+        assert_eq!(detect_audio_format(b"#!SILK_V3"), Some("silk"));
+        assert_eq!(detect_audio_format(b"\x02#!SILK_V3"), Some("silk"));
+        assert_eq!(detect_audio_format(b"#!AMR\n"), Some("amr"));
+        assert_eq!(detect_audio_format(b"RIFFxxxxWAVE"), Some("wav"));
+        assert_eq!(detect_audio_format(b"ID3xxxx"), Some("mp3"));
+        assert_eq!(detect_audio_format(b"OggSxxxx"), Some("ogg"));
+        assert_eq!(detect_audio_format(b"fLaCxxxx"), Some("flac"));
+        assert_eq!(detect_audio_format(b"xxxxftypM4A "), Some("m4a"));
+        assert_eq!(detect_audio_format(&[0xff, 0xf1, 0, 0]), Some("aac"));
+        assert_eq!(detect_audio_format(b"xxxx"), None);
+    }
+
+    #[test]
     fn legacy_xor_decodes_jpg() {
         let plain = [0xff, 0xd8, 0xff, 0xe0, 0, 1, 2, 3];
         let encoded = xor_encrypt(&plain, 0xab);
         let decoded = decode_legacy_xor(&encoded).unwrap();
 
         assert_eq!(decoded.format, "jpg");
+        assert_eq!(decoded.decoder, "legacy_xor");
+        assert_eq!(decoded.data, plain);
+    }
+
+    #[test]
+    fn legacy_xor_decodes_silk_voice() {
+        let plain = b"#!SILK_V3 test voice bytes";
+        let encoded = xor_encrypt(plain, 0x5a);
+        let decoded = decode_legacy_audio_xor(&encoded).unwrap();
+
+        assert_eq!(decoded.format, "silk");
         assert_eq!(decoded.decoder, "legacy_xor");
         assert_eq!(decoded.data, plain);
     }
