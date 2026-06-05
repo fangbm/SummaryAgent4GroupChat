@@ -613,12 +613,16 @@ impl OpenAiAudioTranscriptionClient {
 
         for attempt in 1..=max_attempts {
             let started = Instant::now();
+            let mut file_part =
+                reqwest::multipart::Part::bytes(bytes.clone()).file_name(file_name.clone());
+            if let Some(mime) = audio_mime_type(path) {
+                file_part = file_part
+                    .mime_str(mime)
+                    .map_err(|error| AiError::InvalidResponse(error.to_string()))?;
+            }
             let mut form = reqwest::multipart::Form::new()
                 .text("model", self.model.clone())
-                .part(
-                    "file",
-                    reqwest::multipart::Part::bytes(bytes.clone()).file_name(file_name.clone()),
-                );
+                .part("file", file_part);
             if !self.config.language.trim().is_empty() {
                 form = form.text("language", self.config.language.trim().to_string());
             }
@@ -724,6 +728,25 @@ fn audio_transcriptions_endpoint(base_url: &str) -> String {
         base.to_string()
     } else {
         format!("{base}/audio/transcriptions")
+    }
+}
+
+fn audio_mime_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mp3") => Some("audio/mpeg"),
+        Some("wav") => Some("audio/wav"),
+        Some("m4a") => Some("audio/mp4"),
+        Some("aac") => Some("audio/aac"),
+        Some("ogg") => Some("audio/ogg"),
+        Some("flac") => Some("audio/flac"),
+        Some("amr") => Some("audio/amr"),
+        Some("webm") => Some("audio/webm"),
+        _ => None,
     }
 }
 
@@ -1912,6 +1935,9 @@ mod tests {
             language: "zh".into(),
             prompt: String::new(),
             response_format: "json".into(),
+            transcode_to_mp3: true,
+            ffmpeg_executable: "ffmpeg".into(),
+            mp3_bitrate: "64k".into(),
             max_voices_per_summary: 20,
             max_concurrent_requests: 2,
             request_body_overrides: Default::default(),
@@ -2011,6 +2037,15 @@ mod tests {
             extract_transcription_text("plain text", "text").unwrap(),
             "plain text"
         );
+    }
+
+    #[test]
+    fn voice_transcription_uses_mp3_mime_type() {
+        assert_eq!(
+            audio_mime_type(Path::new(r"C:\temp\voice.mp3")),
+            Some("audio/mpeg")
+        );
+        assert_eq!(audio_mime_type(Path::new("voice.silk")), None);
     }
 
     #[test]

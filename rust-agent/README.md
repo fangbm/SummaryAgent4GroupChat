@@ -94,7 +94,9 @@ Provider-specific chat completion request fields can be added or overridden thro
 Optional image and voice preprocessing can enrich the chat input before summarizing:
 `image_caption` describes decoded images, while `voice_transcription` sends decoded
 voice files to an OpenAI-compatible `/audio/transcriptions` endpoint and inserts
-the transcript back into the original voice-message line.
+the transcript back into the original voice-message line. By default local voice
+files are converted to MP3 first through `voice_transcription.ffmpeg_executable`
+so transcription providers do not need to support WeChat Silk/AMR directly.
 
 The text and image paths use separate prompts:
 

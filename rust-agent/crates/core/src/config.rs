@@ -546,6 +546,12 @@ pub struct VoiceTranscriptionConfig {
     pub prompt: String,
     #[serde(default = "default_voice_transcription_response_format")]
     pub response_format: String,
+    #[serde(default = "default_voice_transcription_transcode_to_mp3")]
+    pub transcode_to_mp3: bool,
+    #[serde(default = "default_voice_transcription_ffmpeg_executable")]
+    pub ffmpeg_executable: String,
+    #[serde(default = "default_voice_transcription_mp3_bitrate")]
+    pub mp3_bitrate: String,
     #[serde(default = "default_voice_transcription_max_voices")]
     pub max_voices_per_summary: usize,
     #[serde(default = "default_voice_transcription_max_concurrent_requests")]
@@ -570,6 +576,9 @@ impl Default for VoiceTranscriptionConfig {
             language: default_voice_transcription_language(),
             prompt: String::new(),
             response_format: default_voice_transcription_response_format(),
+            transcode_to_mp3: default_voice_transcription_transcode_to_mp3(),
+            ffmpeg_executable: default_voice_transcription_ffmpeg_executable(),
+            mp3_bitrate: default_voice_transcription_mp3_bitrate(),
             max_voices_per_summary: default_voice_transcription_max_voices(),
             max_concurrent_requests: default_voice_transcription_max_concurrent_requests(),
             request_body_overrides: BTreeMap::new(),
@@ -772,6 +781,18 @@ fn default_voice_transcription_response_format() -> String {
     "json".to_string()
 }
 
+fn default_voice_transcription_transcode_to_mp3() -> bool {
+    true
+}
+
+fn default_voice_transcription_ffmpeg_executable() -> String {
+    "ffmpeg".to_string()
+}
+
+fn default_voice_transcription_mp3_bitrate() -> String {
+    "64k".to_string()
+}
+
 fn default_voice_transcription_max_voices() -> usize {
     20
 }
@@ -935,6 +956,9 @@ api_key_env = "LLM_API_KEY""#,
         assert_eq!(voice_transcription.model_env, "VOICE_TRANSCRIPTION_MODEL");
         assert_eq!(voice_transcription.max_concurrent_requests, 2);
         assert_eq!(voice_transcription.language, "zh");
+        assert!(voice_transcription.transcode_to_mp3);
+        assert_eq!(voice_transcription.ffmpeg_executable, "ffmpeg");
+        assert_eq!(voice_transcription.mp3_bitrate, "64k");
     }
 
     #[test]

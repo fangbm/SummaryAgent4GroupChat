@@ -111,6 +111,9 @@ struct ConfigView {
     voice_transcription_language: String,
     voice_transcription_prompt: String,
     voice_transcription_response_format: String,
+    voice_transcription_transcode_to_mp3: bool,
+    voice_transcription_ffmpeg_executable: String,
+    voice_transcription_mp3_bitrate: String,
     voice_transcription_max_voices: u32,
     voice_transcription_max_concurrent_requests: u32,
     voice_transcription_request_body_overrides: String,
@@ -960,6 +963,16 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             "语音响应格式",
             &mut view.voice_transcription_response_format,
         );
+        ui.checkbox(
+            &mut view.voice_transcription_transcode_to_mp3,
+            "转写前统一转码为 MP3",
+        );
+        text_field(
+            ui,
+            "ffmpeg 可执行文件",
+            &mut view.voice_transcription_ffmpeg_executable,
+        );
+        text_field(ui, "MP3 码率", &mut view.voice_transcription_mp3_bitrate);
         number_u32(
             ui,
             "每次最多转写语音数",
@@ -1484,6 +1497,9 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             voice_transcription_language: config.voice_transcription.language,
             voice_transcription_prompt: config.voice_transcription.prompt,
             voice_transcription_response_format: config.voice_transcription.response_format,
+            voice_transcription_transcode_to_mp3: config.voice_transcription.transcode_to_mp3,
+            voice_transcription_ffmpeg_executable: config.voice_transcription.ffmpeg_executable,
+            voice_transcription_mp3_bitrate: config.voice_transcription.mp3_bitrate,
             voice_transcription_max_voices: config
                 .voice_transcription
                 .max_voices_per_summary
@@ -1663,6 +1679,19 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             "response_format",
             "json",
         ),
+        voice_transcription_transcode_to_mp3: get_bool(
+            doc,
+            "voice_transcription",
+            "transcode_to_mp3",
+            true,
+        ),
+        voice_transcription_ffmpeg_executable: get_str(
+            doc,
+            "voice_transcription",
+            "ffmpeg_executable",
+            "ffmpeg",
+        ),
+        voice_transcription_mp3_bitrate: get_str(doc, "voice_transcription", "mp3_bitrate", "64k"),
         voice_transcription_max_voices: get_u64(
             doc,
             "voice_transcription",
@@ -1926,6 +1955,21 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         voice_transcription,
         "response_format",
         &update.voice_transcription_response_format,
+    );
+    set_bool(
+        voice_transcription,
+        "transcode_to_mp3",
+        update.voice_transcription_transcode_to_mp3,
+    );
+    set_str(
+        voice_transcription,
+        "ffmpeg_executable",
+        &update.voice_transcription_ffmpeg_executable,
+    );
+    set_str(
+        voice_transcription,
+        "mp3_bitrate",
+        &update.voice_transcription_mp3_bitrate,
     );
     set_int(
         voice_transcription,

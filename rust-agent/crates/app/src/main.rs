@@ -2,11 +2,15 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::Arc,
-    time::{Duration as StdDuration, SystemTime},
+    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 mod platform;
 
@@ -36,6 +40,8 @@ const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
 const LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS: u64 = 60;
 const LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS: usize = 3;
 const CHUNK_PROMPT_HEADROOM_CHARS: usize = 4_096;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 const TEXT_SUMMARY_REFUSAL_RETRY_PROMPT: &str = r#"
 如果聊天记录包含成人、擦边、隐私、争议或其他敏感内容，请只做高层次、中性、脱敏总结：
 - 可以概括为“围绕服饰/购物/玩梗/生活闲聊等话题展开”，不要复述露骨细节。
@@ -3024,6 +3030,7 @@ async fn apply_voice_transcriptions(
     };
     let transcriber = Arc::new(transcriber);
     let max_concurrent = config.voice_transcription.max_concurrent_requests.max(1);
+    let audio_prep = Arc::new(VoiceTranscriptionAudioPrep::from_config(config));
 
     let mut candidates = Vec::new();
     for (history_index, message) in history.iter().enumerate() {
@@ -3056,8 +3063,8 @@ async fn apply_voice_transcriptions(
     append_runtime_log(
         config,
         &format!(
-            "voice transcription batch started room={} attempted={} max_concurrent={}",
-            room_id, attempted, max_concurrent
+            "voice transcription batch started room={} attempted={} max_concurrent={} transcode_to_mp3={}",
+            room_id, attempted, max_concurrent, audio_prep.transcode_to_mp3
         ),
     );
 
@@ -3068,6 +3075,7 @@ async fn apply_voice_transcriptions(
         spawn_voice_transcription_task(
             &mut join_set,
             Arc::clone(&transcriber),
+            Arc::clone(&audio_prep),
             &candidates[next_candidate],
         );
         next_candidate += 1;
@@ -3134,6 +3142,7 @@ async fn apply_voice_transcriptions(
             spawn_voice_transcription_task(
                 &mut join_set,
                 Arc::clone(&transcriber),
+                Arc::clone(&audio_prep),
                 &candidates[next_candidate],
             );
             next_candidate += 1;
@@ -3156,19 +3165,244 @@ struct VoiceTranscriptionTaskResult {
     result: std::result::Result<String, AiError>,
 }
 
+#[derive(Debug, Clone)]
+struct VoiceTranscriptionAudioPrep {
+    transcode_to_mp3: bool,
+    ffmpeg_executable: String,
+    mp3_bitrate: String,
+    cache_dir: PathBuf,
+}
+
+impl VoiceTranscriptionAudioPrep {
+    fn from_config(config: &AgentConfig) -> Self {
+        let ffmpeg_executable = config.voice_transcription.ffmpeg_executable.trim();
+        let mp3_bitrate = config.voice_transcription.mp3_bitrate.trim();
+        Self {
+            transcode_to_mp3: config.voice_transcription.transcode_to_mp3,
+            ffmpeg_executable: if ffmpeg_executable.is_empty() {
+                "ffmpeg".to_string()
+            } else {
+                ffmpeg_executable.to_string()
+            },
+            mp3_bitrate: if mp3_bitrate.is_empty() {
+                "64k".to_string()
+            } else {
+                mp3_bitrate.to_string()
+            },
+            cache_dir: Path::new(&config.runtime.output_dir).join("voice-mp3"),
+        }
+    }
+}
+
 fn spawn_voice_transcription_task(
     join_set: &mut JoinSet<VoiceTranscriptionTaskResult>,
     transcriber: Arc<OpenAiAudioTranscriptionClient>,
+    audio_prep: Arc<VoiceTranscriptionAudioPrep>,
     candidate: &(usize, usize, String),
 ) {
     let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
     join_set.spawn(async move {
+        let result = match prepare_voice_transcription_audio(audio_prep, source).await {
+            Ok(source) => transcriber.transcribe_audio(&source).await,
+            Err(error) => Err(error),
+        };
         VoiceTranscriptionTaskResult {
             history_index,
             attempted,
-            result: transcriber.transcribe_audio(&source).await,
+            result,
         }
     });
+}
+
+async fn prepare_voice_transcription_audio(
+    audio_prep: Arc<VoiceTranscriptionAudioPrep>,
+    source: String,
+) -> std::result::Result<String, AiError> {
+    if !audio_prep.transcode_to_mp3 {
+        return Ok(source);
+    }
+
+    let source_path = PathBuf::from(source);
+    tokio::task::spawn_blocking(move || transcode_voice_source_to_mp3(&audio_prep, &source_path))
+        .await
+        .map_err(|error| {
+            AiError::InvalidResponse(format!("voice mp3 transcoding task failed: {error}"))
+        })?
+        .map_err(|error| {
+            AiError::InvalidResponse(format!("voice mp3 transcoding failed: {error:#}"))
+        })
+}
+
+fn transcode_voice_source_to_mp3(
+    audio_prep: &VoiceTranscriptionAudioPrep,
+    source_path: &Path,
+) -> Result<String> {
+    if !source_path.is_file() {
+        bail!("voice source file not found: {}", source_path.display());
+    }
+
+    let output_path = audio_prep
+        .cache_dir
+        .join(format!("{}.mp3", voice_transcode_cache_key(source_path)));
+    if usable_cached_file(&output_path) {
+        return Ok(output_path.to_string_lossy().into_owned());
+    }
+
+    fs::create_dir_all(&audio_prep.cache_dir).with_context(|| {
+        format!(
+            "creating voice mp3 cache {}",
+            audio_prep.cache_dir.display()
+        )
+    })?;
+
+    if is_mp3_audio_file(source_path) {
+        fs::copy(source_path, &output_path).with_context(|| {
+            format!(
+                "copying already-mp3 voice {} to {}",
+                source_path.display(),
+                output_path.display()
+            )
+        })?;
+        return Ok(output_path.to_string_lossy().into_owned());
+    }
+
+    let temp_path = output_path.with_extension(format!(
+        "tmp-{}.mp3",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut command = Command::new(&audio_prep.ffmpeg_executable);
+    command.arg("-hide_banner").arg("-nostdin").arg("-y");
+    if let Some(format) = audio_input_format_hint(source_path) {
+        command.arg("-f").arg(format);
+    }
+    command
+        .arg("-i")
+        .arg(source_path)
+        .arg("-vn")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-codec:a")
+        .arg("libmp3lame")
+        .arg("-b:a")
+        .arg(&audio_prep.mp3_bitrate)
+        .arg(&temp_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command.output().with_context(|| {
+        format!(
+            "starting ffmpeg executable '{}'; set voice_transcription.ffmpeg_executable to the full path if needed",
+            audio_prep.ffmpeg_executable
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = first_non_empty_line(&stderr)
+            .or_else(|| first_non_empty_line(&stdout))
+            .unwrap_or_else(|| "ffmpeg exited without output".to_string());
+        let _ = fs::remove_file(&temp_path);
+        bail!(
+            "ffmpeg exited with {}; source={}; detail={}",
+            output.status,
+            source_path.display(),
+            detail
+        );
+    }
+    if !usable_cached_file(&temp_path) {
+        bail!(
+            "ffmpeg succeeded but did not create {}",
+            temp_path.display()
+        );
+    }
+    if output_path.exists() {
+        let _ = fs::remove_file(&temp_path);
+    } else {
+        fs::rename(&temp_path, &output_path).with_context(|| {
+            format!(
+                "moving transcoded voice {} to {}",
+                temp_path.display(),
+                output_path.display()
+            )
+        })?;
+    }
+    Ok(output_path.to_string_lossy().into_owned())
+}
+
+fn voice_transcode_cache_key(source_path: &Path) -> String {
+    let metadata = source_path.metadata().ok();
+    let len = metadata
+        .as_ref()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let modified = metadata
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let input = format!("{}:{len}:{modified}:mp3", source_path.display());
+    format!("{:x}", md5::compute(input.as_bytes()))
+}
+
+fn usable_cached_file(path: &Path) -> bool {
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+fn is_mp3_audio_file(path: &Path) -> bool {
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("mp3"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let mut header = [0u8; 16];
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(read) = file.read(&mut header) else {
+        return false;
+    };
+    let bytes = &header[..read];
+    bytes.starts_with(b"ID3")
+        || bytes.len() >= 2 && bytes[0] == 0xff && matches!(bytes[1], 0xfb | 0xf3 | 0xf2)
+}
+
+fn audio_input_format_hint(path: &Path) -> Option<&'static str> {
+    let mut header = [0u8; 16];
+    let Ok(mut file) = fs::File::open(path) else {
+        return None;
+    };
+    let Ok(read) = file.read(&mut header) else {
+        return None;
+    };
+    let bytes = &header[..read];
+    if bytes.starts_with(b"#!SILK") || bytes.starts_with(b"\x02#!SILK") {
+        Some("silk")
+    } else if bytes.starts_with(b"#!AMR") {
+        Some("amr")
+    } else {
+        None
+    }
+}
+
+fn first_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(300).collect())
 }
 
 fn is_voice_transcription_auth_error(error: &str) -> bool {
@@ -3396,6 +3630,45 @@ mod tests {
         assert_eq!(summary_media_decode_limit(&config), Some(10));
         assert_eq!(format_media_decode_limit(Some(7)), "7");
         assert_eq!(format_media_decode_limit(None), "unlimited");
+    }
+
+    #[test]
+    fn voice_transcode_copies_already_mp3_to_cache() {
+        let path = unique_config_path();
+        let dir = path.parent().unwrap();
+        let source = dir.join("voice.aud");
+        std::fs::write(&source, b"ID3 fake mp3 bytes").unwrap();
+        let audio_prep = VoiceTranscriptionAudioPrep {
+            transcode_to_mp3: true,
+            ffmpeg_executable: "missing-ffmpeg-for-test".into(),
+            mp3_bitrate: "64k".into(),
+            cache_dir: dir.join("voice-mp3-cache"),
+        };
+
+        let output = transcode_voice_source_to_mp3(&audio_prep, &source).unwrap();
+        let output_path = PathBuf::from(output);
+        assert_eq!(
+            output_path.extension().and_then(|value| value.to_str()),
+            Some("mp3")
+        );
+        assert_eq!(std::fs::read(output_path).unwrap(), b"ID3 fake mp3 bytes");
+
+        cleanup_config_path(&path);
+    }
+
+    #[test]
+    fn voice_transcode_hints_raw_silk_and_amr_inputs() {
+        let path = unique_config_path();
+        let dir = path.parent().unwrap();
+        let silk = dir.join("voice-silk.aud");
+        let amr = dir.join("voice-amr.aud");
+        std::fs::write(&silk, b"#!SILK_V3 fake").unwrap();
+        std::fs::write(&amr, b"#!AMR\nfake").unwrap();
+
+        assert_eq!(audio_input_format_hint(&silk), Some("silk"));
+        assert_eq!(audio_input_format_hint(&amr), Some("amr"));
+
+        cleanup_config_path(&path);
     }
 
     #[test]

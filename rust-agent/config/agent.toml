@@ -411,6 +411,11 @@ retry_5xx_attempts = 5
 language = "zh"
 prompt = ""
 response_format = "json"
+# Convert every local voice file to MP3 before sending it to the transcription API.
+# Set ffmpeg_executable to a full path if ffmpeg is not on PATH.
+transcode_to_mp3 = true
+ffmpeg_executable = "ffmpeg"
+mp3_bitrate = "64k"
 max_voices_per_summary = 20
 max_concurrent_requests = 2
 
