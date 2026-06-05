@@ -97,6 +97,7 @@ struct ConfigView {
     image_caption_retry_5xx_attempts: u32,
     image_caption_max_tokens: u32,
     image_caption_max_images: u32,
+    image_caption_max_concurrent_requests: u32,
     image_caption_request_body_overrides: String,
     runtime_output_dir: String,
     runtime_log_level: String,
@@ -895,6 +896,11 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         );
         number_u32(ui, "转述最大输出 Token", &mut view.image_caption_max_tokens);
         number_u32(ui, "每次最多转述图片数", &mut view.image_caption_max_images);
+        number_u32(
+            ui,
+            "转述最大并发请求数",
+            &mut view.image_caption_max_concurrent_requests,
+        );
         multiline_field(
             ui,
             "转述请求体覆盖(JSON)",
@@ -1379,6 +1385,10 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
                 .image_caption
                 .max_images_per_summary
                 .min(u32::MAX as usize) as u32,
+            image_caption_max_concurrent_requests: config
+                .image_caption
+                .max_concurrent_requests
+                .min(u32::MAX as usize) as u32,
             image_caption_request_body_overrides,
             runtime_output_dir: config.runtime.output_dir,
             runtime_log_level: config.runtime.log_level,
@@ -1489,6 +1499,13 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         image_caption_max_tokens: get_u64(doc, "image_caption", "max_output_tokens", 500) as u32,
         image_caption_max_images: get_u64(doc, "image_caption", "max_images_per_summary", 20)
             .min(u32::MAX as u64) as u32,
+        image_caption_max_concurrent_requests: get_u64(
+            doc,
+            "image_caption",
+            "max_concurrent_requests",
+            4,
+        )
+        .min(u32::MAX as u64) as u32,
         image_caption_request_body_overrides: request_body_overrides_from_table_doc(
             doc,
             "image_caption",
@@ -1662,6 +1679,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         image_caption,
         "max_images_per_summary",
         update.image_caption_max_images as i64,
+    );
+    set_int(
+        image_caption,
+        "max_concurrent_requests",
+        update.image_caption_max_concurrent_requests.max(1) as i64,
     );
     set_json_object_table(
         image_caption,

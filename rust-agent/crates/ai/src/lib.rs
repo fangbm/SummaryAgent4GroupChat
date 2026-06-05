@@ -1676,6 +1676,7 @@ mod tests {
             system_prompt: "describe".into(),
             user_prompt: "caption".into(),
             max_images_per_summary: 20,
+            max_concurrent_requests: 4,
             request_body_overrides: Default::default(),
         }
     }

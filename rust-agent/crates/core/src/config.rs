@@ -484,6 +484,8 @@ pub struct ImageCaptionConfig {
     pub user_prompt: String,
     #[serde(default = "default_image_caption_max_images")]
     pub max_images_per_summary: usize,
+    #[serde(default = "default_image_caption_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
     #[serde(default)]
     pub request_body_overrides: BTreeMap<String, toml::Value>,
 }
@@ -506,6 +508,7 @@ impl Default for ImageCaptionConfig {
             system_prompt: default_image_caption_system_prompt(),
             user_prompt: default_image_caption_user_prompt(),
             max_images_per_summary: default_image_caption_max_images(),
+            max_concurrent_requests: default_image_caption_max_concurrent_requests(),
             request_body_overrides: BTreeMap::new(),
         }
     }
@@ -674,6 +677,10 @@ fn default_image_caption_max_images() -> usize {
     20
 }
 
+fn default_image_caption_max_concurrent_requests() -> usize {
+    4
+}
+
 fn default_text_summary_system_prompt() -> String {
     "你是一位专业的微信群聊总结助手。请基于聊天记录输出适合直接发回微信群的简洁文字总结，不要输出 JSON，不要编造聊天记录中没有的信息。".to_string()
 }
@@ -816,6 +823,7 @@ mod tests {
         assert!(!image_caption.enabled);
         assert_eq!(image_caption.model_env, "IMAGE_CAPTION_MODEL");
         assert_eq!(image_caption.retry_5xx_attempts, 5);
+        assert_eq!(image_caption.max_concurrent_requests, 4);
         assert!(image_caption.user_prompt.contains("转述"));
     }
 

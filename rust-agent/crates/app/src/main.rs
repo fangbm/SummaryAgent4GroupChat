@@ -2740,11 +2740,12 @@ async fn apply_image_captions(
                 return Ok(0);
             }
         };
+    let captioner = Arc::new(captioner);
+    let max_concurrent = config.image_caption.max_concurrent_requests.max(1);
 
-    let mut inserted = 0usize;
-    let mut attempted = 0usize;
-    for message in history.iter_mut() {
-        if attempted >= config.image_caption.max_images_per_summary {
+    let mut candidates = Vec::new();
+    for (history_index, message) in history.iter().enumerate() {
+        if candidates.len() >= config.image_caption.max_images_per_summary {
             break;
         }
         if !is_image_message_type(&message.msg_type) {
@@ -2762,21 +2763,57 @@ async fn apply_image_captions(
             }
             continue;
         };
-        attempted += 1;
-        match captioner.caption_image(&source).await {
+        candidates.push((history_index, candidates.len() + 1, source));
+    }
+
+    let attempted = candidates.len();
+    if attempted == 0 {
+        return Ok(0);
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "image caption batch started room={} attempted={} max_concurrent={}",
+            room_id, attempted, max_concurrent
+        ),
+    );
+
+    let mut inserted = 0usize;
+    let mut next_candidate = 0usize;
+    let mut join_set = JoinSet::new();
+    while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+        spawn_image_caption_task(
+            &mut join_set,
+            Arc::clone(&captioner),
+            &candidates[next_candidate],
+        );
+        next_candidate += 1;
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let CaptionTaskResult {
+            history_index,
+            attempted,
+            result,
+        } = joined.context("joining image caption request task")?;
+        match result {
             Ok(caption) => {
                 let caption = caption.trim();
-                if caption.is_empty() {
-                    continue;
+                if !caption.is_empty() {
+                    history[history_index].content = format!(
+                        "{}（图片转述：{}）",
+                        history[history_index].content.trim(),
+                        caption
+                    );
+                    inserted += 1;
+                    info!(
+                        room_id = %room_id,
+                        inserted,
+                        attempted,
+                        "image caption inserted into history"
+                    );
                 }
-                message.content = format!("{}（图片转述：{}）", message.content.trim(), caption);
-                inserted += 1;
-                info!(
-                    room_id = %room_id,
-                    inserted,
-                    attempted,
-                    "image caption inserted into history"
-                );
             }
             Err(error) => {
                 let error = error.to_string();
@@ -2810,6 +2847,15 @@ async fn apply_image_captions(
                 }
             }
         }
+
+        while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+            spawn_image_caption_task(
+                &mut join_set,
+                Arc::clone(&captioner),
+                &candidates[next_candidate],
+            );
+            next_candidate += 1;
+        }
     }
 
     if attempted > 0 {
@@ -2822,6 +2868,27 @@ async fn apply_image_captions(
         );
     }
     Ok(inserted)
+}
+
+struct CaptionTaskResult {
+    history_index: usize,
+    attempted: usize,
+    result: std::result::Result<String, AiError>,
+}
+
+fn spawn_image_caption_task(
+    join_set: &mut JoinSet<CaptionTaskResult>,
+    captioner: Arc<OpenAiVisionCaptionClient>,
+    candidate: &(usize, usize, String),
+) {
+    let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
+    join_set.spawn(async move {
+        CaptionTaskResult {
+            history_index,
+            attempted,
+            result: captioner.caption_image(&source).await,
+        }
+    });
 }
 
 fn is_image_caption_auth_error(error: &str) -> bool {
