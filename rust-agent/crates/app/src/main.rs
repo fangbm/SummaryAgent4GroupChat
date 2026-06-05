@@ -1412,6 +1412,27 @@ async fn run_summary_pipeline(
             }
         };
         let image_summary = image_summary_result.output;
+        if let Err(error) = ensure_image_pipeline_output_not_refusal(
+            config,
+            &trigger.room_id,
+            "image summary",
+            &image_summary,
+        ) {
+            let error_message = format_error_chain(&error);
+            send_deferred_summary_text(
+                config,
+                client,
+                &trigger.room_id,
+                &mut pending_text_reply,
+                "after image summary refusal",
+            )
+            .await?;
+            if options.text_summary_enabled {
+                send_image_failure_message(config, client, &trigger.room_id, &error_message).await;
+                return Ok(PipelineOutcome::SummaryProduced);
+            }
+            return Err(error);
+        }
         let image_prompt_chat_input = chat_input_for_followup_prompt(
             config,
             &config.image_prompt.user_prompt_template,
@@ -1487,6 +1508,27 @@ async fn run_summary_pipeline(
                 return Err(error);
             }
         };
+        if let Err(error) = ensure_image_pipeline_output_not_refusal(
+            config,
+            &trigger.room_id,
+            "image prompt",
+            &image_prompt,
+        ) {
+            let error_message = format_error_chain(&error);
+            send_deferred_summary_text(
+                config,
+                client,
+                &trigger.room_id,
+                &mut pending_text_reply,
+                "after image prompt refusal",
+            )
+            .await?;
+            if options.text_summary_enabled {
+                send_image_failure_message(config, client, &trigger.room_id, &error_message).await;
+                return Ok(PipelineOutcome::SummaryProduced);
+            }
+            return Err(error);
+        }
         info!(
             room_id = %trigger.room_id,
             output_chars = image_prompt.chars().count(),
@@ -1685,6 +1727,12 @@ async fn run_background_image_pipeline_inner(
             image_summary.chars().count()
         ),
     );
+    ensure_image_pipeline_output_not_refusal(
+        config,
+        room_id,
+        "background image summary",
+        &image_summary,
+    )?;
 
     let image_prompt_chat_input = chat_input_for_followup_prompt(
         config,
@@ -1729,6 +1777,12 @@ async fn run_background_image_pipeline_inner(
             image_prompt.chars().count()
         ),
     );
+    ensure_image_pipeline_output_not_refusal(
+        config,
+        room_id,
+        "background image prompt",
+        &image_prompt,
+    )?;
 
     let artifact =
         generate_summary_image(config, room_id, &image_prompt, Some(retry_notifier)).await?;
@@ -3478,6 +3532,33 @@ fn looks_like_text_summary_refusal(summary: &str) -> bool {
     starts_like_refusal || contains_refusal
 }
 
+fn ensure_image_pipeline_output_not_refusal(
+    config: &AgentConfig,
+    room_id: &str,
+    stage: &str,
+    output: &str,
+) -> Result<()> {
+    if !looks_like_text_summary_refusal(output) {
+        return Ok(());
+    }
+
+    let output_chars = output.chars().count();
+    warn!(
+        room_id = %room_id,
+        stage,
+        output_chars,
+        "LLM image pipeline output looked like a refusal; skipping image generation"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm image pipeline refusal detected room={} stage={} output_chars={} action=skip_image_generation",
+            room_id, stage, output_chars
+        ),
+    );
+    bail!("LLM returned refusal-like {stage}; skipped image generation");
+}
+
 fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
     ChatMessage {
         timestamp: message.timestamp,
@@ -3563,6 +3644,27 @@ mod tests {
         assert!(!looks_like_text_summary_refusal(
             "有人提到商家无法提供明确发货时间，随后大家转向讨论物流和海关问题。"
         ));
+    }
+
+    #[test]
+    fn rejects_refusal_like_image_pipeline_outputs() {
+        let config = test_config();
+        let error = ensure_image_pipeline_output_not_refusal(
+            &config,
+            "测试群",
+            "image prompt",
+            "你好，我无法给到相关内容。",
+        )
+        .unwrap_err();
+
+        assert!(format_error_chain(&error).contains("skipped image generation"));
+        assert!(ensure_image_pipeline_output_not_refusal(
+            &config,
+            "测试群",
+            "image prompt",
+            "A concise visual prompt for a group chat summary poster.",
+        )
+        .is_ok());
     }
 
     #[test]
