@@ -1079,7 +1079,7 @@ fn readonly_scroll_text(
                     TextRenderMode::Plain => {
                         egui::Label::new(egui::RichText::new(text).monospace())
                     }
-                    TextRenderMode::Ansi => egui::Label::new(ansi_layout_job(ui, text)),
+                    TextRenderMode::Ansi => egui::Label::new(terminal_layout_job(ui, text)),
                 }
                 .wrap()
                 .selectable(true);
@@ -1095,8 +1095,22 @@ struct AnsiTextStyle {
     bold: bool,
 }
 
-fn ansi_layout_job(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
+fn terminal_layout_job(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
+    for line in text.split_inclusive('\n') {
+        let plain_line = strip_ansi_sgr(line);
+        let fallback_color = terminal_line_color(&plain_line);
+        append_ansi_text(ui, &mut job, line, fallback_color);
+    }
+    job
+}
+
+fn append_ansi_text(
+    ui: &egui::Ui,
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    fallback_color: Option<egui::Color32>,
+) {
     let mut style = AnsiTextStyle::default();
     let mut index = 0;
     let mut segment_start = 0;
@@ -1105,7 +1119,7 @@ fn ansi_layout_job(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
     while index < bytes.len() {
         if bytes[index] == b'\x1b' && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
             if let Some(end_offset) = text[index + 2..].bytes().position(|byte| byte == b'm') {
-                append_ansi_segment(ui, &mut job, &style, &text[segment_start..index]);
+                append_ansi_segment(ui, job, &style, fallback_color, &text[segment_start..index]);
                 let params = &text[index + 2..index + 2 + end_offset];
                 apply_ansi_sgr(params, &mut style);
                 index += 2 + end_offset + 1;
@@ -1121,14 +1135,14 @@ fn ansi_layout_job(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
             .unwrap_or(1);
     }
 
-    append_ansi_segment(ui, &mut job, &style, &text[segment_start..]);
-    job
+    append_ansi_segment(ui, job, &style, fallback_color, &text[segment_start..]);
 }
 
 fn append_ansi_segment(
     ui: &egui::Ui,
     job: &mut egui::text::LayoutJob,
     style: &AnsiTextStyle,
+    fallback_color: Option<egui::Color32>,
     text: &str,
 ) {
     if text.is_empty() {
@@ -1137,8 +1151,9 @@ fn append_ansi_segment(
 
     let mut color = style
         .foreground
+        .or(fallback_color)
         .unwrap_or_else(|| ui.visuals().text_color());
-    if style.bold && style.foreground.is_none() {
+    if style.bold && style.foreground.is_none() && fallback_color.is_none() {
         color = egui::Color32::from_rgb(31, 41, 55);
     }
 
@@ -1151,6 +1166,65 @@ fn append_ansi_segment(
             ..Default::default()
         },
     );
+}
+
+fn terminal_line_color(line: &str) -> Option<egui::Color32> {
+    let upper = line.to_ascii_uppercase();
+    if upper.contains(" ERROR ")
+        || upper.contains(" ERROR:")
+        || upper.contains(" - ERROR -")
+        || upper.contains("[ERROR]")
+        || upper.contains("失败")
+    {
+        return Some(egui::Color32::from_rgb(220, 38, 38));
+    }
+    if upper.contains(" WARN ")
+        || upper.contains(" WARNING ")
+        || upper.contains(" - WARNING -")
+        || upper.contains("[WARN]")
+        || upper.contains("警告")
+    {
+        return Some(egui::Color32::from_rgb(217, 119, 6));
+    }
+    if line.starts_with("[gui]") {
+        return Some(egui::Color32::from_rgb(37, 99, 235));
+    }
+    if upper.contains(" INFO ") || upper.contains(" - INFO -") || upper.contains("[INFO]") {
+        return Some(egui::Color32::from_rgb(22, 163, 74));
+    }
+    if upper.contains(" DEBUG ")
+        || upper.contains(" TRACE ")
+        || upper.contains("[DEBUG]")
+        || upper.contains("[TRACE]")
+    {
+        return Some(egui::Color32::from_rgb(107, 114, 128));
+    }
+    if line.starts_with("[stderr]") || line.starts_with("[wxdb stderr]") {
+        return Some(egui::Color32::from_rgb(217, 119, 6));
+    }
+    None
+}
+
+fn strip_ansi_sgr(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    let bytes = text.as_bytes();
+    while index < bytes.len() {
+        if bytes[index] == b'\x1b' && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+            if let Some(end_offset) = text[index + 2..].bytes().position(|byte| byte == b'm') {
+                index += 2 + end_offset + 1;
+                continue;
+            }
+        }
+        let next = text[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+        output.push_str(&text[index..index + next]);
+        index += next;
+    }
+    output
 }
 
 fn apply_ansi_sgr(params: &str, style: &mut AnsiTextStyle) {
@@ -2693,5 +2767,40 @@ fn yes_no(value: bool) -> &'static str {
         "OK"
     } else {
         "missing"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_semantic_colors_plain_log_levels() {
+        assert_eq!(
+            terminal_line_color("[stdout] 2026-06-05T12:00:00Z INFO wx4py_client: ready"),
+            Some(egui::Color32::from_rgb(22, 163, 74))
+        );
+        assert_eq!(
+            terminal_line_color("[stderr] 2026-06-05 20:00:00,000 - wx4py - WARNING - slow"),
+            Some(egui::Color32::from_rgb(217, 119, 6))
+        );
+        assert_eq!(
+            terminal_line_color("[stdout] ERROR wechat_summary_app: failed"),
+            Some(egui::Color32::from_rgb(220, 38, 38))
+        );
+        assert_eq!(
+            terminal_line_color("[gui] 主程序已启动"),
+            Some(egui::Color32::from_rgb(37, 99, 235))
+        );
+    }
+
+    #[test]
+    fn terminal_semantic_colors_strip_ansi_before_matching() {
+        let line = "\u{1b}[2m2026-06-05T12:00:00Z\u{1b}[0m \u{1b}[32mINFO\u{1b}[0m app";
+        assert_eq!(strip_ansi_sgr(line), "2026-06-05T12:00:00Z INFO app");
+        assert_eq!(
+            terminal_line_color(&strip_ansi_sgr(line)),
+            Some(egui::Color32::from_rgb(22, 163, 74))
+        );
     }
 }
