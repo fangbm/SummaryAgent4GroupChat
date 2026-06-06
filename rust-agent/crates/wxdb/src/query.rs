@@ -780,6 +780,7 @@ struct ImageMedia {
 #[derive(Debug, Default)]
 struct ImageResolveContext {
     dir_cache: HashMap<PathBuf, Vec<MediaCandidateEntry>>,
+    recursive_dir_cache: HashMap<(PathBuf, usize), Vec<MediaCandidateEntry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -814,6 +815,56 @@ impl ImageResolveContext {
             .dir_cache
             .entry(dir.to_path_buf())
             .or_insert_with(|| read_media_candidate_entries(dir));
+        for entry in entries {
+            let file_name = entry
+                .path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if keys.iter().any(|key| file_name.starts_with(key)) {
+                out.push(entry.path.clone());
+            }
+        }
+    }
+
+    fn collect_nearby_files_recursive(
+        &mut self,
+        dir: &Path,
+        max_depth: usize,
+        timestamp: i64,
+        out: &mut Vec<PathBuf>,
+    ) {
+        let entries = self
+            .recursive_dir_cache
+            .entry((dir.to_path_buf(), max_depth))
+            .or_insert_with(|| read_media_candidate_entries_recursive(dir, max_depth));
+        for entry in entries {
+            let delta = (entry.modified_secs - timestamp).abs();
+            if delta <= 300 {
+                out.push(entry.path.clone());
+            }
+        }
+    }
+
+    fn collect_files_matching_keys_recursive(
+        &mut self,
+        dir: &Path,
+        max_depth: usize,
+        keys: &[String],
+        out: &mut Vec<PathBuf>,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        let keys = keys
+            .iter()
+            .map(|key| key.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let entries = self
+            .recursive_dir_cache
+            .entry((dir.to_path_buf(), max_depth))
+            .or_insert_with(|| read_media_candidate_entries_recursive(dir, max_depth));
         for entry in entries {
             let file_name = entry
                 .path
@@ -963,6 +1014,35 @@ fn resolve_voice_media(
         );
     }
 
+    for dir in [
+        account_root
+            .join("msg")
+            .join("attach")
+            .join(&chat_hash)
+            .join(&month)
+            .join("Rec"),
+        account_root
+            .join("msg")
+            .join("attach")
+            .join(&chat_hash)
+            .join(&month)
+            .join("RecTmp"),
+        account_root
+            .join("cache")
+            .join(&month)
+            .join("Message")
+            .join(&chat_hash)
+            .join("Rec"),
+        account_root
+            .join("cache")
+            .join(&month)
+            .join("Message")
+            .join(&chat_hash)
+            .join("RecTmp"),
+    ] {
+        resolver.collect_nearby_files_recursive(&dir, 5, timestamp, &mut candidates);
+    }
+
     candidates.sort();
     candidates.dedup();
     let preferred = candidates
@@ -1056,6 +1136,36 @@ fn resolve_video_media(
             timestamp,
             &mut candidates,
         );
+    }
+
+    for dir in [
+        account_root
+            .join("msg")
+            .join("attach")
+            .join(&chat_hash)
+            .join(&month)
+            .join("Rec"),
+        account_root
+            .join("msg")
+            .join("attach")
+            .join(&chat_hash)
+            .join(&month)
+            .join("RecTmp"),
+        account_root
+            .join("cache")
+            .join(&month)
+            .join("Message")
+            .join(&chat_hash)
+            .join("Rec"),
+        account_root
+            .join("cache")
+            .join(&month)
+            .join("Message")
+            .join(&chat_hash)
+            .join("RecTmp"),
+    ] {
+        resolver.collect_files_matching_keys_recursive(&dir, 5, &local_keys, &mut candidates);
+        resolver.collect_nearby_files_recursive(&dir, 5, timestamp, &mut candidates);
     }
 
     candidates.sort();
@@ -1248,6 +1358,37 @@ fn read_media_candidate_entries(dir: &Path) -> Vec<MediaCandidateEntry> {
             path,
             modified_secs: modified_secs.as_secs() as i64,
         });
+    }
+    out
+}
+
+fn read_media_candidate_entries_recursive(
+    dir: &Path,
+    max_depth: usize,
+) -> Vec<MediaCandidateEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if !is_media_candidate_name(&path) {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+                continue;
+            };
+            let Ok(modified_secs) = modified.duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            out.push(MediaCandidateEntry {
+                path,
+                modified_secs: modified_secs.as_secs() as i64,
+            });
+        } else if max_depth > 0 && path.is_dir() {
+            out.extend(read_media_candidate_entries_recursive(&path, max_depth - 1));
+        }
     }
     out
 }
@@ -1828,6 +1969,84 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("完整视频未落盘"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_media_finds_nested_rec_source_file() {
+        let root = temp_test_dir("wxdb-video-rec-source");
+        let key = "878779b7187a1c3c0653b21df139d47d";
+        let chat_hash = format!("{:x}", md5::compute("chat@chatroom".as_bytes()));
+        let rec_video_dir = root
+            .join("msg")
+            .join("attach")
+            .join(&chat_hash)
+            .join("2026-06")
+            .join("Rec")
+            .join("nested")
+            .join("V");
+        std::fs::create_dir_all(&rec_video_dir).unwrap();
+        let full = rec_video_dir.join(format!("{key}.mp4"));
+        std::fs::write(&full, b"\x00\x00\x00\x18ftypmp42payload").unwrap();
+        let mut packed = vec![0x08, 0x04, 0x10, 0x02, 0x22, 0x22, 0x42, 0x20];
+        packed.extend_from_slice(key.as_bytes());
+        let timestamp = Local
+            .with_ymd_and_hms(2026, 6, 6, 12, 5, 0)
+            .unwrap()
+            .timestamp();
+        let mut resolver = ImageResolveContext::default();
+
+        let media = resolve_video_media(
+            &mut resolver,
+            Some(&root),
+            &root.join("cache"),
+            "chat@chatroom",
+            timestamp,
+            r#"<videomsg cdnvideourl="cdn" />"#,
+            &packed,
+        )
+        .unwrap();
+
+        assert_eq!(media.media_path.as_deref(), Some(full.as_path()));
+        assert!(media.decoded_path.is_some());
+        assert_eq!(media.decoder.as_deref(), Some("plain"));
+        assert!(media.decode_error.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn voice_media_finds_nested_rectmp_candidate() {
+        let root = temp_test_dir("wxdb-voice-rectmp-source");
+        let chat_hash = format!("{:x}", md5::compute("chat@chatroom".as_bytes()));
+        let rec_voice_dir = root
+            .join("cache")
+            .join("2026-06")
+            .join("Message")
+            .join(&chat_hash)
+            .join("RecTmp")
+            .join("nested")
+            .join("Voice");
+        std::fs::create_dir_all(&rec_voice_dir).unwrap();
+        let voice = rec_voice_dir.join("voice.silk");
+        std::fs::write(&voice, b"not-a-real-silk").unwrap();
+        let timestamp = Local::now().timestamp();
+        let mut resolver = ImageResolveContext::default();
+
+        let media = resolve_voice_media(
+            &mut resolver,
+            Some(&root),
+            &root.join("cache"),
+            "chat@chatroom",
+            timestamp,
+            r#"<voicemsg voiceurl="cdn" />"#,
+        )
+        .unwrap();
+
+        assert_eq!(media.media_path.as_deref(), Some(voice.as_path()));
+        assert!(media.decoded_path.is_none());
+        assert!(media.decode_error.is_some());
 
         let _ = std::fs::remove_dir_all(root);
     }
