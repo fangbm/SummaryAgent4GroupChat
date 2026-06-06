@@ -378,18 +378,12 @@ fn append_runtime_log(config: &AgentConfig, message: &str) {
     }
 }
 
-fn retry_message_notifier(
-    config: &AgentConfig,
-    sender: PlatformSender,
-    room_id: String,
-) -> RetryNotifier {
+fn retry_log_notifier(config: &AgentConfig, room_id: String) -> RetryNotifier {
     let config = config.clone();
     Arc::new(move |notice: AiRetryNotice| {
         let config = config.clone();
-        let sender = sender.clone();
         let room_id = room_id.clone();
         Box::pin(async move {
-            let message = format_retry_notice(&notice);
             let reason = retry_notice_reason(&notice.reason, 160);
             info!(
                 room_id = %room_id,
@@ -398,60 +392,23 @@ fn retry_message_notifier(
                 max_attempts = notice.max_attempts,
                 retry_after_ms = notice.retry_after_ms,
                 reason = %reason,
-                "sending AI retry notification"
+                "AI request retry scheduled"
             );
-            append_runtime_log(
-                &config,
-                &format!(
-                    "ai retry notification room={} operation={} retry={}/{} wait_ms={} reason={}",
-                    room_id,
-                    notice.operation,
-                    retry_notice_retry_index(&notice),
-                    retry_notice_max_retries(&notice),
-                    notice.retry_after_ms,
-                    reason
-                ),
-            );
-            if let Err(error) = sender.send_text(&room_id, &message).await {
-                let send_error = format_error_chain(&error);
-                warn!(
-                    room_id = %room_id,
-                    error = %send_error,
-                    "failed to send AI retry notification"
-                );
-                append_runtime_log(
-                    &config,
-                    &format!(
-                        "ai retry notification send failed room={} error={}",
-                        room_id, send_error
-                    ),
-                );
-            }
+            append_runtime_log(&config, &format_retry_log_entry(&room_id, &notice));
         })
     })
 }
 
-fn format_retry_notice(notice: &AiRetryNotice) -> String {
-    let operation = retry_operation_label(notice.operation);
-    let retry_index = retry_notice_retry_index(notice);
-    let max_retries = retry_notice_max_retries(notice);
-    let wait = format_retry_wait(notice.retry_after_ms);
-    let reason = retry_notice_reason(&notice.reason, 96);
+fn format_retry_log_entry(room_id: &str, notice: &AiRetryNotice) -> String {
     format!(
-        "{operation}暂时失败，正在重试（第 {retry_index}/{max_retries} 次，约 {wait} 后继续）。原因：{reason}"
+        "ai retry scheduled room={} operation={} retry={}/{} wait_ms={} reason={}",
+        room_id,
+        notice.operation,
+        retry_notice_retry_index(notice),
+        retry_notice_max_retries(notice),
+        notice.retry_after_ms,
+        retry_notice_reason(&notice.reason, 160)
     )
-}
-
-fn retry_operation_label(operation: &str) -> &'static str {
-    match operation {
-        "LLM chat completion" => "模型请求",
-        "image caption request" => "图片转述请求",
-        "image caption remote image download" => "图片下载",
-        "image generation request" => "图片生成请求",
-        "image task poll" => "图片任务查询",
-        "image download" => "生成图片下载",
-        _ => "模型服务请求",
-    }
 }
 
 fn retry_notice_max_retries(notice: &AiRetryNotice) -> usize {
@@ -462,22 +419,35 @@ fn retry_notice_retry_index(notice: &AiRetryNotice) -> usize {
     notice.attempt.min(retry_notice_max_retries(notice)).max(1)
 }
 
-fn format_retry_wait(ms: u64) -> String {
-    if ms < 1_000 {
-        return format!("{ms}毫秒");
-    }
-    if ms % 1_000 == 0 {
-        return format!("{}秒", ms / 1_000);
-    }
-    format!("{:.1}秒", ms as f64 / 1_000.0)
-}
-
 fn retry_notice_reason(reason: &str, max_chars: usize) -> String {
     let compact = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     let redacted = redact_secret_like_tokens(&compact);
     let mut output = redacted.chars().take(max_chars).collect::<String>();
     if redacted.chars().count() > max_chars {
         output.push_str("...");
+    }
+    if output.is_empty() {
+        "unknown".to_string()
+    } else {
+        output
+    }
+}
+
+fn format_failure_message_for_chat(label: &str, error_message: &str) -> String {
+    let reason = compact_error_for_chat(error_message, 700);
+    format!("{label}：{reason}")
+}
+
+fn compact_error_for_chat(error_message: &str, max_chars: usize) -> String {
+    let compact = error_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let redacted = redact_secret_like_tokens(&compact);
+    let char_count = redacted.chars().count();
+    let mut output = redacted.chars().take(max_chars).collect::<String>();
+    if char_count > max_chars {
+        output.push_str("...（完整错误见终端/日志）");
     }
     if output.is_empty() {
         "unknown".to_string()
@@ -778,7 +748,10 @@ async fn handle_platform_event(
                 ),
             );
             let _ = client
-                .send_text(&trigger.room_id, &format!("总结失败：{error_message}"))
+                .send_text(
+                    &trigger.room_id,
+                    &format_failure_message_for_chat("总结失败", &error_message),
+                )
                 .await;
         }
     }
@@ -971,7 +944,10 @@ async fn run_scheduled_summaries(
                     ),
                 );
                 let _ = client
-                    .send_text(&room, &format!("定时总结失败：{error_message}"))
+                    .send_text(
+                        &room,
+                        &format_failure_message_for_chat("定时总结失败", &error_message),
+                    )
                     .await;
             }
         }
@@ -987,7 +963,7 @@ struct PipelineOptions {
     send_progress: bool,
     defer_text_until_image_ready: bool,
     send_disabled_message: bool,
-    send_retry_notifications: bool,
+    log_retry_attempts: bool,
 }
 
 #[derive(Clone)]
@@ -1012,7 +988,7 @@ impl PipelineOptions {
             send_progress: true,
             defer_text_until_image_ready: false,
             send_disabled_message: true,
-            send_retry_notifications: true,
+            log_retry_attempts: true,
         }
     }
 
@@ -1023,7 +999,7 @@ impl PipelineOptions {
             send_progress: false,
             defer_text_until_image_ready: true,
             send_disabled_message: false,
-            send_retry_notifications: false,
+            log_retry_attempts: false,
         }
     }
 }
@@ -1067,8 +1043,8 @@ async fn run_summary_pipeline(
     }
 
     let retry_notifier = options
-        .send_retry_notifications
-        .then(|| retry_message_notifier(config, client.sender(), trigger.room_id.clone()));
+        .log_retry_attempts
+        .then(|| retry_log_notifier(config, trigger.room_id.clone()));
 
     let history_message_limit = config.history_message_limit();
     let history_query_limit = history_message_limit.min(u32::MAX as usize) as u32;
@@ -1585,7 +1561,10 @@ async fn run_summary_pipeline(
                 client
                     .send_text(
                         &trigger.room_id,
-                        &format!("{prefix}图片生成失败：{error_message}"),
+                        &format!(
+                            "{prefix}{}",
+                            format_failure_message_for_chat("图片生成失败", &error_message)
+                        ),
                     )
                     .await
                     .context("sending image failure message")?;
@@ -1662,7 +1641,13 @@ async fn run_background_image_pipeline(
             ""
         };
         if let Err(send_error) = sender
-            .send_text(&room_id, &format!("{prefix}图片生成失败：{error_message}"))
+            .send_text(
+                &room_id,
+                &format!(
+                    "{prefix}{}",
+                    format_failure_message_for_chat("图片生成失败", &error_message)
+                ),
+            )
             .await
         {
             warn!(
@@ -1682,7 +1667,7 @@ async fn run_background_image_pipeline_inner(
     chat_messages: &[ChatMessage],
     image_cooldown_recorder: Option<&ImageCooldownRecorder>,
 ) -> Result<()> {
-    let retry_notifier = retry_message_notifier(config, sender.clone(), room_id.to_string());
+    let retry_notifier = retry_log_notifier(config, room_id.to_string());
     let llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
         .context("initializing LLM client for background image pipeline")?
         .with_retry_notifier(retry_notifier.clone());
@@ -2601,7 +2586,10 @@ async fn send_image_failure_message(
     if let Err(error) = client
         .send_text(
             room_id,
-            &format!("文字总结已完成，但图片生成失败：{error_message}"),
+            &format!(
+                "文字总结已完成，但{}",
+                format_failure_message_for_chat("图片生成失败", error_message)
+            ),
         )
         .await
     {
@@ -4428,7 +4416,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_notice_mentions_attempt_wait_and_operation() {
+    fn retry_log_entry_mentions_attempt_wait_and_operation() {
         let notice = AiRetryNotice {
             operation: "LLM chat completion",
             attempt: 2,
@@ -4437,17 +4425,17 @@ mod tests {
             reason: "503 Service Unavailable".into(),
         };
 
-        let message = format_retry_notice(&notice);
+        let message = format_retry_log_entry("room-a", &notice);
 
-        assert!(message.contains("模型请求"));
-        assert!(message.contains("第 2/5 次"));
-        assert!(message.contains("约 2秒 后"));
+        assert!(message.contains("room=room-a"));
+        assert!(message.contains("operation=LLM chat completion"));
+        assert!(message.contains("retry=2/5"));
+        assert!(message.contains("wait_ms=2000"));
         assert!(message.contains("503 Service Unavailable"));
-        assert!(is_agent_status_content(&message));
     }
 
     #[test]
-    fn retry_notice_redacts_secret_like_reason() {
+    fn retry_log_entry_redacts_secret_like_reason() {
         let notice = AiRetryNotice {
             operation: "image generation request",
             attempt: 1,
@@ -4456,10 +4444,25 @@ mod tests {
             reason: "upstream rejected sk-test-direct-value-1234567890".into(),
         };
 
-        let message = format_retry_notice(&notice);
+        let message = format_retry_log_entry("room-a", &notice);
 
         assert!(!message.contains("sk-test"));
         assert!(message.contains("<redacted-secret>"));
+    }
+
+    #[test]
+    fn failure_message_for_chat_is_compact_and_redacted() {
+        let error = format!(
+            "upstream failed sk-test-direct-value-1234567890 {}",
+            "x".repeat(900)
+        );
+        let message = format_failure_message_for_chat("总结失败", &error);
+
+        assert!(message.starts_with("总结失败："));
+        assert!(!message.contains("sk-test"));
+        assert!(message.contains("<redacted-secret>"));
+        assert!(message.contains("完整错误见终端/日志"));
+        assert!(message.chars().count() < 800);
     }
 
     #[test]
@@ -4635,17 +4638,17 @@ mod tests {
     }
 
     #[test]
-    fn manual_pipeline_sends_retry_notifications() {
+    fn manual_pipeline_logs_retry_attempts() {
         let config = test_config();
 
-        assert!(PipelineOptions::manual(&config, false).send_retry_notifications);
+        assert!(PipelineOptions::manual(&config, false).log_retry_attempts);
     }
 
     #[test]
-    fn scheduled_pipeline_suppresses_retry_notifications() {
+    fn scheduled_pipeline_suppresses_retry_attempt_logs() {
         let config = test_config();
 
-        assert!(!PipelineOptions::scheduled(&config).send_retry_notifications);
+        assert!(!PipelineOptions::scheduled(&config).log_retry_attempts);
     }
 
     fn test_config() -> AgentConfig {

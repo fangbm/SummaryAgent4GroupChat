@@ -198,6 +198,7 @@ impl OpenAiCompatibleLlm {
                     .await
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
@@ -208,7 +209,7 @@ impl OpenAiCompatibleLlm {
                     max_attempts,
                     retry,
                     retry_after_ms,
-                    response = %snippet,
+                    response = %response_for_log,
                     "LLM chat completion request failed"
                 );
                 if retry {
@@ -224,7 +225,7 @@ impl OpenAiCompatibleLlm {
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
-                let message = format!("chat completion API returned {status}: {snippet}");
+                let message = format!("chat completion API returned {status}: {response_for_log}");
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(AiError::RateLimited(message));
                 }
@@ -240,24 +241,26 @@ impl OpenAiCompatibleLlm {
 
             let body = response.text().await?;
             let response = serde_json::from_str::<Value>(&body).map_err(|error| {
-                let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 warn!(
                     elapsed_ms,
-                    response = %snippet,
+                    response = %response_for_log,
                     "LLM chat completion JSON parsing failed"
                 );
-                AiError::InvalidResponse(format!("invalid chat completion JSON: {error}"))
+                AiError::InvalidResponse(format!(
+                    "invalid chat completion JSON: {error}; response={response_for_log}"
+                ))
             })?;
             let content = extract_chat_completion_content(&response).ok_or_else(|| {
                 let finish_reason = chat_completion_finish_reason(&response);
-                let snippet = truncate_for_log(&response.to_string(), 500);
+                let response_for_log = full_response_for_log(&response.to_string());
                 warn!(
                     finish_reason = %finish_reason,
-                    response = %snippet,
+                    response = %response_for_log,
                     "LLM chat completion response is missing content"
                 );
                 AiError::InvalidResponse(format!(
-                    "missing chat completion content (finish_reason={finish_reason})"
+                    "missing chat completion content (finish_reason={finish_reason}); response={response_for_log}"
                 ))
             })?;
             info!(
@@ -387,6 +390,7 @@ impl OpenAiVisionCaptionClient {
                     .await
                     .unwrap_or_else(|error| format!("failed to read image response body: {error}"));
                 let snippet = truncate_for_log(&body, 300);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
                 warn!(
@@ -397,7 +401,7 @@ impl OpenAiVisionCaptionClient {
                     retry,
                     retry_after_ms,
                     elapsed_ms = started.elapsed().as_millis(),
-                    response = %snippet,
+                    response = %response_for_log,
                     "image caption remote image download failed"
                 );
                 if retry {
@@ -414,7 +418,7 @@ impl OpenAiVisionCaptionClient {
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
-                    "remote image download returned {status}: {snippet}"
+                    "remote image download returned {status}: {response_for_log}"
                 )));
             }
             let bytes = response.bytes().await?;
@@ -505,6 +509,7 @@ impl OpenAiVisionCaptionClient {
                     .await
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
@@ -515,7 +520,7 @@ impl OpenAiVisionCaptionClient {
                     max_attempts,
                     retry,
                     retry_after_ms,
-                    response = %snippet,
+                    response = %response_for_log,
                     "image caption request failed"
                 );
                 if retry {
@@ -531,7 +536,7 @@ impl OpenAiVisionCaptionClient {
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
-                let message = format!("image caption API returned {status}: {snippet}");
+                let message = format!("image caption API returned {status}: {response_for_log}");
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(AiError::RateLimited(message));
                 }
@@ -540,17 +545,25 @@ impl OpenAiVisionCaptionClient {
 
             let body = response.text().await?;
             let response = serde_json::from_str::<Value>(&body).map_err(|error| {
-                let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 warn!(
-                    response = %snippet,
+                    response = %response_for_log,
                     "image caption JSON parsing failed"
                 );
-                AiError::InvalidResponse(format!("invalid image caption JSON: {error}"))
+                AiError::InvalidResponse(format!(
+                    "invalid image caption JSON: {error}; response={response_for_log}"
+                ))
             })?;
             let content = extract_chat_completion_content(&response).ok_or_else(|| {
                 let finish_reason = chat_completion_finish_reason(&response);
+                let response_for_log = full_response_for_log(&response.to_string());
+                warn!(
+                    finish_reason = %finish_reason,
+                    response = %response_for_log,
+                    "image caption response is missing content"
+                );
                 AiError::InvalidResponse(format!(
-                    "missing image caption content (finish_reason={finish_reason})"
+                    "missing image caption content (finish_reason={finish_reason}); response={response_for_log}"
                 ))
             })?;
             info!(
@@ -672,6 +685,7 @@ impl OpenAiVideoCaptionClient {
                     .await
                     .unwrap_or_else(|error| format!("failed to read video response body: {error}"));
                 let snippet = truncate_for_log(&body, 300);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
                 warn!(
@@ -682,7 +696,7 @@ impl OpenAiVideoCaptionClient {
                     retry,
                     retry_after_ms,
                     elapsed_ms = started.elapsed().as_millis(),
-                    response = %snippet,
+                    response = %response_for_log,
                     "video caption remote video download failed"
                 );
                 if retry {
@@ -690,7 +704,7 @@ impl OpenAiVideoCaptionClient {
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
-                    "remote video download returned {status}: {snippet}"
+                    "remote video download returned {status}: {response_for_log}"
                 )));
             }
             let bytes = response.bytes().await?;
@@ -772,6 +786,7 @@ impl OpenAiVideoCaptionClient {
                     .await
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
@@ -782,14 +797,14 @@ impl OpenAiVideoCaptionClient {
                     max_attempts,
                     retry,
                     retry_after_ms,
-                    response = %snippet,
+                    response = %response_for_log,
                     "video caption request failed"
                 );
                 if retry {
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
-                let message = format!("video caption API returned {status}: {snippet}");
+                let message = format!("video caption API returned {status}: {response_for_log}");
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(AiError::RateLimited(message));
                 }
@@ -798,17 +813,25 @@ impl OpenAiVideoCaptionClient {
 
             let body = response.text().await?;
             let response = serde_json::from_str::<Value>(&body).map_err(|error| {
-                let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 warn!(
-                    response = %snippet,
+                    response = %response_for_log,
                     "video caption JSON parsing failed"
                 );
-                AiError::InvalidResponse(format!("invalid video caption JSON: {error}"))
+                AiError::InvalidResponse(format!(
+                    "invalid video caption JSON: {error}; response={response_for_log}"
+                ))
             })?;
             let content = extract_chat_completion_content(&response).ok_or_else(|| {
                 let finish_reason = chat_completion_finish_reason(&response);
+                let response_for_log = full_response_for_log(&response.to_string());
+                warn!(
+                    finish_reason = %finish_reason,
+                    response = %response_for_log,
+                    "video caption response is missing content"
+                );
                 AiError::InvalidResponse(format!(
-                    "missing video caption content (finish_reason={finish_reason})"
+                    "missing video caption content (finish_reason={finish_reason}); response={response_for_log}"
                 ))
             })?;
             info!(
@@ -940,6 +963,7 @@ impl OpenAiAudioTranscriptionClient {
             let body = response.text().await?;
             if !status.is_success() {
                 let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
@@ -950,14 +974,15 @@ impl OpenAiAudioTranscriptionClient {
                     max_attempts,
                     retry,
                     retry_after_ms,
-                    response = %snippet,
+                    response = %response_for_log,
                     "voice transcription request failed"
                 );
                 if retry {
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
-                let message = format!("voice transcription API returned {status}: {snippet}");
+                let message =
+                    format!("voice transcription API returned {status}: {response_for_log}");
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(AiError::RateLimited(message));
                 }
@@ -1043,6 +1068,7 @@ impl OpenAiAudioTranscriptionClient {
             let body = response.text().await?;
             if !status.is_success() {
                 let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
@@ -1053,15 +1079,16 @@ impl OpenAiAudioTranscriptionClient {
                     max_attempts,
                     retry,
                     retry_after_ms,
-                    response = %snippet,
+                    response = %response_for_log,
                     "StepFun voice transcription request failed"
                 );
                 if retry {
                     sleep(http_retry_delay(attempt)).await;
                     continue;
                 }
-                let message =
-                    format!("StepFun voice transcription API returned {status}: {snippet}");
+                let message = format!(
+                    "StepFun voice transcription API returned {status}: {response_for_log}"
+                );
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(AiError::RateLimited(message));
                 }
@@ -1888,6 +1915,7 @@ impl OpenAiImageClient {
                     .await
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
                 warn!(
@@ -1897,7 +1925,7 @@ impl OpenAiImageClient {
                     max_attempts,
                     retry,
                     retry_after_ms,
-                    response = %snippet,
+                    response = %response_for_log,
                     "image generation request failed"
                 );
                 if retry {
@@ -1914,7 +1942,7 @@ impl OpenAiImageClient {
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
-                    "image generation API returned {status}: {snippet}"
+                    "image generation API returned {status}: {response_for_log}"
                 )));
             }
             info!(
@@ -2058,6 +2086,7 @@ impl OpenAiImageClient {
                             format!("failed to read error response body: {error}")
                         });
                         let snippet = truncate_for_log(&body, 500);
+                        let response_for_log = full_response_for_log(&body);
                         let retry = http_attempt < max_attempts
                             && should_retry_http_failure(status, &snippet);
                         let retry_after_ms = retry
@@ -2072,7 +2101,7 @@ impl OpenAiImageClient {
                             retry_after_ms,
                             status = %status,
                             elapsed_ms,
-                            response = %snippet,
+                            response = %response_for_log,
                             "image task poll failed"
                         );
                         if retry {
@@ -2089,7 +2118,7 @@ impl OpenAiImageClient {
                             continue;
                         }
                         return Err(AiError::InvalidResponse(format!(
-                            "image task API returned {status}: {snippet}"
+                            "image task API returned {status}: {response_for_log}"
                         )));
                     }
                     final_response = Some((response, elapsed_ms, http_attempt));
@@ -2181,6 +2210,7 @@ impl OpenAiImageClient {
                     .await
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
+                let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
                 let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
                 warn!(
@@ -2191,7 +2221,7 @@ impl OpenAiImageClient {
                     retry,
                     retry_after_ms,
                     elapsed_ms,
-                    response = %snippet,
+                    response = %response_for_log,
                     "image download failed"
                 );
                 if retry {
@@ -2208,7 +2238,7 @@ impl OpenAiImageClient {
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
-                    "image download returned {status}: {snippet}"
+                    "image download returned {status}: {response_for_log}"
                 )));
             }
             let bytes = response.bytes().await?.to_vec();
@@ -2505,6 +2535,10 @@ fn redacted_url_source(url: &str) -> String {
                 .map(|host| format!("{}://{}", parsed.scheme(), host))
         })
         .unwrap_or_else(|| "<unparseable-url>".to_string())
+}
+
+fn full_response_for_log(input: &str) -> String {
+    redact_secret_like_tokens(input)
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -2989,6 +3023,20 @@ data: {"type":"transcript.text.delta","delta":"文字"}
 
         assert!(!text.contains("sk-test"));
         assert!(text.contains("<redacted-secret>"));
+    }
+
+    #[test]
+    fn full_response_log_keeps_long_body_and_redacts_secret_like_tokens() {
+        let body = format!(
+            "bad sk-test-direct-value-1234567890 here {}",
+            "x".repeat(900)
+        );
+        let text = full_response_for_log(&body);
+
+        assert!(!text.contains("sk-test"));
+        assert!(text.contains("<redacted-secret>"));
+        assert!(text.len() > 900);
+        assert!(!text.ends_with("..."));
     }
 
     #[test]
