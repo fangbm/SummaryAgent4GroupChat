@@ -916,6 +916,65 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         text_field(ui, "图片分辨率", &mut view.image_resolution);
         number_u64(ui, "图片超时秒数", &mut view.image_timeout);
         number_u32(ui, "5xx 重试次数", &mut view.image_retry_5xx_attempts);
+        ui.separator();
+        ui.heading("语音转写");
+        ui.checkbox(&mut view.voice_transcription_enabled, "启用语音转写");
+        text_field(ui, "语音 Provider", &mut view.voice_transcription_provider);
+        text_field(
+            ui,
+            "语音 API Key 环境变量/直接值",
+            &mut view.voice_transcription_api_key_env,
+        );
+        text_field(
+            ui,
+            "语音 Base URL 环境变量/直接值",
+            &mut view.voice_transcription_base_url_env,
+        );
+        text_field(ui, "语音模型名称", &mut view.voice_transcription_model);
+        text_field(
+            ui,
+            "语音模型环境变量",
+            &mut view.voice_transcription_model_env,
+        );
+        number_u64(ui, "语音超时秒数", &mut view.voice_transcription_timeout);
+        number_u32(
+            ui,
+            "5xx 重试次数",
+            &mut view.voice_transcription_retry_5xx_attempts,
+        );
+        text_field(ui, "语音语言", &mut view.voice_transcription_language);
+        text_field(ui, "语音提示词", &mut view.voice_transcription_prompt);
+        text_field(
+            ui,
+            "语音响应格式",
+            &mut view.voice_transcription_response_format,
+        );
+        ui.checkbox(
+            &mut view.voice_transcription_transcode_to_mp3,
+            "转写前统一转码为 MP3",
+        );
+        text_field(
+            ui,
+            "ffmpeg 可执行文件",
+            &mut view.voice_transcription_ffmpeg_executable,
+        );
+        text_field(ui, "MP3 码率", &mut view.voice_transcription_mp3_bitrate);
+        number_u32(
+            ui,
+            "每次最多转写语音数",
+            &mut view.voice_transcription_max_voices,
+        );
+        number_u32(
+            ui,
+            "语音最大并发请求数",
+            &mut view.voice_transcription_max_concurrent_requests,
+        );
+        multiline_field(
+            ui,
+            "语音请求体覆盖(JSON)",
+            &mut view.voice_transcription_request_body_overrides,
+            4,
+        );
 
         let ui = &mut columns[2];
         ui.heading("图片转述");
@@ -990,65 +1049,6 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             ui,
             "视频请求体覆盖(JSON)",
             &mut view.video_caption_request_body_overrides,
-            4,
-        );
-        ui.separator();
-        ui.heading("语音转写");
-        ui.checkbox(&mut view.voice_transcription_enabled, "启用语音转写");
-        text_field(ui, "语音 Provider", &mut view.voice_transcription_provider);
-        text_field(
-            ui,
-            "语音 API Key 环境变量/直接值",
-            &mut view.voice_transcription_api_key_env,
-        );
-        text_field(
-            ui,
-            "语音 Base URL 环境变量/直接值",
-            &mut view.voice_transcription_base_url_env,
-        );
-        text_field(ui, "语音模型名称", &mut view.voice_transcription_model);
-        text_field(
-            ui,
-            "语音模型环境变量",
-            &mut view.voice_transcription_model_env,
-        );
-        number_u64(ui, "语音超时秒数", &mut view.voice_transcription_timeout);
-        number_u32(
-            ui,
-            "5xx 重试次数",
-            &mut view.voice_transcription_retry_5xx_attempts,
-        );
-        text_field(ui, "语音语言", &mut view.voice_transcription_language);
-        text_field(ui, "语音提示词", &mut view.voice_transcription_prompt);
-        text_field(
-            ui,
-            "语音响应格式",
-            &mut view.voice_transcription_response_format,
-        );
-        ui.checkbox(
-            &mut view.voice_transcription_transcode_to_mp3,
-            "转写前统一转码为 MP3",
-        );
-        text_field(
-            ui,
-            "ffmpeg 可执行文件",
-            &mut view.voice_transcription_ffmpeg_executable,
-        );
-        text_field(ui, "MP3 码率", &mut view.voice_transcription_mp3_bitrate);
-        number_u32(
-            ui,
-            "每次最多转写语音数",
-            &mut view.voice_transcription_max_voices,
-        );
-        number_u32(
-            ui,
-            "语音最大并发请求数",
-            &mut view.voice_transcription_max_concurrent_requests,
-        );
-        multiline_field(
-            ui,
-            "语音请求体覆盖(JSON)",
-            &mut view.voice_transcription_request_body_overrides,
             4,
         );
     });
