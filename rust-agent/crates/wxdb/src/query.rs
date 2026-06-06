@@ -563,7 +563,7 @@ fn query_messages(
     };
     let sql = format!(
         "SELECT local_id, local_type, create_time, real_sender_id,
-                message_content, WCDB_CT_message_content
+                message_content, WCDB_CT_message_content, packed_info_data
          FROM [{}] {} ORDER BY create_time DESC LIMIT ?",
         table, where_clause
     );
@@ -579,6 +579,7 @@ fn query_messages(
             row.get::<_, i64>(3)?,
             get_content_bytes(row, 4),
             row.get::<_, i64>(5).unwrap_or(0),
+            get_content_bytes(row, 6),
         ))
     })?;
 
@@ -590,7 +591,8 @@ fn query_messages(
             continue;
         };
         stats.rows_seen += 1;
-        let (local_id, local_type, timestamp, real_sender_id, content_bytes, ct) = row;
+        let (local_id, local_type, timestamp, real_sender_id, content_bytes, ct, packed_info_data) =
+            row;
         let raw_content = decompress_message(&content_bytes, ct);
         let base_type = base_msg_type(local_type);
         let sender_username =
@@ -640,6 +642,7 @@ fn query_messages(
                         media_cache_dir,
                         chat_username,
                         timestamp,
+                        &raw_content,
                     );
                     record_media_decode_stats(&mut stats, &media);
                     media
@@ -658,6 +661,8 @@ fn query_messages(
                         media_cache_dir,
                         chat_username,
                         timestamp,
+                        &raw_content,
+                        &packed_info_data,
                     );
                     record_media_decode_stats(&mut stats, &media);
                     media
@@ -796,6 +801,31 @@ impl ImageResolveContext {
             }
         }
     }
+
+    fn collect_files_matching_keys(&mut self, dir: &Path, keys: &[String], out: &mut Vec<PathBuf>) {
+        if keys.is_empty() {
+            return;
+        }
+        let keys = keys
+            .iter()
+            .map(|key| key.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let entries = self
+            .dir_cache
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| read_media_candidate_entries(dir));
+        for entry in entries {
+            let file_name = entry
+                .path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if keys.iter().any(|key| file_name.starts_with(key)) {
+                out.push(entry.path.clone());
+            }
+        }
+    }
 }
 
 fn resolve_image_media(
@@ -891,6 +921,7 @@ fn resolve_voice_media(
     media_cache_dir: &Path,
     chat_username: &str,
     timestamp: i64,
+    raw_content: &str,
 ) -> Option<ImageMedia> {
     let account_root = account_root?;
     let chat_hash = format!("{:x}", md5::compute(chat_username.as_bytes()));
@@ -950,10 +981,16 @@ fn resolve_voice_media(
             Some(decoded.decoder.to_string()),
             None::<String>,
         ),
-        Ok(None) => (None, None, None),
+        Ok(None) => {
+            let error = voice_has_cdn_metadata(raw_content).then(|| {
+                "语音文件未落盘，数据库仅包含 CDN 元数据；当前 wxdb 暂不能直接下载微信 CDN 语音"
+                    .to_string()
+            });
+            (None, None, error)
+        }
         Err(error) => (None, None, Some(error.to_string())),
     };
-    (!candidates.is_empty()).then_some(ImageMedia {
+    (!candidates.is_empty() || voice_has_cdn_metadata(raw_content)).then_some(ImageMedia {
         media_path: preferred,
         thumbnail_path: None,
         candidates,
@@ -969,6 +1006,8 @@ fn resolve_video_media(
     media_cache_dir: &Path,
     chat_username: &str,
     timestamp: i64,
+    raw_content: &str,
+    packed_info_data: &[u8],
 ) -> Option<ImageMedia> {
     let account_root = account_root?;
     let chat_hash = format!("{:x}", md5::compute(chat_username.as_bytes()));
@@ -977,6 +1016,15 @@ fn resolve_video_media(
         .single()
         .map(|dt| dt.format("%Y-%m").to_string())?;
     let mut candidates = Vec::new();
+    let mut local_keys = video_local_keys(raw_content, packed_info_data);
+    local_keys.sort();
+    local_keys.dedup();
+    let direct_video_dir = account_root.join("msg").join("video").join(&month);
+
+    resolver.collect_files_matching_keys(&direct_video_dir, &local_keys, &mut candidates);
+    if candidates.is_empty() {
+        resolver.collect_nearby_files(&direct_video_dir, timestamp, &mut candidates);
+    }
 
     for leaf in ["Video", "video", "Media", "media", "File", "file"] {
         resolver.collect_nearby_files(
@@ -1016,13 +1064,12 @@ fn resolve_video_media(
         .iter()
         .filter(|path| is_video_candidate(path))
         .min_by_key(|path| media_candidate_score(path, timestamp, None))
-        .cloned()
-        .or_else(|| {
-            candidates
-                .iter()
-                .min_by_key(|path| media_candidate_score(path, timestamp, None))
-                .cloned()
-        });
+        .cloned();
+    let thumbnail = candidates
+        .iter()
+        .filter(|path| is_video_thumbnail_candidate(path))
+        .min_by_key(|path| media_candidate_score(path, timestamp, None))
+        .cloned();
     let decode_result = decode_first_video_candidate(
         account_root,
         media_cache_dir,
@@ -1035,12 +1082,24 @@ fn resolve_video_media(
             Some(decoded.decoder.to_string()),
             None::<String>,
         ),
-        Ok(None) => (None, None, None),
+        Ok(None) => {
+            let error = if !candidates.is_empty() && preferred.is_none() {
+                Some(
+                    "完整视频未落盘，仅找到视频缩略图；需要打开微信缓存原视频或实现 CDN 下载"
+                        .to_string(),
+                )
+            } else if video_has_cdn_metadata(raw_content) {
+                Some("完整视频未落盘，数据库仅包含 CDN 元数据；当前 wxdb 暂不能直接下载微信 CDN 视频".to_string())
+            } else {
+                None
+            };
+            (None, None, error)
+        }
         Err(error) => (None, None, Some(error.to_string())),
     };
-    (!candidates.is_empty()).then_some(ImageMedia {
+    (!candidates.is_empty() || video_has_cdn_metadata(raw_content)).then_some(ImageMedia {
         media_path: preferred,
-        thumbnail_path: None,
+        thumbnail_path: thumbnail,
         candidates,
         decoded_path,
         decoder,
@@ -1103,7 +1162,7 @@ fn decode_first_video_candidate(
         paths.push(path);
     }
     for path in candidates {
-        if !paths.iter().any(|known| *known == path) {
+        if is_video_candidate(path) && !paths.iter().any(|known| *known == path) {
             paths.push(path);
         }
     }
@@ -1112,22 +1171,18 @@ fn decode_first_video_candidate(
     }
 
     let mut errors = Vec::new();
-    let mut fallback = None;
     for path in paths {
         match media::decode_media_to_cache(path, Some(account_root), media_cache_dir) {
             Ok(decoded) if is_caption_friendly_video_format(decoded.format) => {
                 return Ok(Some(decoded))
             }
-            Ok(decoded) => {
-                if fallback.is_none() {
-                    fallback = Some(decoded);
-                }
-            }
+            Ok(decoded) => errors.push(format!(
+                "{}: 解码得到 {}，不是可转述视频格式",
+                path.display(),
+                decoded.format
+            )),
             Err(error) => errors.push(format!("{}: {error:#}", path.display())),
         }
-    }
-    if fallback.is_some() {
-        return Ok(fallback);
     }
     anyhow::bail!("{}", errors.join(" | "))
 }
@@ -1287,12 +1342,82 @@ fn is_video_candidate(path: &Path) -> bool {
         || name.ends_with(".webm")
 }
 
+fn is_video_thumbnail_candidate(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    is_thumbnail_candidate(path)
+        || name.ends_with(".jpg")
+        || name.ends_with(".jpeg")
+        || name.ends_with(".png")
+        || name.ends_with(".webp")
+}
+
 fn is_thumbnail_candidate(path: &Path) -> bool {
     let text = path.to_string_lossy().to_ascii_lowercase();
     text.contains("\\thumb\\")
         || text.contains("/thumb/")
         || text.contains("_thumb")
         || text.contains("_t.")
+}
+
+fn video_local_keys(raw_content: &str, packed_info_data: &[u8]) -> Vec<String> {
+    let mut keys = packed_ascii_hex_keys(packed_info_data);
+    for attr in ["md5", "newmd5", "rawmd5", "originsourcemd5"] {
+        if let Some(value) = xml_attr(raw_content, attr) {
+            if is_probable_hex_media_key(&value) {
+                keys.push(value);
+            }
+        }
+    }
+    keys
+}
+
+fn video_has_cdn_metadata(raw_content: &str) -> bool {
+    xml_attr(raw_content, "cdnvideourl").is_some()
+        || xml_attr(raw_content, "cdnrawvideourl").is_some()
+}
+
+fn voice_has_cdn_metadata(raw_content: &str) -> bool {
+    xml_attr(raw_content, "voiceurl").is_some()
+}
+
+fn packed_ascii_hex_keys(data: &[u8]) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut start = None;
+    for (index, byte) in data.iter().copied().enumerate() {
+        if byte.is_ascii_hexdigit() {
+            if start.is_none() {
+                start = Some(index);
+            }
+            continue;
+        }
+        if let Some(start_index) = start.take() {
+            push_packed_hex_key(data, start_index, index, &mut keys);
+        }
+    }
+    if let Some(start_index) = start {
+        push_packed_hex_key(data, start_index, data.len(), &mut keys);
+    }
+    keys
+}
+
+fn push_packed_hex_key(data: &[u8], start: usize, end: usize, keys: &mut Vec<String>) {
+    if end.saturating_sub(start) < 16 {
+        return;
+    }
+    if let Ok(value) = std::str::from_utf8(&data[start..end]) {
+        if is_probable_hex_media_key(value) {
+            keys.push(value.to_ascii_lowercase());
+        }
+    }
+}
+
+fn is_probable_hex_media_key(value: &str) -> bool {
+    let value = value.trim();
+    value.len() >= 16 && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
@@ -1621,6 +1746,93 @@ mod tests {
     }
 
     #[test]
+    fn packed_info_extracts_video_local_key() {
+        let key = "53f905fb8d4377e83a12752fb977905c";
+        let mut data = vec![0x08, 0x04, 0x10, 0x02, 0x22, 0x22, 0x42, 0x20];
+        data.extend_from_slice(key.as_bytes());
+        data.push(0x58);
+
+        assert_eq!(packed_ascii_hex_keys(&data), vec![key.to_string()]);
+    }
+
+    #[test]
+    fn video_media_uses_direct_video_dir_and_keeps_thumbnail_separate() {
+        let root = temp_test_dir("wxdb-video-media");
+        let key = "53f905fb8d4377e83a12752fb977905c";
+        let video_dir = root.join("msg").join("video").join("2026-06");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let full = video_dir.join(format!("{key}.mp4"));
+        let thumb = video_dir.join(format!("{key}_thumb.jpg"));
+        std::fs::write(&full, b"\x00\x00\x00\x18ftypmp42payload").unwrap();
+        std::fs::write(&thumb, [0xff, 0xd8, 0xff, 0xe0]).unwrap();
+        let mut packed = vec![0x08, 0x04, 0x10, 0x02, 0x22, 0x22, 0x42, 0x20];
+        packed.extend_from_slice(key.as_bytes());
+        let timestamp = Local
+            .with_ymd_and_hms(2026, 6, 6, 11, 50, 10)
+            .unwrap()
+            .timestamp();
+        let mut resolver = ImageResolveContext::default();
+
+        let media = resolve_video_media(
+            &mut resolver,
+            Some(&root),
+            &root.join("cache"),
+            "chat@chatroom",
+            timestamp,
+            r#"<videomsg cdnvideourl="cdn" />"#,
+            &packed,
+        )
+        .unwrap();
+
+        assert_eq!(media.media_path.as_deref(), Some(full.as_path()));
+        assert_eq!(media.thumbnail_path.as_deref(), Some(thumb.as_path()));
+        assert!(media.decoded_path.is_some());
+        assert_eq!(media.decoder.as_deref(), Some("plain"));
+        assert!(media.decode_error.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_media_does_not_use_thumbnail_as_decoded_video() {
+        let root = temp_test_dir("wxdb-video-thumb-only");
+        let key = "d2b0b3ee90e762e15080415f948070f1";
+        let video_dir = root.join("msg").join("video").join("2026-06");
+        std::fs::create_dir_all(&video_dir).unwrap();
+        let thumb = video_dir.join(format!("{key}_thumb.jpg"));
+        std::fs::write(&thumb, [0xff, 0xd8, 0xff, 0xe0]).unwrap();
+        let mut packed = vec![0x08, 0x04, 0x10, 0x02, 0x22, 0x22, 0x42, 0x20];
+        packed.extend_from_slice(key.as_bytes());
+        let timestamp = Local
+            .with_ymd_and_hms(2026, 6, 6, 9, 22, 6)
+            .unwrap()
+            .timestamp();
+        let mut resolver = ImageResolveContext::default();
+
+        let media = resolve_video_media(
+            &mut resolver,
+            Some(&root),
+            &root.join("cache"),
+            "chat@chatroom",
+            timestamp,
+            r#"<videomsg cdnvideourl="cdn" />"#,
+            &packed,
+        )
+        .unwrap();
+
+        assert!(media.media_path.is_none());
+        assert_eq!(media.thumbnail_path.as_deref(), Some(thumb.as_path()));
+        assert!(media.decoded_path.is_none());
+        assert!(media
+            .decode_error
+            .as_deref()
+            .unwrap()
+            .contains("完整视频未落盘"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn media_decode_budget_can_disable_or_limit_image_resolution() {
         let mut disabled = Some(0);
         assert!(!consume_media_decode_budget(&mut disabled));
@@ -1665,5 +1877,9 @@ mod tests {
             r"\\?\D:\Temp\xwechat_files\wxid_a\db_storage: 没有可用数据库密钥；请确认微信正在运行"
         ));
         assert!(!is_missing_db_key_error("打开 contact.db 失败"));
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
     }
 }
