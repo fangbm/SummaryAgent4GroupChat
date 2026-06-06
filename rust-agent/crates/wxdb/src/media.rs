@@ -11,7 +11,9 @@ use std::{
 const V1_MAGIC: &[u8; 6] = b"\x07\x08V1\x08\x07";
 const V2_MAGIC: &[u8; 6] = b"\x07\x08V2\x08\x07";
 const PACKED_HEADER_LEN: usize = 15;
-const CACHEABLE_IMAGE_FORMATS: &[&str] = &["jpg", "png", "gif", "webp", "bmp", "hevc", "tif"];
+const CACHEABLE_MEDIA_FORMATS: &[&str] = &[
+    "jpg", "png", "gif", "webp", "bmp", "hevc", "tif", "mp4", "mov", "mkv", "webm", "m4v",
+];
 const V2_KEY_FAILURE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
@@ -61,7 +63,7 @@ pub fn decode_media_to_cache(
         fs::read(dat_path).with_context(|| format!("读取媒体文件 {}", dat_path.display()))?;
     let decoded = decode_media_bytes(&bytes, account_root, Some(cache_dir))?;
     if decoded.format == "bin" {
-        bail!("解码后不是可识别图片格式");
+        bail!("解码后不是可识别媒体格式");
     }
 
     fs::create_dir_all(cache_dir)
@@ -69,7 +71,7 @@ pub fn decode_media_to_cache(
     let output_path = cache_dir.join(format!("{}.{}", cache_key, decoded.format));
     if !output_path.exists() {
         fs::write(&output_path, &decoded.data)
-            .with_context(|| format!("写入解码图片 {}", output_path.display()))?;
+            .with_context(|| format!("写入解码媒体 {}", output_path.display()))?;
     }
 
     Ok(DecodedMedia {
@@ -119,7 +121,7 @@ fn decode_media_bytes(
     if bytes.is_empty() {
         bail!("空媒体文件");
     }
-    if let Some(format) = detect_image_format(bytes) {
+    if let Some(format) = detect_image_format(bytes).or_else(|| detect_video_format(bytes)) {
         return Ok(DecodedBytes {
             data: bytes.to_vec(),
             format,
@@ -197,9 +199,11 @@ fn decode_packed_aes_xor(
     let mut data = aes128_ecb_decrypt_pkcs7(&aes_key, &bytes[PACKED_HEADER_LEN..aes_end])?;
     data.extend_from_slice(&bytes[aes_end..raw_end]);
     data.extend(bytes[raw_end..].iter().map(|byte| byte ^ xor_key));
-    let format = detect_image_format(&data).unwrap_or("bin");
+    let format = detect_image_format(&data)
+        .or_else(|| detect_video_format(&data))
+        .unwrap_or("bin");
     if format == "bin" {
-        bail!("{decoder}: 解密成功但图片 magic 不识别，可能 image key 不匹配");
+        bail!("{decoder}: 解密成功但媒体 magic 不识别，可能 media key 不匹配");
     }
     Ok(DecodedBytes {
         data,
@@ -282,9 +286,11 @@ fn aes128_ecb_decrypt_pkcs7(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
 fn decode_legacy_xor(bytes: &[u8]) -> Result<DecodedBytes> {
     let key = detect_legacy_xor_key(bytes).ok_or_else(|| anyhow!("legacy XOR key 探测失败"))?;
     let data = bytes.iter().map(|byte| byte ^ key).collect::<Vec<_>>();
-    let format = detect_image_format(&data).unwrap_or("bin");
+    let format = detect_image_format(&data)
+        .or_else(|| detect_video_format(&data))
+        .unwrap_or("bin");
     if format == "bin" {
-        bail!("legacy XOR key=0x{key:02x} 解码后图片 magic 不识别");
+        bail!("legacy XOR key=0x{key:02x} 解码后媒体 magic 不识别");
     }
     Ok(DecodedBytes {
         data,
@@ -422,6 +428,20 @@ pub fn detect_audio_format(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+pub fn detect_video_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand.starts_with(b"qt") {
+            return Some("mov");
+        }
+        return Some("mp4");
+    }
+    if bytes.len() >= 4 && bytes[..4] == [0x1a, 0x45, 0xdf, 0xa3] {
+        return Some("mkv");
+    }
+    None
+}
+
 fn media_cache_key(path: &Path) -> String {
     let metadata = path.metadata().ok();
     let len = metadata
@@ -438,7 +458,7 @@ fn media_cache_key(path: &Path) -> String {
 }
 
 fn cached_decoded_media(cache_dir: &Path, cache_key: &str) -> Option<DecodedMedia> {
-    for &format in CACHEABLE_IMAGE_FORMATS {
+    for &format in CACHEABLE_MEDIA_FORMATS {
         let path = cache_dir.join(format!("{cache_key}.{format}"));
         if path.is_file() {
             return Some(DecodedMedia {
@@ -888,6 +908,23 @@ mod tests {
         assert_eq!(detect_audio_format(b"xxxxftypM4A "), Some("m4a"));
         assert_eq!(detect_audio_format(&[0xff, 0xf1, 0, 0]), Some("aac"));
         assert_eq!(detect_audio_format(b"xxxx"), None);
+    }
+
+    #[test]
+    fn detects_common_video_formats() {
+        assert_eq!(
+            detect_video_format(b"\x00\x00\x00\x18ftypmp42"),
+            Some("mp4")
+        );
+        assert_eq!(
+            detect_video_format(b"\x00\x00\x00\x18ftypqt  "),
+            Some("mov")
+        );
+        assert_eq!(
+            detect_video_format(&[0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0]),
+            Some("mkv")
+        );
+        assert_eq!(detect_video_format(b"xxxx"), None);
     }
 
     #[test]

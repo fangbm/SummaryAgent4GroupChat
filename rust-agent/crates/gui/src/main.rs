@@ -100,6 +100,19 @@ struct ConfigView {
     image_caption_max_images: u32,
     image_caption_max_concurrent_requests: u32,
     image_caption_request_body_overrides: String,
+    video_caption_enabled: bool,
+    video_caption_provider: String,
+    video_caption_api_key_env: String,
+    video_caption_base_url_env: String,
+    video_caption_model: String,
+    video_caption_model_env: String,
+    video_caption_timeout: u64,
+    video_caption_retry_5xx_attempts: u32,
+    video_caption_max_tokens: u32,
+    video_caption_max_videos: u32,
+    video_caption_max_concurrent_requests: u32,
+    video_caption_max_video_bytes: u64,
+    video_caption_request_body_overrides: String,
     voice_transcription_enabled: bool,
     voice_transcription_provider: String,
     voice_transcription_api_key_env: String,
@@ -940,6 +953,46 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             6,
         );
         ui.separator();
+        ui.heading("视频转述");
+        ui.checkbox(&mut view.video_caption_enabled, "启用视频转述");
+        text_field(ui, "视频 Provider", &mut view.video_caption_provider);
+        text_field(
+            ui,
+            "视频 API Key 环境变量/直接值",
+            &mut view.video_caption_api_key_env,
+        );
+        text_field(
+            ui,
+            "视频 Base URL 环境变量/直接值",
+            &mut view.video_caption_base_url_env,
+        );
+        text_field(ui, "视频模型名称", &mut view.video_caption_model);
+        text_field(ui, "视频模型环境变量", &mut view.video_caption_model_env);
+        number_u64(ui, "视频超时秒数", &mut view.video_caption_timeout);
+        number_u32(
+            ui,
+            "5xx 重试次数",
+            &mut view.video_caption_retry_5xx_attempts,
+        );
+        number_u32(ui, "视频最大输出 Token", &mut view.video_caption_max_tokens);
+        number_u32(ui, "每次最多转述视频数", &mut view.video_caption_max_videos);
+        number_u32(
+            ui,
+            "视频最大并发请求数",
+            &mut view.video_caption_max_concurrent_requests,
+        );
+        number_u64(
+            ui,
+            "视频最大字节数",
+            &mut view.video_caption_max_video_bytes,
+        );
+        multiline_field(
+            ui,
+            "视频请求体覆盖(JSON)",
+            &mut view.video_caption_request_body_overrides,
+            4,
+        );
+        ui.separator();
         ui.heading("语音转写");
         ui.checkbox(&mut view.voice_transcription_enabled, "启用语音转写");
         text_field(ui, "语音 Provider", &mut view.voice_transcription_provider);
@@ -1486,6 +1539,13 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             config.image_caption.model_env,
             "IMAGE_CAPTION_MODEL",
         );
+        let video_caption_request_body_overrides =
+            request_body_overrides_to_json(&config.video_caption.request_body_overrides);
+        let (video_caption_model, video_caption_model_env) = split_model_fields(
+            config.video_caption.model,
+            config.video_caption.model_env,
+            "VIDEO_CAPTION_MODEL",
+        );
         let voice_transcription_request_body_overrides =
             request_body_overrides_to_json(&config.voice_transcription.request_body_overrides);
         let (voice_transcription_model, voice_transcription_model_env) = split_model_fields(
@@ -1566,6 +1626,28 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
                 .max_concurrent_requests
                 .min(u32::MAX as usize) as u32,
             image_caption_request_body_overrides,
+            video_caption_enabled: config.video_caption.enabled,
+            video_caption_provider: config.video_caption.provider,
+            video_caption_api_key_env: config.video_caption.api_key_env,
+            video_caption_base_url_env: config.video_caption.base_url_env,
+            video_caption_model,
+            video_caption_model_env,
+            video_caption_timeout: config.video_caption.timeout_seconds,
+            video_caption_retry_5xx_attempts: config
+                .video_caption
+                .retry_5xx_attempts
+                .min(u32::MAX as usize) as u32,
+            video_caption_max_tokens: config.video_caption.max_output_tokens,
+            video_caption_max_videos: config
+                .video_caption
+                .max_videos_per_summary
+                .min(u32::MAX as usize) as u32,
+            video_caption_max_concurrent_requests: config
+                .video_caption
+                .max_concurrent_requests
+                .min(u32::MAX as usize) as u32,
+            video_caption_max_video_bytes: config.video_caption.max_video_bytes,
+            video_caption_request_body_overrides,
             voice_transcription_enabled: config.voice_transcription.enabled,
             voice_transcription_provider: config.voice_transcription.provider,
             voice_transcription_api_key_env: config.voice_transcription.api_key_env,
@@ -1607,6 +1689,11 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         non_empty_string(get_str(doc, "image_caption", "model", "")),
         get_str(doc, "image_caption", "model_env", "IMAGE_CAPTION_MODEL"),
         "IMAGE_CAPTION_MODEL",
+    );
+    let (video_caption_model, video_caption_model_env) = split_model_fields(
+        non_empty_string(get_str(doc, "video_caption", "model", "")),
+        get_str(doc, "video_caption", "model_env", "VIDEO_CAPTION_MODEL"),
+        "VIDEO_CAPTION_MODEL",
     );
     let (voice_transcription_model, voice_transcription_model_env) = split_model_fields(
         non_empty_string(get_str(doc, "voice_transcription", "model", "")),
@@ -1724,6 +1811,45 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         image_caption_request_body_overrides: request_body_overrides_from_table_doc(
             doc,
             "image_caption",
+        ),
+        video_caption_enabled: get_bool(doc, "video_caption", "enabled", false),
+        video_caption_provider: get_str(doc, "video_caption", "provider", "stepfun"),
+        video_caption_api_key_env: get_str(
+            doc,
+            "video_caption",
+            "api_key_env",
+            "VIDEO_CAPTION_API_KEY",
+        ),
+        video_caption_base_url_env: get_str(
+            doc,
+            "video_caption",
+            "base_url_env",
+            "VIDEO_CAPTION_BASE_URL",
+        ),
+        video_caption_model,
+        video_caption_model_env,
+        video_caption_timeout: get_u64(doc, "video_caption", "timeout_seconds", 180),
+        video_caption_retry_5xx_attempts: get_u64(doc, "video_caption", "retry_5xx_attempts", 5)
+            .min(u32::MAX as u64) as u32,
+        video_caption_max_tokens: get_u64(doc, "video_caption", "max_output_tokens", 800) as u32,
+        video_caption_max_videos: get_u64(doc, "video_caption", "max_videos_per_summary", 5)
+            .min(u32::MAX as u64) as u32,
+        video_caption_max_concurrent_requests: get_u64(
+            doc,
+            "video_caption",
+            "max_concurrent_requests",
+            2,
+        )
+        .min(u32::MAX as u64) as u32,
+        video_caption_max_video_bytes: get_u64(
+            doc,
+            "video_caption",
+            "max_video_bytes",
+            134_217_728,
+        ),
+        video_caption_request_body_overrides: request_body_overrides_from_table_doc(
+            doc,
+            "video_caption",
         ),
         voice_transcription_enabled: get_bool(doc, "voice_transcription", "enabled", false),
         voice_transcription_provider: get_str(
@@ -1977,6 +2103,61 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         image_caption,
         "request_body_overrides",
         &update.image_caption_request_body_overrides,
+    )?;
+
+    let video_caption = table_mut(&mut doc, "video_caption");
+    set_bool(video_caption, "enabled", update.video_caption_enabled);
+    set_str(video_caption, "provider", &update.video_caption_provider);
+    set_str(
+        video_caption,
+        "api_key_env",
+        &update.video_caption_api_key_env,
+    );
+    set_str(
+        video_caption,
+        "base_url_env",
+        &update.video_caption_base_url_env,
+    );
+    if update.video_caption_model.trim().is_empty() {
+        remove_key(video_caption, "model");
+    } else {
+        set_str(video_caption, "model", update.video_caption_model.trim());
+    }
+    set_str(video_caption, "model_env", &update.video_caption_model_env);
+    set_int(
+        video_caption,
+        "timeout_seconds",
+        update.video_caption_timeout as i64,
+    );
+    set_int(
+        video_caption,
+        "retry_5xx_attempts",
+        update.video_caption_retry_5xx_attempts as i64,
+    );
+    set_int(
+        video_caption,
+        "max_output_tokens",
+        update.video_caption_max_tokens as i64,
+    );
+    set_int(
+        video_caption,
+        "max_videos_per_summary",
+        update.video_caption_max_videos as i64,
+    );
+    set_int(
+        video_caption,
+        "max_concurrent_requests",
+        update.video_caption_max_concurrent_requests.max(1) as i64,
+    );
+    set_int(
+        video_caption,
+        "max_video_bytes",
+        update.video_caption_max_video_bytes.min(i64::MAX as u64) as i64,
+    );
+    set_json_object_table(
+        video_caption,
+        "request_body_overrides",
+        &update.video_caption_request_body_overrides,
     )?;
 
     let voice_transcription = table_mut(&mut doc, "voice_transcription");

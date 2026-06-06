@@ -11,7 +11,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use wechat_summary_core::{
     config::{
-        ImageCaptionConfig, ImageGenConfig, LlmConfig, ProxyConfig, VoiceTranscriptionConfig,
+        ImageCaptionConfig, ImageGenConfig, LlmConfig, ProxyConfig, VideoCaptionConfig,
+        VoiceTranscriptionConfig,
     },
     ImageArtifact,
 };
@@ -569,6 +570,256 @@ pub struct OpenAiAudioTranscriptionClient {
     api_key: String,
     base_url: String,
     model: String,
+}
+
+pub struct OpenAiVideoCaptionClient {
+    config: VideoCaptionConfig,
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+impl OpenAiVideoCaptionClient {
+    pub fn new(config: VideoCaptionConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
+        let api_key = config_value_or_env(
+            config.api_key.as_deref(),
+            &config.api_key_env,
+            "video caption API key",
+        )
+        .map_err(|_| missing_api_key(&config.api_key_env))?;
+        let base_url = config_value_or_env(
+            config.base_url.as_deref(),
+            &config.base_url_env,
+            "video caption API base URL",
+        )?;
+        let model = config_value_or_env(
+            config.model.as_deref(),
+            &config.model_env,
+            "video caption model name",
+        )?;
+        let client = http_client(config.timeout_seconds, proxy)?;
+        Ok(Self {
+            config,
+            client,
+            api_key,
+            base_url,
+            model,
+        })
+    }
+
+    pub async fn caption_video(&self, video_source: &str) -> Result<String, AiError> {
+        let video_url = self.video_url_for_multimodal_request(video_source).await?;
+        self.complete_with_video_url(&video_url).await
+    }
+
+    async fn video_url_for_multimodal_request(&self, source: &str) -> Result<String, AiError> {
+        let trimmed = source.trim();
+        if trimmed.starts_with("data:") {
+            validate_video_data_url(trimmed, self.config.max_video_bytes)?;
+            return Ok(trimmed.to_string());
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return self.download_video_as_data_url(trimmed).await;
+        }
+        let path = Path::new(trimmed);
+        let bytes = fs::read(path)?;
+        video_data_url_from_bytes(Some(path), &bytes, self.config.max_video_bytes)
+    }
+
+    async fn download_video_as_data_url(&self, url: &str) -> Result<String, AiError> {
+        let source = redacted_url_source(url);
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        for attempt in 1..=max_attempts {
+            let started = Instant::now();
+            info!(
+                source = %source,
+                attempt,
+                max_attempts,
+                "video caption remote video download started"
+            );
+            let response = match self.client.get(url).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    warn!(
+                        source = %source,
+                        attempt,
+                        max_attempts,
+                        retry,
+                        retry_after_ms,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %error,
+                        "video caption remote video download transport failed"
+                    );
+                    if retry {
+                        sleep(http_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read video response body: {error}"));
+                let snippet = truncate_for_log(&body, 300);
+                let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                warn!(
+                    source = %source,
+                    status = %status,
+                    attempt,
+                    max_attempts,
+                    retry,
+                    retry_after_ms,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    response = %snippet,
+                    "video caption remote video download failed"
+                );
+                if retry {
+                    sleep(http_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(AiError::InvalidResponse(format!(
+                    "remote video download returned {status}: {snippet}"
+                )));
+            }
+            let bytes = response.bytes().await?;
+            let data_url = video_data_url_from_bytes(None, &bytes, self.config.max_video_bytes)?;
+            info!(
+                source = %source,
+                content_type = content_type.as_deref().unwrap_or("unknown"),
+                bytes = bytes.len(),
+                attempt,
+                max_attempts,
+                elapsed_ms = started.elapsed().as_millis(),
+                "video caption remote video downloaded"
+            );
+            return Ok(data_url);
+        }
+
+        unreachable!("video caption remote video download retry loop always returns")
+    }
+
+    async fn complete_with_video_url(&self, video_url: &str) -> Result<String, AiError> {
+        let endpoint = chat_completions_endpoint(&self.base_url);
+        let mut payload = video_caption_payload(
+            &self.model,
+            &self.config.system_prompt,
+            &self.config.user_prompt,
+            video_url,
+            self.config.temperature,
+            self.config.max_output_tokens,
+        );
+        apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
+
+        let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        for attempt in 1..=max_attempts {
+            let started = Instant::now();
+            info!(
+                base_url = %self.base_url,
+                model = %self.model,
+                prompt_chars = self.config.user_prompt.chars().count(),
+                max_tokens = self.config.max_output_tokens,
+                timeout_seconds = self.config.timeout_seconds,
+                attempt,
+                max_attempts,
+                video_source_kind = if video_url.starts_with("data:") { "data_url" } else { "url" },
+                "video caption request started"
+            );
+            let response = match self
+                .client
+                .post(&endpoint)
+                .bearer_auth(&self.api_key)
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
+                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    warn!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        attempt,
+                        max_attempts,
+                        retry,
+                        retry_after_ms,
+                        error = %error,
+                        "video caption transport failed"
+                    );
+                    if retry {
+                        sleep(http_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(AiError::Http(error));
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+                let snippet = truncate_for_log(&body, 500);
+                let retry = attempt < max_attempts
+                    && should_retry_chat_completion_failure(status, &snippet);
+                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                warn!(
+                    status = %status,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    attempt,
+                    max_attempts,
+                    retry,
+                    retry_after_ms,
+                    response = %snippet,
+                    "video caption request failed"
+                );
+                if retry {
+                    sleep(http_retry_delay(attempt)).await;
+                    continue;
+                }
+                let message = format!("video caption API returned {status}: {snippet}");
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(AiError::RateLimited(message));
+                }
+                return Err(AiError::InvalidResponse(message));
+            }
+
+            let body = response.text().await?;
+            let response = serde_json::from_str::<Value>(&body).map_err(|error| {
+                let snippet = truncate_for_log(&body, 500);
+                warn!(
+                    response = %snippet,
+                    "video caption JSON parsing failed"
+                );
+                AiError::InvalidResponse(format!("invalid video caption JSON: {error}"))
+            })?;
+            let content = extract_chat_completion_content(&response).ok_or_else(|| {
+                let finish_reason = chat_completion_finish_reason(&response);
+                AiError::InvalidResponse(format!(
+                    "missing video caption content (finish_reason={finish_reason})"
+                ))
+            })?;
+            info!(
+                output_chars = content.chars().count(),
+                "video caption response parsed"
+            );
+            return Ok(content);
+        }
+
+        unreachable!("video caption retry loop always returns")
+    }
 }
 
 impl OpenAiAudioTranscriptionClient {
@@ -1194,6 +1445,31 @@ fn image_caption_payload(
     })
 }
 
+fn video_caption_payload(
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    video_url: &str,
+    temperature: f32,
+    max_tokens: u32,
+) -> Value {
+    json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "video_url", "video_url": {"url": video_url}}
+                ]
+            }
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    })
+}
+
 fn image_data_url_from_bytes(path: Option<&Path>, bytes: &[u8]) -> Result<String, AiError> {
     if let Some(mime) = image_mime_type(path, bytes) {
         let encoded = general_purpose::STANDARD.encode(bytes);
@@ -1265,6 +1541,69 @@ fn validate_image_data_url(data_url: &str) -> Result<(), AiError> {
     }
 }
 
+fn video_data_url_from_bytes(
+    path: Option<&Path>,
+    bytes: &[u8],
+    max_video_bytes: u64,
+) -> Result<String, AiError> {
+    validate_video_byte_len(bytes.len(), max_video_bytes)?;
+    let mime = video_mime_type(path, bytes).ok_or_else(|| {
+        AiError::InvalidResponse(format!(
+            "unsupported video format for captioning: {}",
+            video_source_label(path)
+        ))
+    })?;
+    Ok(format!(
+        "data:{mime};base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn validate_video_data_url(data_url: &str, max_video_bytes: u64) -> Result<(), AiError> {
+    let Some((metadata, payload)) = data_url.split_once(',') else {
+        return Err(AiError::InvalidResponse(
+            "invalid video data URL for captioning".into(),
+        ));
+    };
+    let metadata = metadata.to_ascii_lowercase();
+    let supported = metadata == "data:video/mp4;base64"
+        || metadata == "data:video/quicktime;base64"
+        || metadata == "data:video/x-matroska;base64"
+        || metadata == "data:video/webm;base64";
+    if !supported {
+        return Err(AiError::InvalidResponse(format!(
+            "unsupported video data URL media type for captioning: {metadata}"
+        )));
+    }
+
+    validate_video_byte_len(estimated_base64_decoded_len(payload), max_video_bytes)
+}
+
+fn estimated_base64_decoded_len(payload: &str) -> usize {
+    let trimmed = payload.trim();
+    let non_padding = trimmed
+        .as_bytes()
+        .iter()
+        .filter(|byte| !byte.is_ascii_whitespace() && **byte != b'=')
+        .count();
+    non_padding.saturating_mul(3) / 4
+}
+
+fn validate_video_byte_len(len: usize, max_video_bytes: u64) -> Result<(), AiError> {
+    if max_video_bytes == 0 || len as u64 <= max_video_bytes {
+        return Ok(());
+    }
+    Err(AiError::InvalidResponse(format!(
+        "video caption source is too large: {} bytes > configured max_video_bytes {}",
+        len, max_video_bytes
+    )))
+}
+
+fn video_source_label(path: Option<&Path>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "downloaded video".to_string())
+}
+
 fn image_mime_type(path: Option<&Path>, bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 3 && bytes[..3] == [0xff, 0xd8, 0xff] {
         return Some("image/jpeg");
@@ -1289,6 +1628,35 @@ fn image_mime_type(path: Option<&Path>, bytes: &[u8]) -> Option<&'static str> {
         "png" => Some("image/png"),
         "gif" if gif_is_static(bytes) => Some("image/gif"),
         "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn video_mime_type(path: Option<&Path>, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand.starts_with(b"qt") {
+            return Some("video/quicktime");
+        }
+        return Some("video/mp4");
+    }
+    if bytes.len() >= 4 && bytes[..4] == [0x1a, 0x45, 0xdf, 0xa3] {
+        return Some("video/x-matroska");
+    }
+    if bytes.len() >= 4 && &bytes[..4] == b"RIFF" && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        return None;
+    }
+    match path?
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" | "m4v" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "mkv" => Some("video/x-matroska"),
+        "webm" => Some("video/webm"),
         _ => None,
     }
 }
@@ -2291,6 +2659,27 @@ mod tests {
     }
 
     #[test]
+    fn video_caption_payload_uses_video_url_content() {
+        let payload = video_caption_payload(
+            "step-3.7-flash",
+            "system",
+            "describe video",
+            "data:video/mp4;base64,AAAA",
+            0.1,
+            800,
+        );
+
+        assert_eq!(payload["model"], "step-3.7-flash");
+        assert_eq!(payload["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(payload["messages"][1]["content"][1]["type"], "video_url");
+        assert_eq!(
+            payload["messages"][1]["content"][1]["video_url"]["url"],
+            "data:video/mp4;base64,AAAA"
+        );
+        assert_eq!(payload["max_tokens"], 800);
+    }
+
+    #[test]
     fn image_caption_client_can_use_persistent_config_values() {
         let mut config = image_caption_config();
         config.api_key = Some("persisted-key".into());
@@ -2478,6 +2867,31 @@ data: {"type":"transcript.text.delta","delta":"文字"}
         assert!(validate_image_data_url("data:image/jpeg;base64,abc").is_ok());
         assert!(validate_image_data_url("data:image/png,abc").is_err());
         assert!(validate_image_data_url("data:image/bmp;base64,abc").is_err());
+    }
+
+    #[test]
+    fn video_data_url_from_bytes_accepts_mp4_magic() {
+        let data = video_data_url_from_bytes(
+            Some(std::path::Path::new("clip.mp4")),
+            b"\x00\x00\x00\x18ftypmp42",
+            128,
+        )
+        .unwrap();
+
+        assert!(data.starts_with("data:video/mp4;base64,"));
+    }
+
+    #[test]
+    fn video_data_url_from_bytes_rejects_oversized_video() {
+        let error = video_data_url_from_bytes(
+            Some(std::path::Path::new("clip.mp4")),
+            b"\x00\x00\x00\x18ftypmp42",
+            4,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("too large"));
     }
 
     #[test]

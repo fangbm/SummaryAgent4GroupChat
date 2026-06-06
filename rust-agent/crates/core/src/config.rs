@@ -49,6 +49,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub image_caption: ImageCaptionConfig,
     #[serde(default)]
+    pub video_caption: VideoCaptionConfig,
+    #[serde(default)]
     pub voice_transcription: VoiceTranscriptionConfig,
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -519,6 +521,71 @@ impl Default for ImageCaptionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct VideoCaptionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_video_caption_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_video_caption_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_video_caption_base_url_env")]
+    pub base_url_env: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_video_caption_model_env")]
+    pub model_env: String,
+    #[serde(default = "default_video_caption_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_retry_5xx_attempts")]
+    pub retry_5xx_attempts: usize,
+    #[serde(default = "default_video_caption_max_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default = "default_image_caption_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_video_caption_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_video_caption_user_prompt")]
+    pub user_prompt: String,
+    #[serde(default = "default_video_caption_max_videos")]
+    pub max_videos_per_summary: usize,
+    #[serde(default = "default_video_caption_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    #[serde(default = "default_video_caption_max_video_bytes")]
+    pub max_video_bytes: u64,
+    #[serde(default)]
+    pub request_body_overrides: BTreeMap<String, toml::Value>,
+}
+
+impl Default for VideoCaptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_video_caption_provider(),
+            api_key: None,
+            api_key_env: default_video_caption_api_key_env(),
+            base_url: None,
+            base_url_env: default_video_caption_base_url_env(),
+            model: None,
+            model_env: default_video_caption_model_env(),
+            timeout_seconds: default_video_caption_timeout(),
+            retry_5xx_attempts: default_retry_5xx_attempts(),
+            max_output_tokens: default_video_caption_max_output_tokens(),
+            temperature: default_image_caption_temperature(),
+            system_prompt: default_video_caption_system_prompt(),
+            user_prompt: default_video_caption_user_prompt(),
+            max_videos_per_summary: default_video_caption_max_videos(),
+            max_concurrent_requests: default_video_caption_max_concurrent_requests(),
+            max_video_bytes: default_video_caption_max_video_bytes(),
+            request_body_overrides: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct VoiceTranscriptionConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -721,16 +788,32 @@ fn default_voice_transcription_provider() -> String {
     "openai_compatible".to_string()
 }
 
+fn default_video_caption_provider() -> String {
+    "stepfun".to_string()
+}
+
 fn default_voice_transcription_api_key_env() -> String {
     "VOICE_TRANSCRIPTION_API_KEY".to_string()
+}
+
+fn default_video_caption_api_key_env() -> String {
+    "VIDEO_CAPTION_API_KEY".to_string()
 }
 
 fn default_voice_transcription_base_url_env() -> String {
     "VOICE_TRANSCRIPTION_BASE_URL".to_string()
 }
 
+fn default_video_caption_base_url_env() -> String {
+    "VIDEO_CAPTION_BASE_URL".to_string()
+}
+
 fn default_voice_transcription_model_env() -> String {
     "VOICE_TRANSCRIPTION_MODEL".to_string()
+}
+
+fn default_video_caption_model_env() -> String {
+    "VIDEO_CAPTION_MODEL".to_string()
 }
 
 fn default_image_timeout() -> u64 {
@@ -761,6 +844,14 @@ fn default_image_caption_max_output_tokens() -> u32 {
     500
 }
 
+fn default_video_caption_max_output_tokens() -> u32 {
+    800
+}
+
+fn default_video_caption_timeout() -> u64 {
+    180
+}
+
 fn default_image_caption_temperature() -> f32 {
     0.1
 }
@@ -771,6 +862,18 @@ fn default_image_caption_max_images() -> usize {
 
 fn default_image_caption_max_concurrent_requests() -> usize {
     4
+}
+
+fn default_video_caption_max_videos() -> usize {
+    5
+}
+
+fn default_video_caption_max_concurrent_requests() -> usize {
+    2
+}
+
+fn default_video_caption_max_video_bytes() -> u64 {
+    128 * 1024 * 1024
 }
 
 fn default_voice_transcription_language() -> String {
@@ -843,6 +946,14 @@ fn default_image_caption_system_prompt() -> String {
 
 fn default_image_caption_user_prompt() -> String {
     "请用一到三句话中文转述这张聊天图片的可见内容，适合插回聊天记录供群聊总结模型理解。".to_string()
+}
+
+fn default_video_caption_system_prompt() -> String {
+    "你是视频转述助手。请客观描述视频中的可见内容、字幕、屏幕文字和主要动作，重点提取与群聊上下文相关的信息；不要推断不可见的私人信息，不要编造。".to_string()
+}
+
+fn default_video_caption_user_prompt() -> String {
+    "请用三到六句话中文转述这个聊天视频的主要内容，适合插回聊天记录供群聊总结模型理解。".to_string()
 }
 
 fn default_log_level() -> String {

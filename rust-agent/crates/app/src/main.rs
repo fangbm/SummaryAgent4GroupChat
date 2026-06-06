@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
 use wechat_summary_ai::{
     AiError, AiRetryNotice, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm, OpenAiImageClient,
-    OpenAiVisionCaptionClient, RetryNotifier,
+    OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
 };
 use wechat_summary_core::{
     config::{PlatformKindConfig, TimeRangeMode},
@@ -1257,6 +1257,7 @@ async fn run_summary_pipeline(
     );
 
     let image_caption_count = apply_image_captions(config, &trigger.room_id, &mut history).await?;
+    let video_caption_count = apply_video_captions(config, &trigger.room_id, &mut history).await?;
     let voice_transcription_count =
         apply_voice_transcriptions(config, &trigger.room_id, &mut history).await?;
 
@@ -1300,6 +1301,15 @@ async fn run_summary_pipeline(
             &format!(
                 "image captions inserted room={} count={}",
                 trigger.room_id, image_caption_count
+            ),
+        );
+    }
+    if video_caption_count > 0 {
+        append_runtime_log(
+            config,
+            &format!(
+                "video captions inserted room={} count={}",
+                trigger.room_id, video_caption_count
             ),
         );
     }
@@ -2920,6 +2930,9 @@ fn summary_media_decode_limit(config: &AgentConfig) -> Option<usize> {
     if config.image_caption.enabled {
         limit = limit.saturating_add(config.image_caption.max_images_per_summary);
     }
+    if config.video_caption.enabled {
+        limit = limit.saturating_add(config.video_caption.max_videos_per_summary);
+    }
     if config.voice_transcription.enabled {
         limit = limit.saturating_add(config.voice_transcription.max_voices_per_summary);
     }
@@ -3140,6 +3153,206 @@ fn is_image_message_type(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "image" | "img" | "3" | "图片"
+    )
+}
+
+async fn apply_video_captions(
+    config: &AgentConfig,
+    room_id: &str,
+    history: &mut [PlatformHistoryMessage],
+) -> Result<usize> {
+    if !config.video_caption.enabled || config.video_caption.max_videos_per_summary == 0 {
+        return Ok(0);
+    }
+    let captioner = match OpenAiVideoCaptionClient::new(config.video_caption.clone(), &config.proxy)
+    {
+        Ok(client) => client,
+        Err(error) => {
+            let error = error.to_string();
+            warn!(
+                room_id = %room_id,
+                error = %error,
+                "video caption client initialization failed; continuing without captions"
+            );
+            append_runtime_log(
+                config,
+                &format!("video caption init failed room={} error={}", room_id, error),
+            );
+            return Ok(0);
+        }
+    };
+    let captioner = Arc::new(captioner);
+    let max_concurrent = config.video_caption.max_concurrent_requests.max(1);
+
+    let mut candidates = Vec::new();
+    for (history_index, message) in history.iter().enumerate() {
+        if candidates.len() >= config.video_caption.max_videos_per_summary {
+            break;
+        }
+        if !is_video_message_type(&message.msg_type) {
+            continue;
+        }
+        let Some(source) = video_caption_source(message) else {
+            if let Some(error) = message.media_decode_error.as_deref() {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "video caption skipped room={} reason=decode_failed error={}",
+                        room_id, error
+                    ),
+                );
+            }
+            continue;
+        };
+        candidates.push((history_index, candidates.len() + 1, source));
+    }
+
+    let attempted = candidates.len();
+    if attempted == 0 {
+        return Ok(0);
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "video caption batch started room={} attempted={} max_concurrent={}",
+            room_id, attempted, max_concurrent
+        ),
+    );
+
+    let mut inserted = 0usize;
+    let mut next_candidate = 0usize;
+    let mut join_set = JoinSet::new();
+    while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+        spawn_video_caption_task(
+            &mut join_set,
+            Arc::clone(&captioner),
+            &candidates[next_candidate],
+        );
+        next_candidate += 1;
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let CaptionTaskResult {
+            history_index,
+            attempted,
+            result,
+        } = joined.context("joining video caption request task")?;
+        match result {
+            Ok(caption) => {
+                let caption = caption.trim();
+                if !caption.is_empty() {
+                    history[history_index].content = format!(
+                        "{}（视频转述：{}）",
+                        history[history_index].content.trim(),
+                        caption
+                    );
+                    inserted += 1;
+                    info!(
+                        room_id = %room_id,
+                        inserted,
+                        attempted,
+                        "video caption inserted into history"
+                    );
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                warn!(
+                    room_id = %room_id,
+                    attempted,
+                    error = %error,
+                    "video caption failed; keeping video placeholder"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "video caption failed room={} attempted={} error={}",
+                        room_id, attempted, error
+                    ),
+                );
+                if is_video_caption_auth_error(&error) {
+                    warn!(
+                        room_id = %room_id,
+                        attempted,
+                        "video caption stopped after authentication failure"
+                    );
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "video caption stopped room={} reason=authentication_failed attempted={}",
+                            room_id, attempted
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+
+        while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+            spawn_video_caption_task(
+                &mut join_set,
+                Arc::clone(&captioner),
+                &candidates[next_candidate],
+            );
+            next_candidate += 1;
+        }
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "video caption completed room={} attempted={} inserted={}",
+            room_id, attempted, inserted
+        ),
+    );
+    Ok(inserted)
+}
+
+fn spawn_video_caption_task(
+    join_set: &mut JoinSet<CaptionTaskResult>,
+    captioner: Arc<OpenAiVideoCaptionClient>,
+    candidate: &(usize, usize, String),
+) {
+    let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
+    join_set.spawn(async move {
+        CaptionTaskResult {
+            history_index,
+            attempted,
+            result: captioner.caption_video(&source).await,
+        }
+    });
+}
+
+fn is_video_caption_auth_error(error: &str) -> bool {
+    is_image_caption_auth_error(error)
+}
+
+fn video_caption_source(message: &PlatformHistoryMessage) -> Option<String> {
+    message
+        .decoded_media_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            message
+                .media_path
+                .as_deref()
+                .filter(|path| {
+                    let path = path.trim();
+                    path.starts_with("http://")
+                        || path.starts_with("https://")
+                        || path.starts_with("data:")
+                        || !path.is_empty()
+                })
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn is_video_message_type(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "video" | "视频" | "43"
     )
 }
 

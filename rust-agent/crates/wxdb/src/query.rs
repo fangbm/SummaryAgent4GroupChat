@@ -648,6 +648,24 @@ fn query_messages(
                     None
                 }
             }
+            43 => {
+                stats.video_messages += 1;
+                if consume_media_decode_budget(media_decode_remaining) {
+                    stats.media_decode_attempts += 1;
+                    let media = resolve_video_media(
+                        image_resolver,
+                        account_root,
+                        media_cache_dir,
+                        chat_username,
+                        timestamp,
+                    );
+                    record_media_decode_stats(&mut stats, &media);
+                    media
+                } else {
+                    stats.media_decode_skipped_budget += 1;
+                    None
+                }
+            }
             _ => None,
         };
         stats.messages_kept += 1;
@@ -692,6 +710,7 @@ fn query_messages(
         messages = stats.messages_kept,
         image_messages = stats.image_messages,
         voice_messages = stats.voice_messages,
+        video_messages = stats.video_messages,
         media_decode_attempts = stats.media_decode_attempts,
         media_decode_success = stats.media_decode_success,
         media_decode_errors = stats.media_decode_errors,
@@ -714,6 +733,7 @@ struct QueryMessageStats {
     messages_kept: usize,
     image_messages: usize,
     voice_messages: usize,
+    video_messages: usize,
     media_decode_attempts: usize,
     media_decode_success: usize,
     media_decode_errors: usize,
@@ -943,6 +963,91 @@ fn resolve_voice_media(
     })
 }
 
+fn resolve_video_media(
+    resolver: &mut ImageResolveContext,
+    account_root: Option<&Path>,
+    media_cache_dir: &Path,
+    chat_username: &str,
+    timestamp: i64,
+) -> Option<ImageMedia> {
+    let account_root = account_root?;
+    let chat_hash = format!("{:x}", md5::compute(chat_username.as_bytes()));
+    let month = Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m").to_string())?;
+    let mut candidates = Vec::new();
+
+    for leaf in ["Video", "video", "Media", "media", "File", "file"] {
+        resolver.collect_nearby_files(
+            &account_root
+                .join("msg")
+                .join("attach")
+                .join(&chat_hash)
+                .join(&month)
+                .join(leaf),
+            timestamp,
+            &mut candidates,
+        );
+        resolver.collect_nearby_files(
+            &account_root
+                .join("temp")
+                .join(&chat_hash)
+                .join(&month)
+                .join(leaf),
+            timestamp,
+            &mut candidates,
+        );
+        resolver.collect_nearby_files(
+            &account_root
+                .join("cache")
+                .join(&month)
+                .join("Message")
+                .join(&chat_hash)
+                .join(leaf),
+            timestamp,
+            &mut candidates,
+        );
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    let preferred = candidates
+        .iter()
+        .filter(|path| is_video_candidate(path))
+        .min_by_key(|path| media_candidate_score(path, timestamp, None))
+        .cloned()
+        .or_else(|| {
+            candidates
+                .iter()
+                .min_by_key(|path| media_candidate_score(path, timestamp, None))
+                .cloned()
+        });
+    let decode_result = decode_first_video_candidate(
+        account_root,
+        media_cache_dir,
+        preferred.as_ref(),
+        &candidates,
+    );
+    let (decoded_path, decoder, decode_error) = match decode_result {
+        Ok(Some(decoded)) => (
+            Some(decoded.path),
+            Some(decoded.decoder.to_string()),
+            None::<String>,
+        ),
+        Ok(None) => (None, None, None),
+        Err(error) => (None, None, Some(error.to_string())),
+    };
+    (!candidates.is_empty()).then_some(ImageMedia {
+        media_path: preferred,
+        thumbnail_path: None,
+        candidates,
+        decoded_path,
+        decoder,
+        decode_error,
+    })
+}
+
 fn decode_first_media_candidate(
     account_root: &Path,
     media_cache_dir: &Path,
@@ -971,6 +1076,46 @@ fn decode_first_media_candidate(
     for path in paths {
         match media::decode_media_to_cache(path, Some(account_root), media_cache_dir) {
             Ok(decoded) if is_caption_friendly_image_format(decoded.format) => {
+                return Ok(Some(decoded))
+            }
+            Ok(decoded) => {
+                if fallback.is_none() {
+                    fallback = Some(decoded);
+                }
+            }
+            Err(error) => errors.push(format!("{}: {error:#}", path.display())),
+        }
+    }
+    if fallback.is_some() {
+        return Ok(fallback);
+    }
+    anyhow::bail!("{}", errors.join(" | "))
+}
+
+fn decode_first_video_candidate(
+    account_root: &Path,
+    media_cache_dir: &Path,
+    preferred: Option<&PathBuf>,
+    candidates: &[PathBuf],
+) -> Result<Option<media::DecodedMedia>> {
+    let mut paths = Vec::<&PathBuf>::new();
+    if let Some(path) = preferred {
+        paths.push(path);
+    }
+    for path in candidates {
+        if !paths.iter().any(|known| *known == path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut errors = Vec::new();
+    let mut fallback = None;
+    for path in paths {
+        match media::decode_media_to_cache(path, Some(account_root), media_cache_dir) {
+            Ok(decoded) if is_caption_friendly_video_format(decoded.format) => {
                 return Ok(Some(decoded))
             }
             Ok(decoded) => {
@@ -1018,6 +1163,10 @@ fn decode_first_voice_candidate(
 
 fn is_caption_friendly_image_format(format: &str) -> bool {
     matches!(format, "jpg" | "png" | "gif" | "webp" | "bmp")
+}
+
+fn is_caption_friendly_video_format(format: &str) -> bool {
+    matches!(format, "mp4" | "mov" | "mkv" | "webm" | "m4v")
 }
 
 fn has_full_size_candidate(paths: &[PathBuf]) -> bool {
@@ -1113,11 +1262,29 @@ fn is_media_candidate_name(path: &Path) -> bool {
         || name.ends_with(".aac")
         || name.ends_with(".ogg")
         || name.ends_with(".flac")
+        || name.ends_with(".mp4")
+        || name.ends_with(".m4v")
+        || name.ends_with(".mov")
+        || name.ends_with(".mkv")
+        || name.ends_with(".webm")
         || name.ends_with(".jpg")
         || name.ends_with(".jpeg")
         || name.ends_with(".png")
         || name.ends_with(".gif")
         || name.ends_with(".webp")
+}
+
+fn is_video_candidate(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".mp4")
+        || name.ends_with(".m4v")
+        || name.ends_with(".mov")
+        || name.ends_with(".mkv")
+        || name.ends_with(".webm")
 }
 
 fn is_thumbnail_candidate(path: &Path) -> bool {
@@ -1443,6 +1610,14 @@ mod tests {
         assert!(is_media_candidate_name(Path::new("msg.silk")));
         assert!(is_media_candidate_name(Path::new("msg.amr")));
         assert!(is_media_candidate_name(Path::new("msg.wav")));
+    }
+
+    #[test]
+    fn media_candidate_names_include_video_files() {
+        assert!(is_media_candidate_name(Path::new("clip.mp4")));
+        assert!(is_media_candidate_name(Path::new("clip.mov")));
+        assert!(is_media_candidate_name(Path::new("clip.mkv")));
+        assert!(is_video_candidate(Path::new("clip.webm")));
     }
 
     #[test]
