@@ -843,7 +843,7 @@ async fn handle_platform_event(
         return Ok(());
     };
 
-    if recent_trigger_attempts.is_duplicate(&trigger, Utc::now()) {
+    if recent_trigger_attempts.is_duplicate(&trigger, incoming.timestamp) {
         info!(
             room_id = %trigger.room_id,
             trigger_content = %trigger.trigger_content,
@@ -4741,6 +4741,21 @@ mod tests {
             &trigger,
             now + Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS + 1)
         ));
+    }
+
+    #[test]
+    fn recent_trigger_attempts_reject_out_of_order_duplicate_trigger() {
+        let mut attempts = RecentTriggerAttempts::default();
+        let trigger = TriggerMatch {
+            room_id: "room-a".into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结 5h".into(),
+        };
+        let wx4py_seen_at = Utc.with_ymd_and_hms(2026, 6, 7, 12, 33, 34).unwrap();
+        let wxdb_seen_at = wx4py_seen_at - Duration::seconds(1);
+
+        assert!(!attempts.is_duplicate(&trigger, wx4py_seen_at));
+        assert!(attempts.is_duplicate(&trigger, wxdb_seen_at));
     }
 
     #[test]
