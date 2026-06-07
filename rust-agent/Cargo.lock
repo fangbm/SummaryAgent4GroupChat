@@ -4915,6 +4915,7 @@ dependencies = [
  "wechat-summary-ai",
  "wechat-summary-core",
  "wechat-summary-storage",
+ "wechat-summary-wxdb",
  "wx4py-client",
 ]
 

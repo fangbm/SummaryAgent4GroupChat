@@ -16,4 +16,5 @@ tracing-subscriber.workspace = true
 wechat-summary-ai = { path = "../ai" }
 wechat-summary-core = { path = "../core" }
 wechat-summary-storage = { path = "../storage" }
+wechat-summary-wxdb = { path = "../wxdb" }
 wx4py-client = { path = "../wx4py-client" }

@@ -1,11 +1,12 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{mpsc, Arc},
+    thread,
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
@@ -36,6 +37,9 @@ use crate::platform::{PlatformClient, PlatformEvent, PlatformHistoryMessage, Pla
 const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
 const RECENT_OBSERVED_WINDOW_HOURS: i64 = 6;
 const RECENT_OBSERVED_MAX_MESSAGES: usize = 5_000;
+const WXDB_COMMAND_WATCH_INTERVAL_SECONDS: u64 = 3;
+const WXDB_COMMAND_WATCH_LOOKBACK_SECONDS: i64 = 300;
+const WXDB_COMMAND_WATCH_LIMIT: usize = 300;
 const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
 const LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS: u64 = 60;
 const LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS: usize = 3;
@@ -82,6 +86,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
 
     let store = SqliteStateStore::open(&config.storage.sqlite_path)
         .with_context(|| format!("opening state store {}", config.storage.sqlite_path))?;
+    let wxdb_command_watcher = WxdbCommandWatcher::start(config);
     let client = PlatformClient::start(config)
         .await
         .with_context(|| format!("starting {} platform client", config.platform.kind.as_str()))?;
@@ -138,6 +143,22 @@ async fn run_agent(config_path: &str) -> Result<()> {
             }
         }
 
+        while let Some(event) = wxdb_command_watcher.try_recv() {
+            reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run)?;
+            let config = config_reloader.config();
+            let matcher = config_reloader.matcher();
+            handle_platform_event(
+                config,
+                &store,
+                matcher,
+                &client,
+                &mut recent_trigger_attempts,
+                &mut recent_observed_messages,
+                event,
+            )
+            .await?;
+        }
+
         if let Some(event) = client.next_event_timeout(StdDuration::from_secs(1))? {
             reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run)?;
             let config = config_reloader.config();
@@ -186,6 +207,215 @@ fn reload_config_if_changed(
     }
 
     Ok(())
+}
+
+struct WxdbCommandWatcher {
+    receiver: Option<mpsc::Receiver<PlatformEvent>>,
+}
+
+impl WxdbCommandWatcher {
+    fn start(config: &AgentConfig) -> Self {
+        if !wxdb_command_watcher_enabled(config) {
+            return Self { receiver: None };
+        }
+
+        let rooms = configured_wx_rooms(config);
+        if rooms.is_empty() {
+            append_runtime_log(config, "wxdb command watcher skipped no wx rooms");
+            return Self { receiver: None };
+        }
+
+        let config = config.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || run_wxdb_command_watcher(config, rooms, sender));
+        Self {
+            receiver: Some(receiver),
+        }
+    }
+
+    fn try_recv(&self) -> Option<PlatformEvent> {
+        let receiver = self.receiver.as_ref()?;
+        match receiver.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => None,
+        }
+    }
+}
+
+fn wxdb_command_watcher_enabled(config: &AgentConfig) -> bool {
+    config.platform.kind == PlatformKindConfig::Wx4py
+        && matches!(
+            config
+                .wx_cli
+                .executable
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "builtin" | "internal" | "wxdb-builtin"
+        )
+}
+
+fn configured_wx_rooms(config: &AgentConfig) -> Vec<String> {
+    let rooms = if config.wx4py.groups.is_empty() {
+        &config.listen.whitelist_rooms
+    } else {
+        &config.wx4py.groups
+    };
+    rooms
+        .iter()
+        .map(|room| room.trim())
+        .filter(|room| !room.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn run_wxdb_command_watcher(
+    config: AgentConfig,
+    rooms: Vec<String>,
+    sender: mpsc::Sender<PlatformEvent>,
+) {
+    let matcher = match TriggerMatcher::new(config.listen.clone()) {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            append_runtime_log(
+                &config,
+                &format!("wxdb command watcher failed building matcher error={error}"),
+            );
+            return;
+        }
+    };
+
+    append_runtime_log(
+        &config,
+        &format!(
+            "wxdb command watcher started rooms={:?} interval_seconds={} lookback_seconds={}",
+            rooms, WXDB_COMMAND_WATCH_INTERVAL_SECONDS, WXDB_COMMAND_WATCH_LOOKBACK_SECONDS
+        ),
+    );
+
+    let mut seen = HashSet::new();
+    loop {
+        let now = Utc::now();
+        let since = now - Duration::seconds(WXDB_COMMAND_WATCH_LOOKBACK_SECONDS);
+        for room in &rooms {
+            match poll_wxdb_command_room(&config, &matcher, room, since, now, &mut seen) {
+                Ok(events) => {
+                    for event in events {
+                        if sender.send(event).is_err() {
+                            append_runtime_log(
+                                &config,
+                                "wxdb command watcher stopped because receiver closed",
+                            );
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    append_runtime_log(
+                        &config,
+                        &format!(
+                            "wxdb command watcher poll failed room={} error={error:#}",
+                            room
+                        ),
+                    );
+                }
+            }
+        }
+        thread::sleep(StdDuration::from_secs(WXDB_COMMAND_WATCH_INTERVAL_SECONDS));
+    }
+}
+
+fn poll_wxdb_command_room(
+    config: &AgentConfig,
+    matcher: &TriggerMatcher,
+    room: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    seen: &mut HashSet<String>,
+) -> Result<Vec<PlatformEvent>> {
+    let chat_name = config
+        .wx_cli
+        .group_name_map
+        .get(room)
+        .map(String::as_str)
+        .unwrap_or(room);
+    let result = wechat_summary_wxdb::query_history(wechat_summary_wxdb::HistoryQuery {
+        chat_name: chat_name.to_string(),
+        since: Some(since),
+        until: Some(until),
+        limit: WXDB_COMMAND_WATCH_LIMIT,
+        text_only: true,
+        msg_types: vec!["text".to_string()],
+        media_decode_limit: Some(0),
+    })
+    .with_context(|| format!("querying wxdb command watcher history for {chat_name}"))?;
+
+    let mut latest_by_room: HashMap<String, PlatformEvent> = HashMap::new();
+    for message in result.messages {
+        let key = wxdb_seen_message_key(chat_name, &message);
+        if seen.contains(&key) {
+            continue;
+        }
+        let Some(timestamp) = Utc.timestamp_opt(message.timestamp, 0).single() else {
+            continue;
+        };
+        let content = message.content.trim().to_string();
+        if content.is_empty() || is_agent_status_content(&content) {
+            continue;
+        }
+        let incoming = IncomingMessage {
+            room_id: room.to_string(),
+            room_name: Some(chat_name.to_string()),
+            sender_id: message
+                .sender_username
+                .clone()
+                .filter(|sender| !sender.is_empty())
+                .unwrap_or_else(|| message.sender.clone()),
+            sender_name: (!message.sender.is_empty()).then_some(message.sender.clone()),
+            content: content.clone(),
+            msg_type: "text".to_string(),
+            timestamp,
+            is_self: false,
+        };
+        if matcher.match_message(&incoming).is_none() {
+            continue;
+        }
+        seen.insert(key);
+        let event = PlatformEvent {
+            room_id: incoming.room_id,
+            room_name: incoming.room_name,
+            sender_id: incoming.sender_id,
+            sender_name: incoming.sender_name,
+            content: incoming.content,
+            msg_type: incoming.msg_type,
+            timestamp: incoming.timestamp,
+            is_self: incoming.is_self,
+        };
+        latest_by_room.insert(event.room_id.clone(), event);
+    }
+
+    let mut events = latest_by_room.into_values().collect::<Vec<_>>();
+    events.sort_by_key(|event| event.timestamp);
+    for event in &events {
+        append_runtime_log(
+            config,
+            &format!(
+                "wxdb command watcher recovered trigger room={} ts={} content={:?}",
+                event.room_id, event.timestamp, event.content
+            ),
+        );
+    }
+    Ok(events)
+}
+
+fn wxdb_seen_message_key(chat_name: &str, message: &wechat_summary_wxdb::HistoryMessage) -> String {
+    if let Some(local_id) = message.local_id {
+        return format!("{chat_name}:local:{local_id}");
+    }
+    format!(
+        "{}:fallback:{}:{}:{}",
+        chat_name, message.timestamp, message.sender, message.content
+    )
 }
 
 struct ConfigReloader {

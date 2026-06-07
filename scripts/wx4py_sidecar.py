@@ -551,7 +551,11 @@ class Wx4pySidecar:
                 registry = getattr(self.client, "outgoing_registry", None)
                 if registry:
                     registry.record(room, text)
-                if self.client.chat_window.send_message(text):
+                ok = self.client.chat_window.send_message(text)
+                diag_log(
+                    f"send_text_guarded result target={room!r} attempt={attempt} ok={ok}"
+                )
+                if ok:
                     return True
             except Exception as exc:
                 diag_log(f"send_text_guarded failed target={room!r}: {type(exc).__name__}: {exc}")
@@ -565,7 +569,11 @@ class Wx4pySidecar:
                 diag_log(f"send_image_guarded target={room!r} attempt={attempt}")
                 if not self.open_chat_guarded(room):
                     continue
-                if self.client.chat_window.send_file(str(path)):
+                ok = self.client.chat_window.send_file(str(path))
+                diag_log(
+                    f"send_image_guarded result target={room!r} attempt={attempt} ok={ok}"
+                )
+                if ok:
                     return True
             except Exception as exc:
                 diag_log(f"send_image_guarded failed target={room!r}: {type(exc).__name__}: {exc}")
