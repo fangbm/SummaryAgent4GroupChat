@@ -13,7 +13,8 @@ groups = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galg
 # Bot token is read from this environment variable unless token is set directly.
 token_env = "DISCORD_BOT_TOKEN"
 # Discord channels must be channel IDs, for example ["123456789012345678"].
-# Empty means scheduled summaries use numeric channel IDs from listen.whitelist_rooms.
+# Non-empty channels are automatically accepted by the trigger matcher and used by scheduled summaries.
+# Empty means the Discord adapter falls back to numeric channel IDs from listen.whitelist_rooms.
 channels = []
 
 [listen]

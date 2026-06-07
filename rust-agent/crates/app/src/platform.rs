@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     sync::{
         mpsc::{self, Receiver, RecvTimeoutError},
@@ -149,10 +150,18 @@ impl DiscordPlatform {
     async fn start(config: &AgentConfig) -> Result<Self> {
         let token = discord_token(config)?;
         let (sender, receiver) = mpsc::channel();
+        let allowed_channels = discord_rooms(config).into_iter().collect::<HashSet<_>>();
         let handler = DiscordHandler {
             sender: sender.clone(),
+            allowed_channels: allowed_channels.clone(),
         };
-        let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
+        tracing::info!(
+            channels = ?allowed_channels,
+            "starting Discord gateway client"
+        );
+        let intents = GatewayIntents::GUILD_MESSAGES
+            | GatewayIntents::DIRECT_MESSAGES
+            | GatewayIntents::MESSAGE_CONTENT;
         let mut client = Client::builder(&token, intents)
             .event_handler(handler)
             .await
@@ -235,7 +244,7 @@ impl DiscordPlatform {
                 if content.trim().is_empty() {
                     continue;
                 }
-                let image_url = discord_image_attachment_url(message);
+                let media_url = discord_media_attachment_url(message);
 
                 collected.push(PlatformHistoryMessage {
                     timestamp,
@@ -243,7 +252,7 @@ impl DiscordPlatform {
                     sender_name: Some(message.author.name.clone()),
                     content,
                     msg_type: discord_message_msg_type(message).to_string(),
-                    media_path: image_url,
+                    media_path: media_url,
                     decoded_media_path: None,
                     media_decode_error: None,
                     thumbnail_path: None,
@@ -308,12 +317,17 @@ impl DiscordSender {
 
 struct DiscordHandler {
     sender: mpsc::Sender<DiscordInbound>,
+    allowed_channels: HashSet<String>,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
     async fn message(&self, ctx: SerenityContext, message: Message) {
         if message.author.bot {
+            return;
+        }
+        let channel_id = message.channel_id.to_string();
+        if !self.allowed_channels.is_empty() && !self.allowed_channels.contains(&channel_id) {
             return;
         }
 
@@ -325,6 +339,7 @@ impl EventHandler for DiscordHandler {
 
         let room_name = message.channel_id.name(&ctx.http).await.ok();
         let event = PlatformEvent {
+            platform: PlatformKindConfig::Discord,
             room_id: message.channel_id.to_string(),
             room_name,
             sender_id: message.author.id.to_string(),
@@ -340,6 +355,7 @@ impl EventHandler for DiscordHandler {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PlatformEvent {
+    pub platform: PlatformKindConfig,
     pub room_id: String,
     pub room_name: Option<String>,
     pub sender_id: String,
@@ -354,6 +370,7 @@ impl PlatformEvent {
     fn from_wx4py(event: Wx4pyEvent) -> Option<Self> {
         let timestamp = event.timestamp()?;
         Some(Self {
+            platform: PlatformKindConfig::Wx4py,
             room_id: event.room_id,
             room_name: event.room_name,
             sender_id: event.sender_id.unwrap_or_else(|| "unknown".to_string()),
@@ -457,24 +474,36 @@ fn discord_message_content(message: &Message) -> String {
 fn discord_message_msg_type(message: &Message) -> &'static str {
     if message.attachments.iter().any(is_discord_image_attachment) {
         "image"
+    } else if message.attachments.iter().any(is_discord_video_attachment) {
+        "video"
+    } else if message.attachments.iter().any(is_discord_audio_attachment) {
+        "voice"
     } else {
         "text"
     }
 }
 
-fn discord_image_attachment_url(message: &Message) -> Option<String> {
+fn discord_media_attachment_url(message: &Message) -> Option<String> {
     message
         .attachments
         .iter()
-        .find(|attachment| is_discord_image_attachment(attachment))
+        .find(|attachment| {
+            is_discord_image_attachment(attachment)
+                || is_discord_video_attachment(attachment)
+                || is_discord_audio_attachment(attachment)
+        })
         .map(|attachment| attachment.url.clone())
 }
 
 fn discord_attachment_tag(attachment: &Attachment) -> String {
     if is_discord_image_attachment(attachment) {
         format!("[图片:{} {}]", attachment.filename, attachment.url)
+    } else if is_discord_video_attachment(attachment) {
+        format!("[视频:{} {}]", attachment.filename, attachment.url)
+    } else if is_discord_audio_attachment(attachment) {
+        format!("[语音:{} {}]", attachment.filename, attachment.url)
     } else {
-        format!("[附件:{}]", attachment.filename)
+        format!("[附件:{} {}]", attachment.filename, attachment.url)
     }
 }
 
@@ -508,6 +537,51 @@ fn has_image_extension(filename: &str) -> bool {
             .to_ascii_lowercase()
             .as_str(),
         "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "avif"
+    )
+}
+
+fn is_discord_video_attachment(attachment: &Attachment) -> bool {
+    is_discord_video_attachment_parts(&attachment.filename, attachment.content_type.as_deref())
+}
+
+fn is_discord_video_attachment_parts(filename: &str, content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|content_type| content_type.to_ascii_lowercase().starts_with("video/"))
+        || has_video_extension(filename)
+}
+
+fn has_video_extension(filename: &str) -> bool {
+    matches!(
+        filename
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi"
+    )
+}
+
+fn is_discord_audio_attachment(attachment: &Attachment) -> bool {
+    is_discord_audio_attachment_parts(&attachment.filename, attachment.content_type.as_deref())
+        || attachment.duration_secs.is_some()
+}
+
+fn is_discord_audio_attachment_parts(filename: &str, content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|content_type| {
+        let content_type = content_type.to_ascii_lowercase();
+        content_type.starts_with("audio/") || content_type == "application/ogg"
+    }) || has_audio_extension(filename)
+}
+
+fn has_audio_extension(filename: &str) -> bool {
+    matches!(
+        filename
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "mp3" | "m4a" | "wav" | "ogg" | "oga" | "opus" | "flac" | "aac" | "amr" | "silk"
     )
 }
 
@@ -648,6 +722,23 @@ mod tests {
             None,
             None
         ));
+    }
+
+    #[test]
+    fn discord_video_and_audio_attachment_detection_accept_mime_and_extension() {
+        assert!(is_discord_video_attachment_parts(
+            "clip.bin",
+            Some("video/mp4")
+        ));
+        assert!(is_discord_video_attachment_parts("clip.webm", None));
+        assert!(!is_discord_video_attachment_parts("clip.txt", None));
+
+        assert!(is_discord_audio_attachment_parts(
+            "voice.bin",
+            Some("audio/ogg")
+        ));
+        assert!(is_discord_audio_attachment_parts("voice.opus", None));
+        assert!(!is_discord_audio_attachment_parts("voice.txt", None));
     }
 
     #[test]

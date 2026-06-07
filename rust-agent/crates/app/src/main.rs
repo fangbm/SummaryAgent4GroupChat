@@ -25,7 +25,7 @@ use wechat_summary_ai::{
     OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
 };
 use wechat_summary_core::{
-    config::{PlatformKindConfig, TimeRangeMode},
+    config::{ListenConfig, PlatformKindConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
     parse_command_time_range_minutes, AgentConfig, ChatFormatter, PrivacyFilter, ResolvedTimeRange,
     TimeRangeCalculator, TriggerMatch, TriggerMatcher,
@@ -274,7 +274,7 @@ fn run_wxdb_command_watcher(
     rooms: Vec<String>,
     sender: mpsc::Sender<PlatformEvent>,
 ) {
-    let matcher = match TriggerMatcher::new(config.listen.clone()) {
+    let matcher = match TriggerMatcher::new(effective_listen_config(&config)) {
         Ok(matcher) => matcher,
         Err(error) => {
             append_runtime_log(
@@ -382,6 +382,7 @@ fn poll_wxdb_command_room(
         }
         seen.insert(key);
         let event = PlatformEvent {
+            platform: PlatformKindConfig::Wx4py,
             room_id: incoming.room_id,
             room_name: incoming.room_name,
             sender_id: incoming.sender_id,
@@ -431,8 +432,8 @@ impl ConfigReloader {
         let path = PathBuf::from(config_path);
         let config = AgentConfig::from_path(&path)
             .with_context(|| format!("loading config {}", path.display()))?;
-        let matcher =
-            TriggerMatcher::new(config.listen.clone()).context("building trigger matcher")?;
+        let matcher = TriggerMatcher::new(effective_listen_config(&config))
+            .context("building trigger matcher")?;
         let last_modified = config_modified_time(&path);
         Ok(Self {
             path,
@@ -474,7 +475,7 @@ impl ConfigReloader {
                 return Ok(false);
             }
         };
-        let matcher = match TriggerMatcher::new(config.listen.clone()) {
+        let matcher = match TriggerMatcher::new(effective_listen_config(&config)) {
             Ok(matcher) => matcher,
             Err(error) => {
                 self.last_failed_modified = modified;
@@ -513,6 +514,29 @@ fn config_modified_time(path: &Path) -> Option<SystemTime> {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
+}
+
+fn effective_listen_config(config: &AgentConfig) -> ListenConfig {
+    let mut listen = config.listen.clone();
+    match config.platform.kind {
+        PlatformKindConfig::Wx4py => {
+            extend_unique_rooms(&mut listen.whitelist_rooms, &config.wx4py.groups)
+        }
+        PlatformKindConfig::Discord => {
+            extend_unique_rooms(&mut listen.whitelist_rooms, &config.discord.channels)
+        }
+    }
+    listen
+}
+
+fn extend_unique_rooms(target: &mut Vec<String>, rooms: &[String]) {
+    for room in rooms {
+        let room = room.trim();
+        if room.is_empty() || target.iter().any(|existing| existing.trim() == room) {
+            continue;
+        }
+        target.push(room.to_string());
+    }
 }
 
 fn refresh_wxdb_keys_on_start(config: &AgentConfig) {
@@ -787,8 +811,10 @@ async fn handle_platform_event(
     recent_observed_messages: &mut RecentObservedMessages,
     event: PlatformEvent,
 ) -> Result<()> {
+    let source_platform = event.platform;
     let event_preview = event.content.chars().take(40).collect::<String>();
     info!(
+        platform = source_platform.as_str(),
         room_id = ?event.room_id,
         content_len = event.content.chars().count(),
         content_preview = %event_preview,
@@ -797,7 +823,8 @@ async fn handle_platform_event(
     append_runtime_log(
         config,
         &format!(
-            "event room={:?} len={} preview={:?}",
+            "event platform={} room={:?} len={} preview={:?}",
+            source_platform.as_str(),
             event.room_id,
             event.content.chars().count(),
             event_preview
@@ -833,11 +860,11 @@ async fn handle_platform_event(
         return Ok(());
     }
 
-    let command = parse_summary_command(&trigger, client.kind());
+    let command = parse_summary_command(&trigger, source_platform);
     if !client.supports(command.target_platform) {
         let message = format!(
             "暂不支持从 {} 总结 {} 平台消息。当前已接入的平台：{}。",
-            client.kind().as_str(),
+            source_platform.as_str(),
             command.target_platform.as_str(),
             client.kind().as_str()
         );
@@ -846,7 +873,7 @@ async fn handle_platform_event(
             &format!(
                 "unsupported target platform room={} source_platform={} target_platform={}",
                 trigger.room_id,
-                client.kind().as_str(),
+                source_platform.as_str(),
                 command.target_platform.as_str()
             ),
         );
@@ -912,7 +939,7 @@ async fn handle_platform_event(
 
     info!(
         room_id = %trigger.room_id,
-        source_platform = client.kind().as_str(),
+        source_platform = source_platform.as_str(),
         target_platform = command.target_platform.as_str(),
         since = %range.since,
         until = %range.until,
@@ -925,7 +952,7 @@ async fn handle_platform_event(
         &format!(
             "trigger accepted room={} source_platform={} target_platform={} since={} until={} command_range_minutes={:?} image_token_present={}",
             trigger.room_id,
-            client.kind().as_str(),
+            source_platform.as_str(),
             command.target_platform.as_str(),
             range.since,
             range.until,
@@ -4845,6 +4872,53 @@ mod tests {
             scheduled_rooms(&config, &["平台群".to_string()]),
             vec!["定时群".to_string()]
         );
+    }
+
+    #[test]
+    fn effective_listen_config_includes_discord_channels() {
+        let mut config = test_config();
+        config.platform.kind = PlatformKindConfig::Discord;
+        config.listen.whitelist_rooms = vec!["微信群".to_string()];
+        config.discord.channels = vec!["123456789012345678".to_string()];
+
+        let matcher = TriggerMatcher::new(effective_listen_config(&config)).unwrap();
+        let message = IncomingMessage {
+            room_id: "123456789012345678".to_string(),
+            room_name: Some("general".to_string()),
+            sender_id: "user".to_string(),
+            sender_name: Some("user".to_string()),
+            content: "/总结".to_string(),
+            msg_type: "text".to_string(),
+            timestamp: Utc::now(),
+            is_self: false,
+        };
+
+        assert!(matcher.match_message(&message).is_some());
+
+        let mut other_channel = message;
+        other_channel.room_id = "234567890123456789".to_string();
+        assert!(matcher.match_message(&other_channel).is_none());
+    }
+
+    #[test]
+    fn effective_listen_config_includes_wx_groups() {
+        let mut config = test_config();
+        config.listen.whitelist_rooms = vec!["别的群".to_string()];
+        config.wx4py.groups = vec!["测试群".to_string()];
+
+        let matcher = TriggerMatcher::new(effective_listen_config(&config)).unwrap();
+        let message = IncomingMessage {
+            room_id: "测试群".to_string(),
+            room_name: Some("测试群".to_string()),
+            sender_id: "user".to_string(),
+            sender_name: Some("user".to_string()),
+            content: "/总结".to_string(),
+            msg_type: "text".to_string(),
+            timestamp: Utc::now(),
+            is_self: false,
+        };
+
+        assert!(matcher.match_message(&message).is_some());
     }
 
     #[test]
