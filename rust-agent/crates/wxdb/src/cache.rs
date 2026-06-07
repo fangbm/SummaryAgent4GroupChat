@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use crate::config;
@@ -44,6 +45,8 @@ pub struct DbCache {
     keys: HashMap<String, String>,
     entries: HashMap<String, CacheEntry>,
 }
+
+static CACHE_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 impl DbCache {
     pub fn new(
@@ -94,37 +97,53 @@ impl DbCache {
         };
         let enc_key = crypto::hex_to_32bytes(&enc_key_hex)
             .with_context(|| format!("密钥格式错误: {rel_key}"))?;
-        let cached = self.entries.get(rel_key).cloned();
+        let out_path = self.cache_file_path(rel_key, db_mtime, wal_mtime);
+        let cache_lock = cache_file_lock(&out_path);
+        let _cache_guard = cache_lock.lock().unwrap();
+        self.load_persistent();
+        if out_path.exists() {
+            self.entries.insert(
+                rel_key.to_string(),
+                CacheEntry {
+                    db_mtime,
+                    wal_mtime,
+                    decrypted_path: out_path.clone(),
+                },
+            );
+            self.save_persistent();
+            return Ok(Some(CacheResolve {
+                path: out_path,
+                mode: CacheMode::CacheHit,
+                warning: None,
+            }));
+        }
 
-        if let Some(entry) = cached {
+        let cached = self.entries.get(rel_key).cloned();
+        if let Some(entry) = cached.clone() {
             if entry.db_mtime == db_mtime && entry.decrypted_path.exists() {
-                if entry.wal_mtime == wal_mtime {
-                    return Ok(Some(CacheResolve {
-                        path: entry.decrypted_path,
-                        mode: CacheMode::CacheHit,
-                        warning: None,
-                    }));
-                }
-                match apply_wal_to_cached(&wal_path, &entry.decrypted_path, &enc_key) {
-                    Ok(()) => {
+                match self.publish_from_cached_entry(
+                    rel_key, &entry, &out_path, &wal_path, &enc_key, wal_mtime,
+                ) {
+                    Ok(mode) => {
                         self.entries.insert(
                             rel_key.to_string(),
                             CacheEntry {
                                 db_mtime,
                                 wal_mtime,
-                                decrypted_path: entry.decrypted_path.clone(),
+                                decrypted_path: out_path.clone(),
                             },
                         );
                         self.save_persistent();
                         return Ok(Some(CacheResolve {
-                            path: entry.decrypted_path,
-                            mode: CacheMode::WalIncremental,
+                            path: out_path,
+                            mode,
                             warning: None,
                         }));
                     }
                     Err(error) => {
-                        let warning =
-                            format!("WAL 增量应用失败，降级使用上一份缓存 {}: {error}", rel_key);
+                        let warning = format!(
+                            "缓存快照刷新失败，降级使用上一份缓存 {rel_key}: {error}"
+                        );
                         return Ok(Some(CacheResolve {
                             path: entry.decrypted_path,
                             mode: CacheMode::StaleCache,
@@ -135,21 +154,17 @@ impl DbCache {
             }
         }
 
-        let out_path = self.cache_file_path(rel_key);
         let tmp_path = out_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
         let decrypt_result = (|| -> Result<()> {
             crypto::full_decrypt(&db_path, &tmp_path, &enc_key)?;
             apply_wal_to_cached(&wal_path, &tmp_path, &enc_key)?;
-            if out_path.exists() {
-                let _ = std::fs::remove_file(&out_path);
-            }
-            std::fs::rename(&tmp_path, &out_path)?;
+            publish_temp_cache(&tmp_path, &out_path)?;
             Ok(())
         })();
 
         if let Err(error) = decrypt_result {
             let _ = std::fs::remove_file(&tmp_path);
-            if let Some(entry) = self.entries.get(rel_key).cloned() {
+            if let Some(entry) = cached {
                 if entry.decrypted_path.exists() {
                     let warning = format!("全量解密失败，降级使用上一份缓存 {rel_key}: {error}");
                     return Ok(Some(CacheResolve {
@@ -178,9 +193,44 @@ impl DbCache {
         }))
     }
 
-    fn cache_file_path(&self, rel_key: &str) -> PathBuf {
+    fn cache_file_path(&self, rel_key: &str, db_mtime: u64, wal_mtime: u64) -> PathBuf {
         let hash = format!("{:x}", md5::compute(rel_key.as_bytes()));
-        self.cache_dir.join(format!("{hash}.db"))
+        self.cache_dir
+            .join(format!("{hash}-{db_mtime:x}-{wal_mtime:x}.db"))
+    }
+
+    fn publish_from_cached_entry(
+        &self,
+        rel_key: &str,
+        entry: &CacheEntry,
+        out_path: &Path,
+        wal_path: &Path,
+        enc_key: &[u8; 32],
+        wal_mtime: u64,
+    ) -> Result<CacheMode> {
+        let tmp_path = out_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<CacheMode> {
+            std::fs::copy(&entry.decrypted_path, &tmp_path).with_context(|| {
+                format!(
+                    "复制缓存快照失败: {} -> {}",
+                    entry.decrypted_path.display(),
+                    tmp_path.display()
+                )
+            })?;
+            let mode = if entry.wal_mtime == wal_mtime {
+                CacheMode::CacheHit
+            } else {
+                apply_wal_to_cached(wal_path, &tmp_path, enc_key)
+                    .with_context(|| format!("WAL 增量应用失败: {rel_key}"))?;
+                CacheMode::WalIncremental
+            };
+            publish_temp_cache(&tmp_path, out_path)?;
+            Ok(mode)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        result
     }
 
     fn load_persistent(&mut self) {
@@ -242,6 +292,23 @@ impl DbCache {
             }
         }
     }
+}
+
+fn cache_file_lock(path: &Path) -> Arc<Mutex<()>> {
+    let locks = CACHE_FILE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap();
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn publish_temp_cache(tmp_path: &Path, out_path: &Path) -> Result<()> {
+    if out_path.exists() {
+        let _ = std::fs::remove_file(out_path);
+    }
+    std::fs::rename(tmp_path, out_path)
+        .with_context(|| format!("发布缓存快照失败: {}", out_path.display()))
 }
 
 fn apply_wal_to_cached(wal_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Result<()> {
