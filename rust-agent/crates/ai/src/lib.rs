@@ -1,4 +1,11 @@
-use std::{env, fs, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    env, fs,
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use base64::{engine::general_purpose, Engine};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
@@ -6,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -19,6 +27,9 @@ use wechat_summary_core::{
 
 const HTTP_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
 const HTTP_RETRY_MAX_DELAY_MS: u64 = 30_000;
+const HTTP_RATE_LIMIT_QUEUE_DELAY_MS: u64 = 60_000;
+
+static HTTP_RATE_LIMIT_RETRY_QUEUE: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum AiError {
@@ -201,7 +212,9 @@ impl OpenAiCompatibleLlm {
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     status = %status,
                     elapsed_ms,
@@ -222,7 +235,8 @@ impl OpenAiCompatibleLlm {
                         retry_reason_from_status(status, &snippet),
                     )
                     .await;
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry("LLM chat completion", status, attempt, max_attempts)
+                        .await;
                     continue;
                 }
                 let message = format!("chat completion API returned {status}: {response_for_log}");
@@ -392,7 +406,9 @@ impl OpenAiVisionCaptionClient {
                 let snippet = truncate_for_log(&body, 300);
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     source = %source,
                     status = %status,
@@ -414,7 +430,13 @@ impl OpenAiVisionCaptionClient {
                         retry_reason_from_status(status, &snippet),
                     )
                     .await;
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry(
+                        "image caption remote image download",
+                        status,
+                        attempt,
+                        max_attempts,
+                    )
+                    .await;
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
@@ -512,7 +534,9 @@ impl OpenAiVisionCaptionClient {
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     status = %status,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -533,7 +557,13 @@ impl OpenAiVisionCaptionClient {
                         retry_reason_from_status(status, &snippet),
                     )
                     .await;
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry(
+                        "image caption request",
+                        status,
+                        attempt,
+                        max_attempts,
+                    )
+                    .await;
                     continue;
                 }
                 let message = format!("image caption API returned {status}: {response_for_log}");
@@ -687,7 +717,9 @@ impl OpenAiVideoCaptionClient {
                 let snippet = truncate_for_log(&body, 300);
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     source = %source,
                     status = %status,
@@ -700,7 +732,13 @@ impl OpenAiVideoCaptionClient {
                     "video caption remote video download failed"
                 );
                 if retry {
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry(
+                        "video caption remote video download",
+                        status,
+                        attempt,
+                        max_attempts,
+                    )
+                    .await;
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
@@ -789,7 +827,9 @@ impl OpenAiVideoCaptionClient {
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     status = %status,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -801,7 +841,13 @@ impl OpenAiVideoCaptionClient {
                     "video caption request failed"
                 );
                 if retry {
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry(
+                        "video caption request",
+                        status,
+                        attempt,
+                        max_attempts,
+                    )
+                    .await;
                     continue;
                 }
                 let message = format!("video caption API returned {status}: {response_for_log}");
@@ -966,7 +1012,9 @@ impl OpenAiAudioTranscriptionClient {
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     status = %status,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -978,7 +1026,13 @@ impl OpenAiAudioTranscriptionClient {
                     "voice transcription request failed"
                 );
                 if retry {
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry(
+                        "voice transcription request",
+                        status,
+                        attempt,
+                        max_attempts,
+                    )
+                    .await;
                     continue;
                 }
                 let message =
@@ -1071,7 +1125,9 @@ impl OpenAiAudioTranscriptionClient {
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts
                     && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     status = %status,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -1083,7 +1139,13 @@ impl OpenAiAudioTranscriptionClient {
                     "StepFun voice transcription request failed"
                 );
                 if retry {
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry(
+                        "StepFun voice transcription request",
+                        status,
+                        attempt,
+                        max_attempts,
+                    )
+                    .await;
                     continue;
                 }
                 let message = format!(
@@ -1385,6 +1447,14 @@ fn http_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(http_retry_delay_ms(attempt))
 }
 
+fn http_retry_delay_ms_for_status(status: reqwest::StatusCode, attempt: usize) -> u64 {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        HTTP_RATE_LIMIT_QUEUE_DELAY_MS
+    } else {
+        http_retry_delay_ms(attempt)
+    }
+}
+
 fn http_retry_delay_ms(attempt: usize) -> u64 {
     let mut delay = HTTP_RETRY_INITIAL_DELAY_MS;
     for _ in 1..attempt {
@@ -1394,6 +1464,29 @@ fn http_retry_delay_ms(attempt: usize) -> u64 {
         }
     }
     delay
+}
+
+async fn wait_before_status_retry(
+    operation: &'static str,
+    status: reqwest::StatusCode,
+    attempt: usize,
+    max_attempts: usize,
+) {
+    let delay_ms = http_retry_delay_ms_for_status(status, attempt);
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let queue = HTTP_RATE_LIMIT_RETRY_QUEUE.get_or_init(|| Mutex::new(()));
+        info!(
+            operation,
+            attempt,
+            max_attempts,
+            wait_ms = delay_ms,
+            "AI request rate limited; waiting in serial retry queue"
+        );
+        let _guard = queue.lock().await;
+        sleep(Duration::from_millis(delay_ms)).await;
+    } else {
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
 }
 
 async fn notify_retry(
@@ -1917,7 +2010,9 @@ impl OpenAiImageClient {
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     status = %status,
                     elapsed_ms,
@@ -1938,7 +2033,13 @@ impl OpenAiImageClient {
                         retry_reason_from_status(status, &snippet),
                     )
                     .await;
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry(
+                        "image generation request",
+                        status,
+                        attempt,
+                        max_attempts,
+                    )
+                    .await;
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
@@ -2090,7 +2191,7 @@ impl OpenAiImageClient {
                         let retry = http_attempt < max_attempts
                             && should_retry_http_failure(status, &snippet);
                         let retry_after_ms = retry
-                            .then(|| http_retry_delay_ms(http_attempt))
+                            .then(|| http_retry_delay_ms_for_status(status, http_attempt))
                             .unwrap_or(0);
                         warn!(
                             task_id = %task_id,
@@ -2114,7 +2215,13 @@ impl OpenAiImageClient {
                                 retry_reason_from_status(status, &snippet),
                             )
                             .await;
-                            sleep(http_retry_delay(http_attempt)).await;
+                            wait_before_status_retry(
+                                "image task poll",
+                                status,
+                                http_attempt,
+                                max_attempts,
+                            )
+                            .await;
                             continue;
                         }
                         return Err(AiError::InvalidResponse(format!(
@@ -2212,7 +2319,9 @@ impl OpenAiImageClient {
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
                 let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
-                let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                let retry_after_ms = retry
+                    .then(|| http_retry_delay_ms_for_status(status, attempt))
+                    .unwrap_or(0);
                 warn!(
                     source = %source,
                     status = %status,
@@ -2234,7 +2343,7 @@ impl OpenAiImageClient {
                         retry_reason_from_status(status, &snippet),
                     )
                     .await;
-                    sleep(http_retry_delay(attempt)).await;
+                    wait_before_status_retry("image download", status, attempt, max_attempts).await;
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
@@ -3164,6 +3273,22 @@ reasoning_effort = "none"
         assert_eq!(http_retry_delay_ms(5), 16_000);
         assert_eq!(http_retry_delay_ms(6), 30_000);
         assert_eq!(http_retry_delay_ms(7), 30_000);
+    }
+
+    #[test]
+    fn rate_limit_retry_uses_serial_queue_delay() {
+        assert_eq!(
+            http_retry_delay_ms_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS, 1),
+            60_000
+        );
+        assert_eq!(
+            http_retry_delay_ms_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS, 5),
+            60_000
+        );
+        assert_eq!(
+            http_retry_delay_ms_for_status(reqwest::StatusCode::BAD_GATEWAY, 3),
+            4_000
+        );
     }
 
     #[test]
