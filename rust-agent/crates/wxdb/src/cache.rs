@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
@@ -47,6 +47,7 @@ pub struct DbCache {
 }
 
 static CACHE_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+const CACHE_SNAPSHOTS_PER_DB: usize = 16;
 
 impl DbCache {
     pub fn new(
@@ -111,6 +112,7 @@ impl DbCache {
                 },
             );
             self.save_persistent();
+            self.prune_old_cache_snapshots(rel_key, &out_path);
             return Ok(Some(CacheResolve {
                 path: out_path,
                 mode: CacheMode::CacheHit,
@@ -134,6 +136,7 @@ impl DbCache {
                             },
                         );
                         self.save_persistent();
+                        self.prune_old_cache_snapshots(rel_key, &out_path);
                         return Ok(Some(CacheResolve {
                             path: out_path,
                             mode,
@@ -141,9 +144,8 @@ impl DbCache {
                         }));
                     }
                     Err(error) => {
-                        let warning = format!(
-                            "缓存快照刷新失败，降级使用上一份缓存 {rel_key}: {error}"
-                        );
+                        let warning =
+                            format!("缓存快照刷新失败，降级使用上一份缓存 {rel_key}: {error}");
                         return Ok(Some(CacheResolve {
                             path: entry.decrypted_path,
                             mode: CacheMode::StaleCache,
@@ -186,6 +188,7 @@ impl DbCache {
             },
         );
         self.save_persistent();
+        self.prune_old_cache_snapshots(rel_key, &out_path);
         Ok(Some(CacheResolve {
             path: out_path,
             mode: CacheMode::FullDecrypt,
@@ -194,9 +197,43 @@ impl DbCache {
     }
 
     fn cache_file_path(&self, rel_key: &str, db_mtime: u64, wal_mtime: u64) -> PathBuf {
-        let hash = format!("{:x}", md5::compute(rel_key.as_bytes()));
+        let hash = cache_file_hash(rel_key);
         self.cache_dir
             .join(format!("{hash}-{db_mtime:x}-{wal_mtime:x}.db"))
+    }
+
+    fn prune_old_cache_snapshots(&self, rel_key: &str, current_path: &Path) {
+        let hash = cache_file_hash(rel_key);
+        let Ok(entries) = std::fs::read_dir(&self.cache_dir) else {
+            return;
+        };
+        let mut snapshots = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !is_cache_snapshot_for_hash(&path, &hash) {
+                    return None;
+                }
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((modified, path))
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+
+        let mut keep = HashSet::new();
+        keep.insert(current_path.to_path_buf());
+        for (_, path) in snapshots.iter().take(CACHE_SNAPSHOTS_PER_DB) {
+            keep.insert(path.clone());
+        }
+
+        for (_, path) in snapshots {
+            if !keep.contains(&path) {
+                remove_cache_snapshot(&path);
+            }
+        }
     }
 
     fn publish_from_cached_entry(
@@ -303,6 +340,23 @@ fn cache_file_lock(path: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
+fn cache_file_hash(rel_key: &str) -> String {
+    format!("{:x}", md5::compute(rel_key.as_bytes()))
+}
+
+fn is_cache_snapshot_for_hash(path: &Path, hash: &str) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == format!("{hash}.db") || (name.starts_with(&format!("{hash}-")) && name.ends_with(".db"))
+}
+
+fn remove_cache_snapshot(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
 fn publish_temp_cache(tmp_path: &Path, out_path: &Path) -> Result<()> {
     if out_path.exists() {
         let _ = std::fs::remove_file(out_path);
@@ -329,4 +383,31 @@ fn mtime_nanos(path: &Path) -> u64 {
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_snapshot_matcher_accepts_versioned_and_legacy_db_files() {
+        let hash = "170fb82914dc74888c50bb22f0798c60";
+
+        assert!(is_cache_snapshot_for_hash(
+            Path::new("170fb82914dc74888c50bb22f0798c60.db"),
+            hash
+        ));
+        assert!(is_cache_snapshot_for_hash(
+            Path::new("170fb82914dc74888c50bb22f0798c60-1-2.db"),
+            hash
+        ));
+        assert!(!is_cache_snapshot_for_hash(
+            Path::new("170fb82914dc74888c50bb22f0798c60-1-2.db-wal"),
+            hash
+        ));
+        assert!(!is_cache_snapshot_for_hash(
+            Path::new("923f080775be265c49f979fda84c0cb6-1-2.db"),
+            hash
+        ));
+    }
 }
