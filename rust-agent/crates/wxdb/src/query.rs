@@ -181,18 +181,43 @@ pub fn query_history_with_config(
         return Ok(result);
     }
 
-    errors.extend(missing_key_store_errors);
+    let failure_message = format_store_query_failure(&errors, &missing_key_store_errors);
     tracing::warn!(
         chat_name = %query.chat_name,
         elapsed_ms = query_started.elapsed().as_millis(),
-        errors = errors.len(),
+        errors = errors.len() + missing_key_store_errors.len(),
         "wxdb query failed for all stores"
     );
-    anyhow::bail!("所有 WeChat 数据库候选均查询失败: {}", errors.join(" | "))
+    anyhow::bail!("{failure_message}")
 }
 
 fn is_missing_db_key_error(error: &str) -> bool {
     error.contains("没有可用数据库密钥")
+}
+
+fn format_store_query_failure(errors: &[String], missing_key_errors: &[String]) -> String {
+    if let Some(primary) = errors.first() {
+        let mut message = format!("微信数据库查询失败。主要错误: {primary}");
+        if errors.len() > 1 {
+            message.push_str(&format!("；另有 {} 个候选目录查询失败", errors.len() - 1));
+        }
+        if !missing_key_errors.is_empty() {
+            message.push_str(&format!(
+                "；另有 {} 个候选账号目录缺少数据库密钥，已作为次要诊断处理",
+                missing_key_errors.len()
+            ));
+        }
+        return message;
+    }
+
+    if missing_key_errors.is_empty() {
+        return "微信数据库查询失败，但未返回具体错误".to_string();
+    }
+
+    format!(
+        "未找到任何带可用数据库密钥的微信账号目录（共 {} 个候选）；请确认目标微信账号正在运行，然后执行 wxdb init",
+        missing_key_errors.len()
+    )
 }
 
 fn query_history_in_store(
@@ -2096,6 +2121,38 @@ mod tests {
             r"\\?\D:\Temp\xwechat_files\wxid_a\db_storage: 没有可用数据库密钥；请确认微信正在运行"
         ));
         assert!(!is_missing_db_key_error("打开 contact.db 失败"));
+    }
+
+    #[test]
+    fn store_failure_prefers_real_error_over_missing_key_candidates() {
+        let message = format_store_query_failure(
+            &[
+                r"\\?\D:\active\db_storage: 解密数据库失败: 磁盘空间不足。 (os error 112)"
+                    .to_string(),
+            ],
+            &[
+                r"\\?\D:\old-a\db_storage: 没有可用数据库密钥".to_string(),
+                r"\\?\D:\old-b\db_storage: 没有可用数据库密钥".to_string(),
+            ],
+        );
+
+        assert!(message.contains("主要错误"));
+        assert!(message.contains("磁盘空间不足"));
+        assert!(message.contains("另有 2 个候选账号目录缺少数据库密钥"));
+    }
+
+    #[test]
+    fn store_failure_reports_all_candidates_missing_keys() {
+        let message = format_store_query_failure(
+            &[],
+            &[
+                "store-a: 没有可用数据库密钥".to_string(),
+                "store-b: 没有可用数据库密钥".to_string(),
+            ],
+        );
+
+        assert!(message.contains("未找到任何带可用数据库密钥的微信账号目录"));
+        assert!(message.contains("共 2 个候选"));
     }
 
     fn temp_test_dir(prefix: &str) -> PathBuf {

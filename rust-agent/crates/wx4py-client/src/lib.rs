@@ -56,7 +56,7 @@ pub fn refresh_builtin_wxdb_keys_on_start(
         return Ok(None);
     }
 
-    let config = wechat_summary_wxdb::RuntimeConfig::load();
+    let config = builtin_wxdb_runtime_config(wx_cli);
     let reports = wechat_summary_wxdb::refresh_keys(&config)
         .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb init failed: {error:#}")))?
         .into_iter()
@@ -397,6 +397,7 @@ fn query_text_messages_inner(
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     if should_use_builtin_wxdb(wx_cli) {
         return query_text_messages_via_builtin_wxdb(
+            wx_cli,
             chat_name,
             since,
             until,
@@ -448,6 +449,7 @@ fn should_use_builtin_wxdb(wx_cli: &WxCliConfig) -> bool {
 }
 
 fn query_text_messages_via_builtin_wxdb(
+    wx_cli: &WxCliConfig,
     chat_name: &str,
     since: DateTime<Utc>,
     until: DateTime<Utc>,
@@ -463,7 +465,7 @@ fn query_text_messages_via_builtin_wxdb(
         "querying builtin wxdb history"
     );
     let mut result =
-        query_builtin_wxdb_history(chat_name, since, until, limit, media_decode_limit)?;
+        query_builtin_wxdb_history(wx_cli, chat_name, since, until, limit, media_decode_limit)?;
     if result.messages.is_empty() && until.signed_duration_since(since) >= Duration::minutes(5) {
         tracing::warn!(
             chat_name,
@@ -472,7 +474,8 @@ fn query_text_messages_via_builtin_wxdb(
             "builtin wxdb returned no messages; retrying once after a short delay"
         );
         thread::sleep(StdDuration::from_millis(800));
-        result = query_builtin_wxdb_history(chat_name, since, until, limit, media_decode_limit)?;
+        result =
+            query_builtin_wxdb_history(wx_cli, chat_name, since, until, limit, media_decode_limit)?;
     }
 
     for warning in &result.meta.warnings {
@@ -566,22 +569,37 @@ fn empty_builtin_wxdb_result_uncertain_reason(
 }
 
 fn query_builtin_wxdb_history(
+    wx_cli: &WxCliConfig,
     chat_name: &str,
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
     media_decode_limit: Option<usize>,
 ) -> Result<wechat_summary_wxdb::HistoryResult> {
-    wechat_summary_wxdb::query_history(wechat_summary_wxdb::HistoryQuery {
-        chat_name: chat_name.to_string(),
-        since: Some(since),
-        until: Some(until),
-        limit: limit as usize,
-        text_only: false,
-        msg_types: vec!["text".to_string(), "image".to_string(), "voice".to_string()],
-        media_decode_limit,
-    })
+    let config = builtin_wxdb_runtime_config(wx_cli);
+    wechat_summary_wxdb::query_history_with_config(
+        &config,
+        wechat_summary_wxdb::HistoryQuery {
+            chat_name: chat_name.to_string(),
+            since: Some(since),
+            until: Some(until),
+            limit: limit as usize,
+            text_only: false,
+            msg_types: vec!["text".to_string(), "image".to_string(), "voice".to_string()],
+            media_decode_limit,
+        },
+    )
     .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb failed: {error:#}")))
+}
+
+fn builtin_wxdb_runtime_config(wx_cli: &WxCliConfig) -> wechat_summary_wxdb::RuntimeConfig {
+    let config = wechat_summary_wxdb::RuntimeConfig::load();
+    let cache_dir = wx_cli.cache_dir.trim();
+    if cache_dir.is_empty() {
+        config
+    } else {
+        config.with_cache_dir(cache_dir)
+    }
 }
 
 fn should_skip_export_after_history_error(error: &Wx4pyError) -> bool {
@@ -1169,6 +1187,7 @@ mod tests {
             timeout_seconds: 20,
             history_query_timeout_seconds: 45,
             temp_dir: ".\\runtime\\wx-exports".into(),
+            cache_dir: String::new(),
             group_name_map: HashMap::new(),
         }
     }

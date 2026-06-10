@@ -68,6 +68,7 @@ struct ConfigView {
     wx_cli_timeout: u64,
     wx_cli_history_timeout: u64,
     wx_cli_temp_dir: String,
+    wxdb_cache_dir: String,
     llm_provider: String,
     llm_api_key_env: String,
     llm_base_url_env: String,
@@ -393,7 +394,7 @@ impl GuiApp {
             return;
         }
 
-        match start_wxdb_init(&self.state) {
+        match start_wxdb_init(&self.state, &self.view.wxdb_cache_dir) {
             Ok(process) => {
                 self.append_terminal_line(format!("[gui] wxdb init 已启动 pid={}\n", process.pid));
                 self.wxdb_init = Some(process);
@@ -1069,7 +1070,13 @@ fn runtime_tab(
             text_field(ui, "wxdb 命令", &mut view.wx_cli_executable);
             number_u64(ui, "wxdb 命令超时秒数", &mut view.wx_cli_timeout);
             number_u64(ui, "历史查询总超时秒数", &mut view.wx_cli_history_timeout);
-            text_field(ui, "wxdb 临时目录", &mut view.wx_cli_temp_dir);
+            text_field(ui, "外部 wxdb 导出临时目录", &mut view.wx_cli_temp_dir);
+            directory_field(
+                ui,
+                "wxdb 缓存目录",
+                &mut view.wxdb_cache_dir,
+                "留空使用用户目录下的默认缓存",
+            );
         },
         |ui| {
             text_field(ui, "输出目录", &mut view.runtime_output_dir);
@@ -1447,6 +1454,58 @@ fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.text_edit_singleline(value);
 }
 
+fn directory_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .hint_text(hint)
+                .desired_width((ui.available_width() - 72.0).max(120.0)),
+        );
+        if ui.button("选择...").clicked() {
+            if let Ok(Some(path)) = pick_folder(value.trim()) {
+                *value = path.to_string_lossy().into_owned();
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+fn pick_folder(initial_dir: &str) -> Result<Option<PathBuf>> {
+    const SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择 wxdb 缓存目录'
+$initial = $env:SUMMARY_AGENT_FOLDER_PICKER_INITIAL
+if ($initial -and (Test-Path -LiteralPath $initial)) {
+    $dialog.SelectedPath = $initial
+}
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output $dialog.SelectedPath
+}
+"#;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-STA", "-Command", SCRIPT])
+        .env("SUMMARY_AGENT_FOLDER_PICKER_INITIAL", initial_dir);
+    hide_command_window(&mut command);
+    let output = command.output().context("opening folder picker")?;
+    if !output.status.success() {
+        bail!(
+            "folder picker failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
+}
+
+#[cfg(not(windows))]
+fn pick_folder(_initial_dir: &str) -> Result<Option<PathBuf>> {
+    Ok(None)
+}
+
 fn multiline_field(ui: &mut egui::Ui, label: &str, value: &mut String, rows: usize) {
     ui.label(label);
     ui.add(
@@ -1581,6 +1640,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             wx_cli_timeout: config.wx_cli.timeout_seconds,
             wx_cli_history_timeout: config.wx_cli.history_query_timeout_seconds,
             wx_cli_temp_dir: config.wx_cli.temp_dir,
+            wxdb_cache_dir: config.wx_cli.cache_dir,
             llm_provider: config.llm.provider,
             llm_api_key_env: config.llm.api_key_env,
             llm_base_url_env: config.llm.base_url_env,
@@ -1755,6 +1815,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             60,
         ),
         wx_cli_temp_dir: get_str_alias(doc, "wxdb", "wx_cli", "temp_dir", ".\\runtime\\wx-exports"),
+        wxdb_cache_dir: get_str_alias(doc, "wxdb", "wx_cli", "cache_dir", ""),
         llm_provider: get_str(doc, "llm", "provider", "openai_compatible"),
         llm_api_key_env: get_str(doc, "llm", "api_key_env", "LLM_API_KEY"),
         llm_base_url_env: get_str(doc, "llm", "base_url_env", "LLM_BASE_URL"),
@@ -2002,6 +2063,7 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         update.wx_cli_history_timeout as i64,
     );
     set_str(wxdb, "temp_dir", &update.wx_cli_temp_dir);
+    set_str(wxdb, "cache_dir", &update.wxdb_cache_dir);
     remove_table(&mut doc, "wx_cli");
 
     let privacy = table_mut(&mut doc, "privacy");
@@ -2613,7 +2675,7 @@ fn start_agent(state: &AppState) -> Result<AgentProcess> {
     Ok(AgentProcess { child, output, pid })
 }
 
-fn start_wxdb_init(state: &AppState) -> Result<WxdbInitProcess> {
+fn start_wxdb_init(state: &AppState, cache_dir: &str) -> Result<WxdbInitProcess> {
     let wxdb = find_exe("wxdb");
     if !wxdb.exists() {
         return Err(anyhow!("wxdb 不存在: {}", wxdb.display()));
@@ -2626,6 +2688,9 @@ fn start_wxdb_init(state: &AppState) -> Result<WxdbInitProcess> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if !cache_dir.trim().is_empty() {
+        command.env("WXDB_CACHE_DIR", cache_dir.trim());
+    }
     hide_command_window(&mut command);
 
     let mut child = command.spawn().context("starting wxdb init")?;

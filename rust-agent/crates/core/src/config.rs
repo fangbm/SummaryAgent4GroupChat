@@ -296,6 +296,8 @@ pub struct WxCliConfig {
     #[serde(default = "default_wx_cli_temp_dir")]
     pub temp_dir: String,
     #[serde(default)]
+    pub cache_dir: String,
+    #[serde(default)]
     pub group_name_map: HashMap<String, String>,
 }
 
@@ -308,6 +310,7 @@ impl Default for WxCliConfig {
             timeout_seconds: default_wx_cli_timeout_seconds(),
             history_query_timeout_seconds: default_wx_cli_history_query_timeout_seconds(),
             temp_dir: default_wx_cli_temp_dir(),
+            cache_dir: String::new(),
             group_name_map: HashMap::new(),
         }
     }
@@ -1100,6 +1103,7 @@ api_key_env = "LLM_API_KEY""#,
         assert_eq!(wxdb.max_messages, None);
         assert_eq!(wxdb.timeout_seconds, 20);
         assert_eq!(wxdb.history_query_timeout_seconds, 45);
+        assert!(wxdb.cache_dir.is_empty());
     }
 
     #[test]

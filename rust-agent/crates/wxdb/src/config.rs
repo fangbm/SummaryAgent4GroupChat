@@ -110,6 +110,11 @@ impl RuntimeConfig {
         self.cache_dir.join(safe_dir_name(db_dir))
     }
 
+    pub fn with_cache_dir(mut self, cache_dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = cache_dir.into();
+        self
+    }
+
     pub fn mtime_file_for(&self, db_dir: &Path) -> PathBuf {
         self.cache_dir_for(db_dir).join("_mtimes.json")
     }

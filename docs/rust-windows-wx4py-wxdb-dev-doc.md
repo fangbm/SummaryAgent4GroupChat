@@ -89,6 +89,7 @@ export_format = "json"
 timeout_seconds = 20
 history_query_timeout_seconds = 45
 temp_dir = ".\\runtime\\wx-exports"
+cache_dir = ""
 group_name_map = {}
 ```
 
@@ -98,6 +99,7 @@ group_name_map = {}
 - `wx4py.groups` 必须是微信里能搜索到的群显示名；wx4py 不能像 wxhook 一样按底层 `@chatroom` ID 全量监听。
 - 若 `wx4py.groups` 为空，Rust 会回退使用 `listen.whitelist_rooms`；两者都为空时启动失败。
 - `wxdb.group_name_map` 可把触发事件里的群名映射到 wxdb 可识别的聊天名。
+- `wxdb.cache_dir` 控制内置 wxdb 的解密快照和媒体缓存位置；留空时使用用户目录下的默认缓存。
 - `wxdb.history_query_timeout_seconds` 是整段历史查询的兜底超时，防止 wxdb 或本地 cache 查询卡住后阻塞新请求。
 - `discord.token_env` 默认读取 `DISCORD_BOT_TOKEN`；也可以在 `[discord]` 中直接设置 `token`。
 - `discord.channels` 和 `scheduled_summary.rooms` 对 Discord 必须填写频道 ID；`listen.whitelist_rooms` 可填写频道 ID 或频道名用于触发过滤。

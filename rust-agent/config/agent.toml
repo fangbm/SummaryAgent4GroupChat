@@ -76,6 +76,9 @@ timeout_seconds = 20
 # Keep this above 2 * timeout_seconds so history can time out and still try export.
 history_query_timeout_seconds = 60
 temp_dir = ".\\runtime\\wx-exports"
+# Decrypted database snapshots and decoded media cache. Leave empty to use
+# %USERPROFILE%\.wx-summary-agent\wxdb\cache.
+cache_dir = ""
 group_name_map = {}
 
 [privacy]
