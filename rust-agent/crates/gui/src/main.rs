@@ -1463,47 +1463,23 @@ fn directory_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &st
                 .desired_width((ui.available_width() - 72.0).max(120.0)),
         );
         if ui.button("选择...").clicked() {
-            if let Ok(Some(path)) = pick_folder(value.trim()) {
+            if let Some(path) = pick_folder(value.trim()) {
                 *value = path.to_string_lossy().into_owned();
             }
         }
     });
 }
 
-#[cfg(windows)]
-fn pick_folder(initial_dir: &str) -> Result<Option<PathBuf>> {
-    const SCRIPT: &str = r#"
-Add-Type -AssemblyName System.Windows.Forms
-$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = '选择 wxdb 缓存目录'
-$initial = $env:SUMMARY_AGENT_FOLDER_PICKER_INITIAL
-if ($initial -and (Test-Path -LiteralPath $initial)) {
-    $dialog.SelectedPath = $initial
-}
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    Write-Output $dialog.SelectedPath
-}
-"#;
-    let mut command = Command::new("powershell.exe");
-    command
-        .args(["-NoProfile", "-STA", "-Command", SCRIPT])
-        .env("SUMMARY_AGENT_FOLDER_PICKER_INITIAL", initial_dir);
-    hide_command_window(&mut command);
-    let output = command.output().context("opening folder picker")?;
-    if !output.status.success() {
-        bail!(
-            "folder picker failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+fn pick_folder(initial_dir: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title("选择 wxdb 缓存目录");
+    let initial_dir = initial_dir.trim();
+    if !initial_dir.is_empty() {
+        let path = Path::new(initial_dir);
+        if path.is_dir() {
+            dialog = dialog.set_directory(path);
+        }
     }
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!selected.is_empty()).then(|| PathBuf::from(selected)))
-}
-
-#[cfg(not(windows))]
-fn pick_folder(_initial_dir: &str) -> Result<Option<PathBuf>> {
-    Ok(None)
+    dialog.pick_folder()
 }
 
 fn multiline_field(ui: &mut egui::Ui, label: &str, value: &mut String, rows: usize) {
