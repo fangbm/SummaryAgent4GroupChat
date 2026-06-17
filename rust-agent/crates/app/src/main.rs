@@ -27,14 +27,16 @@ use wechat_summary_ai::{
 use wechat_summary_core::{
     config::{ListenConfig, PlatformKindConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
-    parse_command_time_range_minutes, AgentConfig, ChatFormatter, PrivacyFilter, ResolvedTimeRange,
-    TimeRangeCalculator, TriggerMatch, TriggerMatcher,
+    AgentConfig, ChatFormatter, PrivacyFilter, ResolvedTimeRange, TimeRangeCalculator,
+    TriggerMatch, TriggerMatcher,
 };
 use wechat_summary_storage::SqliteStateStore;
 
 use crate::platform::{PlatformClient, PlatformEvent, PlatformHistoryMessage, PlatformSender};
 
 const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
+const TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS: i64 = 5;
+const TRIGGER_DEDUPE_RETENTION_SECONDS: i64 = 2 * 60 * 60;
 const RECENT_OBSERVED_WINDOW_HOURS: i64 = 6;
 const RECENT_OBSERVED_MAX_MESSAGES: usize = 5_000;
 const WXDB_COMMAND_WATCH_INTERVAL_SECONDS: u64 = 3;
@@ -843,24 +845,44 @@ async fn handle_platform_event(
         return Ok(());
     };
 
+    let Some(command) = parse_summary_command(&trigger, source_platform) else {
+        info!(
+            room_id = %trigger.room_id,
+            trigger_content = %trigger.trigger_content,
+            "trigger-like message ignored because command arguments were not recognized"
+        );
+        append_runtime_log(
+            config,
+            &format!(
+                "trigger-like message ignored room={} content={:?} reason=unrecognized_command_args",
+                trigger.room_id, trigger.trigger_content
+            ),
+        );
+        return Ok(());
+    };
+
     if recent_trigger_attempts.is_duplicate(&trigger, incoming.timestamp) {
         info!(
             room_id = %trigger.room_id,
             trigger_content = %trigger.trigger_content,
             dedupe_window_seconds = TRIGGER_DEDUPE_WINDOW_SECONDS,
+            dedupe_event_window_seconds = TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS,
+            dedupe_retention_seconds = TRIGGER_DEDUPE_RETENTION_SECONDS,
             "duplicate trigger ignored"
         );
         append_runtime_log(
             config,
             &format!(
-                "duplicate trigger ignored room={} content={:?} window_seconds={}",
-                trigger.room_id, trigger.trigger_content, TRIGGER_DEDUPE_WINDOW_SECONDS
+                "duplicate trigger ignored room={} content={:?} window_seconds={} event_window_seconds={} retention_seconds={}",
+                trigger.room_id,
+                trigger.trigger_content,
+                TRIGGER_DEDUPE_WINDOW_SECONDS,
+                TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS,
+                TRIGGER_DEDUPE_RETENTION_SECONDS
             ),
         );
         return Ok(());
     }
-
-    let command = parse_summary_command(&trigger, source_platform);
     if !client.supports(command.target_platform) {
         let message = format!(
             "暂不支持从 {} 总结 {} 平台消息。当前已接入的平台：{}。",
@@ -1018,26 +1040,57 @@ async fn handle_platform_event(
 
 #[derive(Debug, Default)]
 struct RecentTriggerAttempts {
-    seen_at_by_key: HashMap<String, DateTime<Utc>>,
+    attempts_by_key: HashMap<String, Vec<RecentTriggerAttempt>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecentTriggerAttempt {
+    event_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
 }
 
 impl RecentTriggerAttempts {
-    fn is_duplicate(&mut self, trigger: &TriggerMatch, now: DateTime<Utc>) -> bool {
-        let cutoff = now - Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS);
-        self.seen_at_by_key.retain(|_, seen_at| *seen_at >= cutoff);
+    fn is_duplicate(&mut self, trigger: &TriggerMatch, event_at: DateTime<Utc>) -> bool {
+        self.is_duplicate_at(trigger, event_at, Utc::now())
+    }
 
+    fn is_duplicate_at(
+        &mut self,
+        trigger: &TriggerMatch,
+        event_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    ) -> bool {
+        let retention_cutoff = observed_at - Duration::seconds(TRIGGER_DEDUPE_RETENTION_SECONDS);
+        self.attempts_by_key.retain(|_, attempts| {
+            attempts.retain(|attempt| attempt.observed_at >= retention_cutoff);
+            !attempts.is_empty()
+        });
+
+        let process_cutoff = observed_at - Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS);
         let key = trigger_attempt_key(trigger);
-        if self
-            .seen_at_by_key
-            .get(&key)
-            .is_some_and(|seen_at| *seen_at >= cutoff)
-        {
-            return true;
+        if let Some(attempts) = self.attempts_by_key.get(&key) {
+            if attempts.iter().any(|attempt| {
+                attempt.observed_at >= process_cutoff
+                    || event_times_close(attempt.event_at, event_at)
+            }) {
+                return true;
+            }
         }
 
-        self.seen_at_by_key.insert(key, now);
+        self.attempts_by_key
+            .entry(key)
+            .or_default()
+            .push(RecentTriggerAttempt {
+                event_at,
+                observed_at,
+            });
         false
     }
+}
+
+fn event_times_close(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
+    let delta = (left - right).num_seconds();
+    (-TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS..=TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS).contains(&delta)
 }
 
 fn trigger_attempt_key(trigger: &TriggerMatch) -> String {
@@ -3011,7 +3064,7 @@ struct SummaryCommand {
 fn parse_summary_command(
     trigger: &TriggerMatch,
     default_platform: PlatformKindConfig,
-) -> SummaryCommand {
+) -> Option<SummaryCommand> {
     let args = trigger
         .trigger_content
         .strip_prefix(&trigger.trigger_symbol)
@@ -3020,19 +3073,22 @@ fn parse_summary_command(
     parse_summary_command_args(args, default_platform)
 }
 
-fn parse_summary_command_args(args: &str, default_platform: PlatformKindConfig) -> SummaryCommand {
+fn parse_summary_command_args(
+    args: &str,
+    default_platform: PlatformKindConfig,
+) -> Option<SummaryCommand> {
     let args = args.trim();
     if args.is_empty() {
-        return SummaryCommand {
+        return Some(SummaryCommand {
             target_platform: default_platform,
             range_minutes: None,
             image_token_present: false,
-        };
+        });
     }
 
     let mut target_platform = default_platform;
     let mut image_token_present = false;
-    let mut range_tokens = Vec::new();
+    let mut range_tokens: Vec<&str> = Vec::new();
     for token in args.split_whitespace() {
         if let Some(platform) = parse_platform_token(token) {
             target_platform = platform;
@@ -3043,11 +3099,17 @@ fn parse_summary_command_args(args: &str, default_platform: PlatformKindConfig) 
         }
     }
 
-    SummaryCommand {
+    let range_minutes = if range_tokens.is_empty() {
+        None
+    } else {
+        parse_summary_time_range_minutes(&range_tokens)?
+    };
+
+    Some(SummaryCommand {
         target_platform,
-        range_minutes: parse_command_time_range_minutes(&range_tokens.join(" ")),
+        range_minutes,
         image_token_present,
-    }
+    })
 }
 
 fn parse_platform_token(token: &str) -> Option<PlatformKindConfig> {
@@ -3057,6 +3119,68 @@ fn parse_platform_token(token: &str) -> Option<PlatformKindConfig> {
 fn is_image_token(token: &str) -> bool {
     let token = token.trim();
     matches!(token, "图片") || matches!(token.to_ascii_lowercase().as_str(), "image" | "img")
+}
+
+fn parse_summary_time_range_minutes(tokens: &[&str]) -> Option<Option<i64>> {
+    if tokens.len() == 1 && is_default_time_range_token(tokens[0]) {
+        return Some(None);
+    }
+    parse_strict_duration_minutes(tokens).map(Some)
+}
+
+fn is_default_time_range_token(token: &str) -> bool {
+    let token = token.trim();
+    matches!(token.to_ascii_lowercase().as_str(), "today")
+        || matches!(token, "今天" | "今日" | "本日")
+}
+
+fn parse_strict_duration_minutes(tokens: &[&str]) -> Option<i64> {
+    if tokens.is_empty() || tokens.len() > 2 {
+        return None;
+    }
+
+    let first = tokens[0].trim();
+    if first.is_empty() {
+        return None;
+    }
+
+    let split_at = first
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(index, _)| index)
+        .unwrap_or(first.len());
+    if split_at == 0 {
+        return None;
+    }
+
+    let (amount, inline_unit) = first.split_at(split_at);
+    let amount = amount.parse::<i64>().ok()?;
+    if amount <= 0 {
+        return None;
+    }
+
+    let unit = if inline_unit.is_empty() {
+        if tokens.len() != 2 {
+            return None;
+        }
+        tokens[1].trim()
+    } else {
+        if tokens.len() != 1 {
+            return None;
+        }
+        inline_unit
+    };
+
+    match unit.to_ascii_lowercase().as_str() {
+        "m" | "min" | "mins" | "minute" | "minutes" | "分钟" | "分钟内" | "分" | "分内" => {
+            Some(amount)
+        }
+        "h" | "hr" | "hrs" | "hour" | "hours" | "小时" | "小时内" | "时" | "时内" => {
+            Some(amount * 60)
+        }
+        "d" | "day" | "days" | "天" | "天内" | "日" | "日内" => Some(amount * 24 * 60),
+        _ => None,
+    }
 }
 
 fn rate_limit_remaining(
@@ -4548,35 +4672,64 @@ mod tests {
 
         assert_eq!(
             parse_summary_command(&trigger, PlatformKindConfig::Wx4py),
-            SummaryCommand {
+            Some(SummaryCommand {
                 target_platform: PlatformKindConfig::Wx4py,
                 range_minutes: Some(60),
                 image_token_present: false,
-            }
+            })
         );
     }
 
     #[test]
-    fn ignores_non_range_text_after_trigger_symbol() {
+    fn parses_compact_command_time_range_after_trigger_symbol() {
+        let trigger = TriggerMatch {
+            room_id: "room".into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结1h".into(),
+        };
+
+        assert_eq!(
+            parse_summary_command(&trigger, PlatformKindConfig::Wx4py),
+            Some(SummaryCommand {
+                target_platform: PlatformKindConfig::Wx4py,
+                range_minutes: Some(60),
+                image_token_present: false,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_range_text_after_trigger_symbol() {
         let trigger = TriggerMatch {
             room_id: "room".into(),
             trigger_symbol: "/总结".into(),
             trigger_content: "/总结 刚才说了什么".into(),
         };
 
-        assert_eq!(
-            parse_summary_command(&trigger, PlatformKindConfig::Wx4py),
-            SummaryCommand {
-                target_platform: PlatformKindConfig::Wx4py,
-                range_minutes: None,
-                image_token_present: false,
-            }
-        );
+        assert!(parse_summary_command(&trigger, PlatformKindConfig::Wx4py).is_none());
+    }
+
+    #[test]
+    fn rejects_natural_language_suffix_after_trigger_symbol() {
+        let trigger = TriggerMatch {
+            room_id: "room".into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结并推荐几个能看猫的网站".into(),
+        };
+
+        assert!(parse_summary_command(&trigger, PlatformKindConfig::Wx4py).is_none());
+    }
+
+    #[test]
+    fn rejects_extra_text_after_valid_time_range() {
+        let command = parse_summary_command_args("1h extra", PlatformKindConfig::Discord);
+
+        assert!(command.is_none());
     }
 
     #[test]
     fn summary_command_defaults_to_source_platform() {
-        let command = parse_summary_command_args("2h", PlatformKindConfig::Discord);
+        let command = parse_summary_command_args("2h", PlatformKindConfig::Discord).unwrap();
 
         assert_eq!(
             command,
@@ -4590,7 +4743,7 @@ mod tests {
 
     #[test]
     fn summary_command_accepts_explicit_platform_and_time() {
-        let command = parse_summary_command_args("微信 1d", PlatformKindConfig::Discord);
+        let command = parse_summary_command_args("微信 1d", PlatformKindConfig::Discord).unwrap();
 
         assert_eq!(
             command,
@@ -4605,19 +4758,19 @@ mod tests {
     #[test]
     fn summary_command_platform_aliases_are_case_insensitive() {
         for value in ["wx", "WX", "微信", "wechat", "WeChat"] {
-            let command = parse_summary_command_args(value, PlatformKindConfig::Discord);
+            let command = parse_summary_command_args(value, PlatformKindConfig::Discord).unwrap();
             assert_eq!(command.target_platform, PlatformKindConfig::Wx4py);
         }
 
         for value in ["dc", "DC", "discord", "Discord"] {
-            let command = parse_summary_command_args(value, PlatformKindConfig::Wx4py);
+            let command = parse_summary_command_args(value, PlatformKindConfig::Wx4py).unwrap();
             assert_eq!(command.target_platform, PlatformKindConfig::Discord);
         }
     }
 
     #[test]
     fn summary_command_accepts_discord_alias_without_time() {
-        let command = parse_summary_command_args("dc", PlatformKindConfig::Wx4py);
+        let command = parse_summary_command_args("dc", PlatformKindConfig::Wx4py).unwrap();
 
         assert_eq!(
             command,
@@ -4632,7 +4785,7 @@ mod tests {
     #[test]
     fn summary_command_accepts_image_aliases() {
         for value in ["图片", "image", "IMAGE", "img", "IMG"] {
-            let command = parse_summary_command_args(value, PlatformKindConfig::Wx4py);
+            let command = parse_summary_command_args(value, PlatformKindConfig::Wx4py).unwrap();
             assert_eq!(
                 command,
                 SummaryCommand {
@@ -4646,7 +4799,8 @@ mod tests {
 
     #[test]
     fn summary_command_accepts_platform_time_and_image() {
-        let command = parse_summary_command_args("wechat 1d img", PlatformKindConfig::Discord);
+        let command =
+            parse_summary_command_args("wechat 1d img", PlatformKindConfig::Discord).unwrap();
 
         assert_eq!(
             command,
@@ -4660,7 +4814,7 @@ mod tests {
 
     #[test]
     fn summary_command_accepts_image_before_time() {
-        let command = parse_summary_command_args("图片 1h", PlatformKindConfig::Discord);
+        let command = parse_summary_command_args("图片 1h", PlatformKindConfig::Discord).unwrap();
 
         assert_eq!(
             command,
@@ -4732,13 +4886,15 @@ mod tests {
         };
         let now = Utc.with_ymd_and_hms(2026, 5, 29, 12, 25, 38).unwrap();
 
-        assert!(!attempts.is_duplicate(&trigger, now));
-        assert!(attempts.is_duplicate(
+        assert!(!attempts.is_duplicate_at(&trigger, now, now));
+        assert!(attempts.is_duplicate_at(
             &trigger,
+            now + Duration::seconds(1),
             now + Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS - 1)
         ));
-        assert!(!attempts.is_duplicate(
+        assert!(!attempts.is_duplicate_at(
             &trigger,
+            now + Duration::seconds(TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS + 1),
             now + Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS + 1)
         ));
     }
@@ -4754,8 +4910,51 @@ mod tests {
         let wx4py_seen_at = Utc.with_ymd_and_hms(2026, 6, 7, 12, 33, 34).unwrap();
         let wxdb_seen_at = wx4py_seen_at - Duration::seconds(1);
 
-        assert!(!attempts.is_duplicate(&trigger, wx4py_seen_at));
-        assert!(attempts.is_duplicate(&trigger, wxdb_seen_at));
+        assert!(!attempts.is_duplicate_at(&trigger, wx4py_seen_at, wx4py_seen_at));
+        assert!(attempts.is_duplicate_at(
+            &trigger,
+            wxdb_seen_at,
+            wx4py_seen_at + Duration::minutes(30)
+        ));
+    }
+
+    #[test]
+    fn recent_trigger_attempts_reject_delayed_replay_with_same_event_time() {
+        let mut attempts = RecentTriggerAttempts::default();
+        let trigger = TriggerMatch {
+            room_id: "paper2galgame种子用户群".into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结1h".into(),
+        };
+        let event_at = Utc.with_ymd_and_hms(2026, 6, 17, 12, 28, 12).unwrap();
+        let first_observed_at = event_at + Duration::seconds(10);
+        let delayed_observed_at = first_observed_at + Duration::minutes(48);
+
+        assert!(!attempts.is_duplicate_at(&trigger, event_at, first_observed_at));
+        assert!(attempts.is_duplicate_at(
+            &trigger,
+            event_at + Duration::seconds(1),
+            delayed_observed_at
+        ));
+    }
+
+    #[test]
+    fn recent_trigger_attempts_allow_same_command_with_new_event_time() {
+        let mut attempts = RecentTriggerAttempts::default();
+        let trigger = TriggerMatch {
+            room_id: "room-a".into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结1h".into(),
+        };
+        let first_event_at = Utc.with_ymd_and_hms(2026, 6, 17, 12, 28, 12).unwrap();
+        let second_event_at = first_event_at + Duration::minutes(10);
+
+        assert!(!attempts.is_duplicate_at(&trigger, first_event_at, first_event_at));
+        assert!(!attempts.is_duplicate_at(
+            &trigger,
+            second_event_at,
+            first_event_at + Duration::minutes(10)
+        ));
     }
 
     #[test]
@@ -4776,9 +4975,17 @@ mod tests {
         };
         let now = Utc.with_ymd_and_hms(2026, 5, 29, 12, 25, 38).unwrap();
 
-        assert!(!attempts.is_duplicate(&trigger, now));
-        assert!(!attempts.is_duplicate(&different_room, now + Duration::seconds(1)));
-        assert!(!attempts.is_duplicate(&different_content, now + Duration::seconds(1)));
+        assert!(!attempts.is_duplicate_at(&trigger, now, now));
+        assert!(!attempts.is_duplicate_at(
+            &different_room,
+            now + Duration::seconds(1),
+            now + Duration::seconds(1)
+        ));
+        assert!(!attempts.is_duplicate_at(
+            &different_content,
+            now + Duration::seconds(1),
+            now + Duration::seconds(1)
+        ));
     }
 
     #[test]
