@@ -2368,58 +2368,26 @@ async fn complete_chat_summary_with_fallback(
         output_limit,
     )
     .await?;
-    let combined_input = format_chunk_summaries_for_final(&chunk_summaries);
-    let final_prompt = render_prompt_template(user_prompt_template, &combined_input, "", "");
-    let final_prompt_chars = final_prompt.chars().count();
-    if final_prompt_chars > max_prompt_chars {
-        warn!(
-            room_id = %room_id,
-            stage,
-            final_prompt_chars,
-            max_prompt_chars,
-            chunks = chunk_summaries.len(),
-            "LLM long chat final summary still exceeds limit; returning concatenated chunk summaries"
-        );
-        append_runtime_log(
-            config,
-            &format!(
-                "llm long chat final skipped room={} stage={} final_prompt_chars={} max_chars={} chunks={}",
-                room_id,
-                stage,
-                final_prompt_chars,
-                max_prompt_chars,
-                chunk_summaries.len()
-            ),
-        );
-        return Ok(LongChatCompletion {
-            output: combined_input.clone(),
-            followup_chat_input: combined_input,
-        });
-    }
-
+    let combined_input = format_chunk_summaries_for_output(&chunk_summaries);
+    info!(
+        room_id = %room_id,
+        stage,
+        chunks = chunk_summaries.len(),
+        output_chars = combined_input.chars().count(),
+        "LLM long chat fallback completed with concatenated chunk summaries"
+    );
     append_runtime_log(
         config,
         &format!(
-            "calling llm {} final room={} prompt_chars={} chunks={} output_limit={}",
-            stage,
+            "llm long chat fallback concatenated room={} stage={} chunks={} output_chars={}",
             room_id,
-            final_prompt_chars,
+            stage,
             chunk_summaries.len(),
-            output_limit.label()
+            combined_input.chars().count()
         ),
     );
-    let output = complete_llm_with_rate_limit_queue(
-        config,
-        llm,
-        room_id,
-        &format!("{stage} final"),
-        system_prompt,
-        final_prompt,
-        output_limit,
-    )
-    .await?;
     Ok(LongChatCompletion {
-        output,
+        output: combined_input.clone(),
         followup_chat_input: combined_input,
     })
 }
@@ -2783,11 +2751,10 @@ fn formatted_chat_line_chars(message: &ChatMessage) -> usize {
     .count()
 }
 
-fn format_chunk_summaries_for_final(summaries: &[ChunkSummary]) -> String {
+fn format_chunk_summaries_for_output(summaries: &[ChunkSummary]) -> String {
     let mut parts = vec![
         "[CHUNK_SUMMARIES]".to_string(),
-        "以下是同一段群聊按时间顺序切分后的分段总结。请综合这些分段总结，输出一份全局总结；如果无法再次请求模型，可直接发送这些分段总结。"
-            .to_string(),
+        "以下是同一段群聊按时间顺序切分后的分段总结。".to_string(),
     ];
     for summary in summaries {
         parts.push(format!(
@@ -4632,8 +4599,8 @@ mod tests {
     }
 
     #[test]
-    fn chunk_summary_concat_keeps_chunk_order() {
-        let combined = format_chunk_summaries_for_final(&[
+    fn chunk_summary_output_keeps_chunk_order() {
+        let combined = format_chunk_summaries_for_output(&[
             ChunkSummary {
                 index: 0,
                 message_count: 2,
