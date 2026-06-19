@@ -25,7 +25,7 @@ use wechat_summary_ai::{
     OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
 };
 use wechat_summary_core::{
-    config::{ListenConfig, PlatformKindConfig, TimeRangeMode},
+    config::{ListenConfig, PlatformKindConfig, PrivacyConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
     AgentConfig, ChatFormatter, PrivacyFilter, ResolvedTimeRange, TimeRangeCalculator,
     TriggerMatch, TriggerMatcher,
@@ -46,6 +46,7 @@ const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
 const LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS: u64 = 60;
 const LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS: usize = 3;
 const CHUNK_PROMPT_HEADROOM_CHARS: usize = 4_096;
+const CONTEXT_LENGTH_SPLIT_MAX_DEPTH: usize = 12;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const TEXT_SUMMARY_REFUSAL_RETRY_PROMPT: &str = r#"
@@ -2082,6 +2083,7 @@ struct LlmChunkRequest {
     message_count: usize,
     input_chars: usize,
     prompt_chars: usize,
+    messages: Vec<ChatMessage>,
     prompt: String,
 }
 
@@ -2364,6 +2366,8 @@ async fn complete_chat_summary_with_fallback(
         room_id,
         stage,
         system_prompt,
+        user_prompt_template,
+        &config.privacy,
         &chunks,
         output_limit,
     )
@@ -2398,6 +2402,8 @@ async fn complete_chunk_requests(
     room_id: &str,
     stage: &str,
     system_prompt: &str,
+    user_prompt_template: &str,
+    privacy_config: &PrivacyConfig,
     chunks: &[LlmChunkRequest],
     output_limit: LlmOutputLimit,
 ) -> Result<Vec<ChunkSummary>> {
@@ -2422,6 +2428,8 @@ async fn complete_chunk_requests(
             room_id,
             stage,
             system_prompt,
+            user_prompt_template,
+            privacy_config,
             chunks,
             chunks[next_chunk].clone(),
             output_limit,
@@ -2491,6 +2499,8 @@ async fn complete_chunk_requests(
                 room_id,
                 stage,
                 system_prompt,
+                user_prompt_template,
+                privacy_config,
                 chunks,
                 chunks[next_chunk].clone(),
                 output_limit,
@@ -2518,13 +2528,15 @@ async fn complete_chunk_requests(
             ),
         );
         tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS)).await;
-        let output = complete_llm_with_rate_limit_queue(
+        let output = retry_chunk_after_rate_limit(
             config,
             llm,
             room_id,
-            &format!("{stage} chunk {}", chunk.index + 1),
+            stage,
             system_prompt,
-            chunk.prompt.clone(),
+            user_prompt_template,
+            privacy_config,
+            &chunk,
             output_limit,
         )
         .await?;
@@ -2551,6 +2563,8 @@ fn spawn_llm_chunk_request(
     room_id: &str,
     stage: &str,
     system_prompt: &str,
+    user_prompt_template: &str,
+    privacy_config: &PrivacyConfig,
     chunks: &[LlmChunkRequest],
     chunk: LlmChunkRequest,
     output_limit: LlmOutputLimit,
@@ -2569,11 +2583,202 @@ fn spawn_llm_chunk_request(
         ),
     );
     let llm = llm.clone();
+    let runtime_config = config.clone();
     let system_prompt = system_prompt.to_string();
+    let user_prompt_template = user_prompt_template.to_string();
+    let privacy_config = privacy_config.clone();
+    let room_id = room_id.to_string();
+    let stage = stage.to_string();
     join_set.spawn(async move {
-        let result = complete_llm_request(&llm, &system_prompt, &chunk.prompt, output_limit).await;
+        let result = complete_llm_chunk_request_with_context_split(
+            &runtime_config,
+            &llm,
+            &room_id,
+            &stage,
+            &system_prompt,
+            &user_prompt_template,
+            &privacy_config,
+            &chunk,
+            output_limit,
+        )
+        .await;
         (chunk, result)
     });
+}
+
+async fn retry_chunk_after_rate_limit(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    stage: &str,
+    system_prompt: &str,
+    user_prompt_template: &str,
+    privacy_config: &PrivacyConfig,
+    chunk: &LlmChunkRequest,
+    output_limit: LlmOutputLimit,
+) -> Result<String> {
+    for attempt in 1..=LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS {
+        match complete_llm_chunk_request_with_context_split(
+            config,
+            llm,
+            room_id,
+            stage,
+            system_prompt,
+            user_prompt_template,
+            privacy_config,
+            chunk,
+            output_limit,
+        )
+        .await
+        {
+            Ok(output) => return Ok(output),
+            Err(AiError::RateLimited(message)) if attempt < LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS => {
+                warn!(
+                    room_id = %room_id,
+                    stage,
+                    chunk = chunk.index + 1,
+                    attempt,
+                    max_attempts = LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
+                    delay_seconds = LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
+                    error = %message,
+                    "LLM chunk queued retry stayed rate limited; waiting"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm chunk queued retry still rate limited room={} stage={} chunk={} attempt={} delay_seconds={} error={}",
+                        room_id,
+                        stage,
+                        chunk.index + 1,
+                        attempt,
+                        LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
+                        message
+                    ),
+                );
+                tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS))
+                    .await;
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
+    }
+
+    bail!(
+        "LLM chunk {} for {stage} stayed rate limited after {} queued attempts",
+        chunk.index + 1,
+        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS
+    )
+}
+
+async fn complete_llm_chunk_request_with_context_split(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    stage: &str,
+    system_prompt: &str,
+    user_prompt_template: &str,
+    privacy_config: &PrivacyConfig,
+    chunk: &LlmChunkRequest,
+    output_limit: LlmOutputLimit,
+) -> std::result::Result<String, AiError> {
+    let mut pending = vec![(chunk.clone(), 0usize)];
+    let mut outputs = Vec::new();
+    while let Some((current, depth)) = pending.pop() {
+        match complete_llm_request(llm, system_prompt, &current.prompt, output_limit).await {
+            Ok(output) => outputs.push(output),
+            Err(error)
+                if is_context_length_exceeded_error(&error)
+                    && current.messages.len() > 1
+                    && depth < CONTEXT_LENGTH_SPLIT_MAX_DEPTH =>
+            {
+                let Some((left, right)) =
+                    split_llm_chunk_request(&current, privacy_config, user_prompt_template)
+                else {
+                    return Err(error);
+                };
+                warn!(
+                    room_id = %room_id,
+                    stage,
+                    chunk = chunk.index + 1,
+                    depth,
+                    message_count = current.message_count,
+                    prompt_chars = current.prompt_chars,
+                    left_messages = left.message_count,
+                    left_prompt_chars = left.prompt_chars,
+                    right_messages = right.message_count,
+                    right_prompt_chars = right.prompt_chars,
+                    "LLM chunk exceeded context; splitting and retrying"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm chunk context exceeded; split retry room={} stage={} chunk={} depth={} messages={} prompt_chars={} left_messages={} left_prompt_chars={} right_messages={} right_prompt_chars={}",
+                        room_id,
+                        stage,
+                        chunk.index + 1,
+                        depth,
+                        current.message_count,
+                        current.prompt_chars,
+                        left.message_count,
+                        left.prompt_chars,
+                        right.message_count,
+                        right.prompt_chars
+                    ),
+                );
+                pending.push((right, depth + 1));
+                pending.push((left, depth + 1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(outputs
+        .into_iter()
+        .map(|output| output.trim().to_string())
+        .filter(|output| !output.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+fn is_context_length_exceeded_error(error: &AiError) -> bool {
+    match error {
+        AiError::InvalidResponse(message) => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("context_length_exceeded")
+                || lower.contains("maximum context length")
+                || lower.contains("reduce the length of the messages")
+        }
+        _ => false,
+    }
+}
+
+fn split_llm_chunk_request(
+    chunk: &LlmChunkRequest,
+    privacy_config: &PrivacyConfig,
+    user_prompt_template: &str,
+) -> Option<(LlmChunkRequest, LlmChunkRequest)> {
+    if chunk.messages.len() <= 1 {
+        return None;
+    }
+
+    let midpoint = chunk.messages.len() / 2;
+    if midpoint == 0 || midpoint >= chunk.messages.len() {
+        return None;
+    }
+
+    let privacy = PrivacyFilter::new(privacy_config.clone());
+    let left = build_llm_chunk_request(
+        chunk.index,
+        chunk.messages[..midpoint].to_vec(),
+        &privacy,
+        user_prompt_template,
+    );
+    let right = build_llm_chunk_request(
+        chunk.index,
+        chunk.messages[midpoint..].to_vec(),
+        &privacy,
+        user_prompt_template,
+    );
+    Some((left, right))
 }
 
 async fn complete_llm_with_rate_limit_queue(
@@ -2683,17 +2888,27 @@ fn build_llm_chunk_requests(
         .into_iter()
         .enumerate()
         .map(|(index, chunk_messages)| {
-            let input = private_formatted_chat_input(&chunk_messages, privacy);
-            let prompt = render_prompt_template(user_prompt_template, &input, "", "");
-            LlmChunkRequest {
-                index,
-                message_count: chunk_messages.len(),
-                input_chars: input.chars().count(),
-                prompt_chars: prompt.chars().count(),
-                prompt,
-            }
+            build_llm_chunk_request(index, chunk_messages, privacy, user_prompt_template)
         })
         .collect()
+}
+
+fn build_llm_chunk_request(
+    index: usize,
+    messages: Vec<ChatMessage>,
+    privacy: &PrivacyFilter,
+    user_prompt_template: &str,
+) -> LlmChunkRequest {
+    let input = private_formatted_chat_input(&messages, privacy);
+    let prompt = render_prompt_template(user_prompt_template, &input, "", "");
+    LlmChunkRequest {
+        index,
+        message_count: messages.len(),
+        input_chars: input.chars().count(),
+        prompt_chars: prompt.chars().count(),
+        messages,
+        prompt,
+    }
 }
 
 fn push_fitted_llm_chunks(
@@ -4596,6 +4811,39 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].message_count, 1);
         assert!(chunks[0].prompt.contains(&oversized));
+    }
+
+    #[test]
+    fn context_length_error_detection_matches_provider_payloads() {
+        let error = AiError::InvalidResponse(
+            "chat completion API returned 400 Bad Request: {\"error\":{\"message\":\"This model's maximum context length is 262144 tokens. Please reduce the length of the messages.\",\"type\":\"context_length_exceeded\"}}"
+                .into(),
+        );
+
+        assert!(is_context_length_exceeded_error(&error));
+    }
+
+    #[test]
+    fn split_llm_chunk_request_keeps_message_boundaries_and_order() {
+        let privacy_config = wechat_summary_core::config::PrivacyConfig::default();
+        let privacy = PrivacyFilter::new(privacy_config.clone());
+        let messages = (0..6)
+            .map(|index| chat_message(1_716_464_700 + index, "alice", &format!("msg-{index}")))
+            .collect::<Vec<_>>();
+        let chunk = build_llm_chunk_request(2, messages, &privacy, "{chat_input}");
+
+        let (left, right) =
+            split_llm_chunk_request(&chunk, &privacy_config, "{chat_input}").unwrap();
+
+        assert_eq!(left.index, 2);
+        assert_eq!(right.index, 2);
+        assert_eq!(left.message_count, 3);
+        assert_eq!(right.message_count, 3);
+        assert!(left.prompt.contains("msg-0"));
+        assert!(left.prompt.contains("msg-2"));
+        assert!(!left.prompt.contains("msg-3"));
+        assert!(right.prompt.contains("msg-3"));
+        assert!(right.prompt.contains("msg-5"));
     }
 
     #[test]
