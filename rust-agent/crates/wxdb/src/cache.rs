@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -103,21 +104,32 @@ impl DbCache {
         let _cache_guard = cache_lock.lock().unwrap();
         self.load_persistent();
         if out_path.exists() {
-            self.entries.insert(
-                rel_key.to_string(),
-                CacheEntry {
-                    db_mtime,
-                    wal_mtime,
-                    decrypted_path: out_path.clone(),
-                },
-            );
-            self.save_persistent();
-            self.prune_old_cache_snapshots(rel_key, &out_path);
-            return Ok(Some(CacheResolve {
-                path: out_path,
-                mode: CacheMode::CacheHit,
-                warning: None,
-            }));
+            if let Err(error) = validate_sqlite_cache(&out_path) {
+                tracing::warn!(
+                    rel_key,
+                    path = %out_path.display(),
+                    error = %error,
+                    "wxdb cache snapshot is unreadable; rebuilding"
+                );
+                remove_cache_snapshot(&out_path);
+                self.entries.remove(rel_key);
+            } else {
+                self.entries.insert(
+                    rel_key.to_string(),
+                    CacheEntry {
+                        db_mtime,
+                        wal_mtime,
+                        decrypted_path: out_path.clone(),
+                    },
+                );
+                self.save_persistent();
+                self.prune_old_cache_snapshots(rel_key, &out_path);
+                return Ok(Some(CacheResolve {
+                    path: out_path,
+                    mode: CacheMode::CacheHit,
+                    warning: None,
+                }));
+            }
         }
 
         let cached = self.entries.get(rel_key).cloned();
@@ -144,13 +156,23 @@ impl DbCache {
                         }));
                     }
                     Err(error) => {
-                        let warning =
-                            format!("缓存快照刷新失败，降级使用上一份缓存 {rel_key}: {error}");
-                        return Ok(Some(CacheResolve {
-                            path: entry.decrypted_path,
-                            mode: CacheMode::StaleCache,
-                            warning: Some(warning),
-                        }));
+                        if validate_sqlite_cache(&entry.decrypted_path).is_ok() {
+                            let warning =
+                                format!("缓存快照刷新失败，降级使用上一份缓存 {rel_key}: {error}");
+                            return Ok(Some(CacheResolve {
+                                path: entry.decrypted_path,
+                                mode: CacheMode::StaleCache,
+                                warning: Some(warning),
+                            }));
+                        }
+                        tracing::warn!(
+                            rel_key,
+                            path = %entry.decrypted_path.display(),
+                            error = %error,
+                            "wxdb stale cache snapshot is unreadable; rebuilding from source"
+                        );
+                        remove_cache_snapshot(&entry.decrypted_path);
+                        self.entries.remove(rel_key);
                     }
                 }
             }
@@ -160,6 +182,9 @@ impl DbCache {
         let decrypt_result = (|| -> Result<()> {
             crypto::full_decrypt(&db_path, &tmp_path, &enc_key)?;
             apply_wal_to_cached(&wal_path, &tmp_path, &enc_key)?;
+            validate_sqlite_cache(&tmp_path).with_context(|| {
+                format!("解密结果不是可读 SQLite 数据库，可能数据库密钥已过期或不匹配: {rel_key}")
+            })?;
             publish_temp_cache(&tmp_path, &out_path)?;
             Ok(())
         })();
@@ -167,7 +192,9 @@ impl DbCache {
         if let Err(error) = decrypt_result {
             let _ = std::fs::remove_file(&tmp_path);
             if let Some(entry) = cached {
-                if entry.decrypted_path.exists() {
+                if entry.decrypted_path.exists()
+                    && validate_sqlite_cache(&entry.decrypted_path).is_ok()
+                {
                     let warning = format!("全量解密失败，降级使用上一份缓存 {rel_key}: {error}");
                     return Ok(Some(CacheResolve {
                         path: entry.decrypted_path,
@@ -261,6 +288,9 @@ impl DbCache {
                     .with_context(|| format!("WAL 增量应用失败: {rel_key}"))?;
                 CacheMode::WalIncremental
             };
+            validate_sqlite_cache(&tmp_path).with_context(|| {
+                format!("缓存快照不是可读 SQLite 数据库，可能数据库密钥已过期或不匹配: {rel_key}")
+            })?;
             publish_temp_cache(&tmp_path, out_path)?;
             Ok(mode)
         })();
@@ -342,6 +372,14 @@ fn cache_file_lock(path: &Path) -> Arc<Mutex<()>> {
 
 fn cache_file_hash(rel_key: &str) -> String {
     format!("{:x}", md5::compute(rel_key.as_bytes()))
+}
+
+fn validate_sqlite_cache(path: &Path) -> Result<()> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("打开 SQLite 缓存失败: {}", path.display()))?;
+    conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+        .with_context(|| format!("读取 SQLite schema 失败: {}", path.display()))?;
+    Ok(())
 }
 
 fn is_cache_snapshot_for_hash(path: &Path, hash: &str) -> bool {

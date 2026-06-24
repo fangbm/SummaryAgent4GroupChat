@@ -41,7 +41,7 @@ pub fn refresh_keys(config: &RuntimeConfig) -> Result<Vec<KeyRefreshReport>> {
     let mut keyring = load_keyring(&config.keys_file).unwrap_or_default();
     let mut reports = Vec::new();
     for db_dir in &config.db_dirs {
-        let report = refresh_keys_for_db_dir(config, db_dir, &mut keyring)?;
+        let report = refresh_keys_for_db_dir(config, db_dir, &mut keyring, true)?;
         reports.push(report);
     }
     save_keyring(&config.keys_file, &keyring)?;
@@ -53,7 +53,7 @@ pub(crate) fn ensure_keys_for_db_dir(
     db_dir: &Path,
 ) -> Result<HashMap<String, String>> {
     let mut keyring = load_keyring(&config.keys_file).unwrap_or_default();
-    let _ = refresh_keys_for_db_dir(config, db_dir, &mut keyring)?;
+    let _ = refresh_keys_for_db_dir(config, db_dir, &mut keyring, false)?;
     save_keyring(&config.keys_file, &keyring)?;
     Ok(keys_for_db_dir(&keyring, db_dir))
 }
@@ -98,6 +98,7 @@ fn refresh_keys_for_db_dir(
     config: &RuntimeConfig,
     db_dir: &Path,
     keyring: &mut StoredKeyring,
+    force_scan: bool,
 ) -> Result<KeyRefreshReport> {
     let db_key = store_key(db_dir);
     let before_keys = keyring
@@ -121,13 +122,32 @@ fn refresh_keys_for_db_dir(
 
     let message_keys = config::message_db_keys(db_dir);
     let current_keys = keys_for_db_dir(keyring, db_dir);
+    let current_store = keyring.stores.get(&db_key);
     let missing_message_key = message_keys
         .iter()
         .any(|rel| !current_keys.contains_key(rel));
     let has_contact_key = current_keys.contains_key("contact/contact.db");
     let has_session_key = current_keys.contains_key("session/session.db");
+    let has_unverified_legacy_key = current_store
+        .map(|store| {
+            ["contact/contact.db", "session/session.db"]
+                .into_iter()
+                .chain(message_keys.iter().map(|rel| rel.as_str()))
+                .any(|rel| {
+                    store
+                        .get(rel)
+                        .map(|key| key.salt.is_empty() || key.source != "memory-scan")
+                        .unwrap_or(false)
+                })
+        })
+        .unwrap_or(false);
 
-    if missing_message_key || !has_contact_key || !has_session_key {
+    if force_scan
+        || missing_message_key
+        || !has_contact_key
+        || !has_session_key
+        || has_unverified_legacy_key
+    {
         match crate::scanner::scan_keys(db_dir) {
             Ok(entries) => {
                 scanned_keys = merge_scanned_keys(keyring, db_dir, entries);
@@ -166,6 +186,13 @@ fn merge_plain_keys(
         if enc_key.len() != 64 {
             continue;
         }
+        if store
+            .get(&rel)
+            .map(|existing| existing.source == "memory-scan" && !existing.salt.is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if !store.contains_key(&rel) {
             inserted += 1;
         }
@@ -184,13 +211,21 @@ fn merge_plain_keys(
 fn merge_scanned_keys(keyring: &mut StoredKeyring, db_dir: &Path, entries: Vec<KeyEntry>) -> usize {
     let db_key = store_key(db_dir);
     let store = keyring.stores.entry(db_key).or_default();
-    let mut inserted = 0usize;
+    let mut upserted = 0usize;
     for entry in entries {
         if entry.enc_key.len() != 64 {
             continue;
         }
-        if !store.contains_key(&entry.db_name) {
-            inserted += 1;
+        let should_count = store
+            .get(&entry.db_name)
+            .map(|existing| {
+                existing.enc_key != entry.enc_key
+                    || existing.salt != entry.salt
+                    || existing.source != "memory-scan"
+            })
+            .unwrap_or(true);
+        if should_count {
+            upserted += 1;
         }
         store.insert(
             entry.db_name,
@@ -201,7 +236,7 @@ fn merge_scanned_keys(keyring: &mut StoredKeyring, db_dir: &Path, entries: Vec<K
             },
         );
     }
-    inserted
+    upserted
 }
 
 fn store_key(db_dir: &Path) -> String {
