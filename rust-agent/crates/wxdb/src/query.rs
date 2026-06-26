@@ -111,7 +111,7 @@ pub fn query_history_with_config(
     let mut global_warnings = Vec::new();
     let query_started = Instant::now();
 
-    tracing::info!(
+    tracing::debug!(
         chat_name = %query.chat_name,
         since = ?query.since,
         until = ?query.until,
@@ -176,7 +176,7 @@ pub fn query_history_with_config(
     if let Some(mut result) = best {
         global_warnings.extend(errors);
         result.meta.warnings.extend(global_warnings);
-        tracing::info!(
+        tracing::debug!(
             chat_name = %query.chat_name,
             count = result.count,
             db_dir = ?result.meta.db_dir,

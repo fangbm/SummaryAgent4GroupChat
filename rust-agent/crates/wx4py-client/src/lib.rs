@@ -223,7 +223,7 @@ impl Wx4pyClient {
         let total_timeout_seconds = history_query_timeout_seconds(&wx_cli);
         let (sender, receiver) = mpsc::channel();
         let started = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             room_id,
             chat_name,
             %since,
@@ -279,7 +279,7 @@ impl Wx4pyClient {
         match receiver.recv_timeout(StdDuration::from_secs(total_timeout_seconds)) {
             Ok(result) => {
                 match &result {
-                    Ok(messages) => tracing::info!(
+                    Ok(messages) => tracing::debug!(
                         room_id,
                         count = messages.len(),
                         elapsed_ms = started.elapsed().as_millis(),
@@ -409,7 +409,7 @@ fn query_text_messages_inner(
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
-    tracing::info!(
+    tracing::debug!(
         chat_name,
         %since,
         %until,
@@ -456,7 +456,7 @@ fn query_text_messages_via_builtin_wxdb(
     limit: u32,
     media_decode_limit: Option<usize>,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
-    tracing::info!(
+    tracing::debug!(
         chat_name,
         %since,
         %until,
@@ -481,7 +481,7 @@ fn query_text_messages_via_builtin_wxdb(
     for warning in &result.meta.warnings {
         tracing::warn!(chat_name, warning = %warning, "builtin wxdb warning");
     }
-    tracing::info!(
+    tracing::debug!(
         chat_name,
         count = result.messages.len(),
         db_dir = ?result.meta.db_dir,
