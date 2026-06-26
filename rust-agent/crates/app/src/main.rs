@@ -43,6 +43,7 @@ const RECENT_OBSERVED_MAX_MESSAGES: usize = 5_000;
 const WXDB_COMMAND_WATCH_INTERVAL_SECONDS: u64 = 3;
 const WXDB_COMMAND_WATCH_LOOKBACK_SECONDS: i64 = 300;
 const WXDB_COMMAND_WATCH_LIMIT: usize = 300;
+const WXDB_COMMAND_WATCH_ERROR_LOG_INTERVAL_SECONDS: i64 = 5 * 60;
 const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
 const LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS: u64 = 60;
 const LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS: usize = 3;
@@ -80,7 +81,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
     let config = config_reloader.config();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&config.runtime.log_level))
+        .with_env_filter(runtime_env_filter(&config.runtime.log_level))
         .with_writer(RuntimeTraceWriter::new(config))
         .with_ansi(false)
         .init();
@@ -306,12 +307,14 @@ fn run_wxdb_command_watcher(
     );
 
     let mut seen = HashSet::new();
+    let mut recent_errors = WxdbCommandWatcherErrors::default();
     loop {
         let now = Utc::now();
         let since = now - Duration::seconds(WXDB_COMMAND_WATCH_LOOKBACK_SECONDS);
         for room in &rooms {
             match poll_wxdb_command_room(&config, &matcher, room, since, now, &mut seen) {
                 Ok(events) => {
+                    recent_errors.clear_success(&config, room);
                     for event in events {
                         if sender.send(event).is_err() {
                             append_runtime_log(
@@ -323,17 +326,70 @@ fn run_wxdb_command_watcher(
                     }
                 }
                 Err(error) => {
-                    append_runtime_log(
-                        &config,
-                        &format!(
-                            "wxdb command watcher poll failed room={} error={error:#}",
-                            room
-                        ),
-                    );
+                    recent_errors.record(&config, room, &error);
                 }
             }
         }
         thread::sleep(StdDuration::from_secs(WXDB_COMMAND_WATCH_INTERVAL_SECONDS));
+    }
+}
+
+#[derive(Default)]
+struct WxdbCommandWatcherErrors {
+    by_room: HashMap<String, WxdbCommandWatcherErrorState>,
+}
+
+struct WxdbCommandWatcherErrorState {
+    first_seen: DateTime<Utc>,
+    last_logged: DateTime<Utc>,
+    suppressed: usize,
+}
+
+impl WxdbCommandWatcherErrors {
+    fn record(&mut self, config: &AgentConfig, room: &str, error: &anyhow::Error) {
+        let now = Utc::now();
+        let state = self
+            .by_room
+            .entry(room.to_string())
+            .or_insert(WxdbCommandWatcherErrorState {
+                first_seen: now,
+                last_logged: now - Duration::seconds(WXDB_COMMAND_WATCH_ERROR_LOG_INTERVAL_SECONDS),
+                suppressed: 0,
+            });
+
+        if now.signed_duration_since(state.last_logged).num_seconds()
+            >= WXDB_COMMAND_WATCH_ERROR_LOG_INTERVAL_SECONDS
+        {
+            append_runtime_log(
+                config,
+                &format!(
+                    "wxdb command watcher poll failed room={} first_seen={} suppressed={} error={}",
+                    room,
+                    state.first_seen,
+                    state.suppressed,
+                    compact_error_for_runtime(&format!("{error:#}"), 700)
+                ),
+            );
+            state.last_logged = now;
+            state.first_seen = now;
+            state.suppressed = 0;
+        } else {
+            state.suppressed = state.suppressed.saturating_add(1);
+        }
+    }
+
+    fn clear_success(&mut self, config: &AgentConfig, room: &str) {
+        if let Some(state) = self.by_room.remove(room) {
+            if state.suppressed > 0 {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "wxdb command watcher poll recovered room={} suppressed_errors={}",
+                        room, state.suppressed
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -635,6 +691,17 @@ fn config_path_from_args() -> String {
     "config/agent.toml".to_string()
 }
 
+fn runtime_env_filter(log_level: &str) -> EnvFilter {
+    let trimmed = log_level.trim();
+    let level = if trimmed.is_empty() { "info" } else { trimmed };
+    let filter = if level.contains(',') || level.eq_ignore_ascii_case("debug") {
+        level.to_string()
+    } else {
+        format!("{level},wechat_summary_wxdb::query=warn,wx4py_client=warn")
+    };
+    EnvFilter::new(filter)
+}
+
 fn append_runtime_log(config: &AgentConfig, message: &str) {
     let output_dir = std::path::Path::new(&config.runtime.output_dir);
     if fs::create_dir_all(output_dir).is_err() {
@@ -732,6 +799,24 @@ fn retry_notice_reason(reason: &str, max_chars: usize) -> String {
 
 fn compact_ai_error_for_runtime(error: &AiError) -> String {
     retry_notice_reason(&error.to_string(), 700)
+}
+
+fn compact_error_for_runtime(error_message: &str, max_chars: usize) -> String {
+    let compact = error_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let redacted = redact_secret_like_tokens(&compact);
+    let char_count = redacted.chars().count();
+    let mut output = redacted.chars().take(max_chars).collect::<String>();
+    if char_count > max_chars {
+        output.push_str("...");
+    }
+    if output.is_empty() {
+        "unknown".to_string()
+    } else {
+        output
+    }
 }
 
 fn format_failure_message_for_chat(label: &str, error_message: &str) -> String {
