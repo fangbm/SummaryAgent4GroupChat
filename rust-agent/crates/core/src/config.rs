@@ -998,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn history_limit_defaults_to_read_cap() {
+    fn history_limit_defaults_to_page_size() {
         let cfg: HistoryConfig = toml::from_str("").unwrap();
         assert_eq!(
             cfg.max_messages

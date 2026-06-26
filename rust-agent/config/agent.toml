@@ -63,7 +63,8 @@ ignore_rate_limit = true
 sqlite_path = ".\\runtime\\rust-agent.sqlite3"
 
 [history]
-# Cross-platform history read limit. LLM input is only limited by [privacy].max_chars_to_llm.
+# Cross-platform per-read page size. The app keeps reading pages until the requested time range is covered.
+# LLM input is only limited by [privacy].max_chars_to_llm.
 max_messages = 10000
 
 [wxdb]

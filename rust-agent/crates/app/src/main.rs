@@ -1475,6 +1475,159 @@ impl PipelineOptions {
     }
 }
 
+async fn query_platform_history_paginated(
+    config: &AgentConfig,
+    client: &PlatformClient,
+    room_id: &str,
+    room_name: Option<&str>,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    page_limit: usize,
+    media_decode_limit: Option<usize>,
+) -> Result<Vec<PlatformHistoryMessage>> {
+    let page_limit = page_limit.max(1);
+    let query_limit = page_limit.min(u32::MAX as usize) as u32;
+    let mut page_until = until;
+    let mut pages = 0usize;
+    let mut history = Vec::new();
+    let mut seen = HashSet::new();
+    let mut remaining_media_decode_limit = media_decode_limit;
+
+    loop {
+        pages += 1;
+        let page = client
+            .query_text_messages(
+                room_id,
+                room_name,
+                since,
+                page_until,
+                query_limit,
+                remaining_media_decode_limit,
+            )
+            .await
+            .with_context(|| format!("querying platform chat history page {pages}"))?;
+        let page_len = page.len();
+        let first_ts = page.iter().map(|message| message.timestamp).min();
+        let last_ts = page.iter().map(|message| message.timestamp).max();
+        let decoded_media_count = media_decode_attempt_count(&page);
+        if let Some(remaining) = &mut remaining_media_decode_limit {
+            *remaining = remaining.saturating_sub(decoded_media_count);
+        }
+
+        let before_len = history.len();
+        for message in page {
+            if seen.insert(platform_history_message_key(&message)) {
+                history.push(message);
+            }
+        }
+        let new_messages = history.len().saturating_sub(before_len);
+
+        if pages == 1 || pages % 10 == 0 || page_len < page_limit || first_ts <= Some(since) {
+            info!(
+                room_id = %room_id,
+                page = pages,
+                page_len,
+                new_messages,
+                total = history.len(),
+                first = ?first_ts,
+                last = ?last_ts,
+                page_limit,
+                "platform history page completed"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "history page completed room={} page={} page_len={} new={} total={} first={} last={} page_limit={}",
+                    room_id,
+                    pages,
+                    page_len,
+                    new_messages,
+                    history.len(),
+                    first_ts
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_else(|| "-".to_string()),
+                    last_ts
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_else(|| "-".to_string()),
+                    page_limit
+                ),
+            );
+        }
+
+        if page_len == 0 || page_len < page_limit || first_ts <= Some(since) {
+            break;
+        }
+
+        let Some(next_until) = first_ts else {
+            break;
+        };
+
+        if new_messages == 0 || next_until >= page_until {
+            warn!(
+                room_id = %room_id,
+                page = pages,
+                page_until = %page_until,
+                next_until = %next_until,
+                "stopping paginated history query because it made no backward progress"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "history pagination stopped without progress room={} page={} page_until={} next_until={}",
+                    room_id, pages, page_until, next_until
+                ),
+            );
+            break;
+        }
+
+        page_until = next_until;
+    }
+
+    history.sort_by_key(|message| message.timestamp);
+    info!(
+        room_id = %room_id,
+        pages,
+        history_len = history.len(),
+        page_limit,
+        "platform history paginated query completed"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "history paginated query completed room={} pages={} history_len={} page_limit={}",
+            room_id,
+            pages,
+            history.len(),
+            page_limit
+        ),
+    );
+
+    Ok(history)
+}
+
+fn platform_history_message_key(message: &PlatformHistoryMessage) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        message.timestamp.timestamp_millis(),
+        message.sender_id,
+        message.sender_name.as_deref().unwrap_or(""),
+        message.msg_type,
+        message.content,
+        message.media_path.as_deref().unwrap_or(""),
+        message.thumbnail_path.as_deref().unwrap_or(""),
+        message.decoded_media_path.as_deref().unwrap_or("")
+    )
+}
+
+fn media_decode_attempt_count(messages: &[PlatformHistoryMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message.decoded_media_path.is_some() || message.media_decode_error.is_some()
+        })
+        .count()
+}
+
 async fn run_summary_pipeline(
     config: &AgentConfig,
     client: &PlatformClient,
@@ -1517,39 +1670,39 @@ async fn run_summary_pipeline(
         .log_retry_attempts
         .then(|| retry_log_notifier(config, trigger.room_id.clone()));
 
-    let history_message_limit = config.history_message_limit();
-    let history_query_limit = history_message_limit.min(u32::MAX as usize) as u32;
+    let history_page_limit = config.history_message_limit();
     let media_decode_limit = summary_media_decode_limit(config);
     info!(
         room_id = %trigger.room_id,
         since = %range.since,
         until = %range.until,
-        limit = history_message_limit,
+        page_limit = history_page_limit,
         media_decode_limit = ?media_decode_limit,
         "querying platform history"
     );
     append_runtime_log(
         config,
         &format!(
-            "history query started room={} since={} until={} limit={} media_decode_limit={}",
+            "history query started room={} since={} until={} page_limit={} media_decode_limit={}",
             trigger.room_id,
             range.since,
             range.until,
-            history_message_limit,
+            history_page_limit,
             format_media_decode_limit(media_decode_limit)
         ),
     );
-    let mut history = client
-        .query_text_messages(
-            &trigger.room_id,
-            incoming.room_name.as_deref(),
-            range.since,
-            range.until,
-            history_query_limit,
-            media_decode_limit,
-        )
-        .await
-        .context("querying platform chat history")?;
+    let mut history = query_platform_history_paginated(
+        config,
+        client,
+        &trigger.room_id,
+        incoming.room_name.as_deref(),
+        range.since,
+        range.until,
+        history_page_limit,
+        media_decode_limit,
+    )
+    .await
+    .context("querying platform chat history")?;
     if history.is_empty() {
         let observed_count = recent_observed_messages
             .map(|recent| {
@@ -1588,17 +1741,18 @@ async fn run_summary_pipeline(
                     ),
                 );
                 tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
-                history = client
-                    .query_text_messages(
-                        &trigger.room_id,
-                        incoming.room_name.as_deref(),
-                        range.since,
-                        range.until,
-                        history_query_limit,
-                        media_decode_limit,
-                    )
-                    .await
-                    .context("retrying platform chat history after suspicious empty result")?;
+                history = query_platform_history_paginated(
+                    config,
+                    client,
+                    &trigger.room_id,
+                    incoming.room_name.as_deref(),
+                    range.since,
+                    range.until,
+                    history_page_limit,
+                    media_decode_limit,
+                )
+                .await
+                .context("retrying platform chat history after suspicious empty result")?;
                 append_runtime_log(
                     config,
                     &format!(

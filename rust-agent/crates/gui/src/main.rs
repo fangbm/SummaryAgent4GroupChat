@@ -838,7 +838,7 @@ fn listen_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             ui.checkbox(&mut view.rate_limit_enabled, "启用手动总结冷却");
             number_i64(ui, "总结指令冷却秒数", &mut view.summary_cooldown_seconds);
             number_i64(ui, "图片额外冷却秒数", &mut view.image_cooldown_seconds);
-            number_u32(ui, "历史读取最大条数", &mut view.history_max_messages);
+            number_u32(ui, "历史单次读取条数", &mut view.history_max_messages);
         },
         |ui| {
             multiline_field(ui, "监听白名单", &mut view.whitelist_rooms, 5);

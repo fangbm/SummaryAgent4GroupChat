@@ -82,8 +82,9 @@ unless the image argument is present. When it is `true`, manual commands generat
 images by default and the image argument skips image generation for that request.
 Scheduled summaries still use `scheduled_summary.send_image`.
 
-`history.max_messages` limits how many messages are read from any platform before
-formatting. LLM input is not capped by message count; it is capped only by
+`history.max_messages` is the per-read page size for platform history. The app
+keeps reading pages until the requested time range is covered or the platform has
+no older messages. LLM input is not capped by message count; it is capped only by
 `privacy.max_chars_to_llm`. When long chat input exceeds that limit, the app
 splits it into whole-message chunks and sends up to
 `llm.max_concurrent_chunk_requests` chunk requests at the same time.
