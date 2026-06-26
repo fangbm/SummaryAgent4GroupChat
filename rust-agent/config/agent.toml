@@ -484,3 +484,4 @@ https = "http://127.0.0.1:7890"
 output_dir = ".\\runtime\\rust-output"
 log_level = "info"
 cleanup_after_days = 7
+max_log_mb = 50

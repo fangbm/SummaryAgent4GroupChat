@@ -641,8 +641,37 @@ fn append_runtime_log(config: &AgentConfig, message: &str) {
         return;
     }
     let path = output_dir.join("wechat-summary-app.log");
+    enforce_runtime_log_limit(&path, config.runtime.max_log_mb);
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{} {}", Utc::now().to_rfc3339(), message);
+    }
+}
+
+fn enforce_runtime_log_limit(path: &Path, max_log_mb: u64) {
+    if max_log_mb == 0 {
+        return;
+    }
+    let max_bytes = max_log_mb.saturating_mul(1024).saturating_mul(1024);
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() < max_bytes {
+        return;
+    }
+
+    let rotated_message = format!(
+        "{} log truncated because size reached {} bytes (limit={}MB)",
+        Utc::now().to_rfc3339(),
+        metadata.len(),
+        max_log_mb
+    );
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{rotated_message}");
     }
 }
 
@@ -756,6 +785,7 @@ fn redact_secret_like_tokens(input: &str) -> String {
 #[derive(Clone)]
 struct RuntimeTraceWriter {
     path: PathBuf,
+    max_log_mb: u64,
 }
 
 impl RuntimeTraceWriter {
@@ -764,6 +794,7 @@ impl RuntimeTraceWriter {
         let _ = fs::create_dir_all(output_dir);
         Self {
             path: output_dir.join("wechat-summary-app.log"),
+            max_log_mb: config.runtime.max_log_mb,
         }
     }
 }
@@ -772,6 +803,7 @@ impl<'a> MakeWriter<'a> for RuntimeTraceWriter {
     type Writer = RuntimeTraceGuard;
 
     fn make_writer(&'a self) -> Self::Writer {
+        enforce_runtime_log_limit(&self.path, self.max_log_mb);
         RuntimeTraceGuard {
             file: OpenOptions::new()
                 .create(true)
@@ -5565,6 +5597,30 @@ mod tests {
         let config = test_config();
 
         assert!(!PipelineOptions::scheduled(&config).log_retry_attempts);
+    }
+
+    #[test]
+    fn runtime_log_limit_truncates_oversized_log() {
+        let config_path = unique_config_path();
+        let log_path = config_path.parent().unwrap().join("wechat-summary-app.log");
+        std::fs::write(&log_path, vec![b'x'; 1024 * 1024 + 16]).unwrap();
+
+        enforce_runtime_log_limit(&log_path, 1);
+
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        assert!(text.contains("log truncated because size reached"));
+        assert!(std::fs::metadata(&log_path).unwrap().len() < 1024 * 1024);
+    }
+
+    #[test]
+    fn runtime_log_limit_zero_disables_truncation() {
+        let config_path = unique_config_path();
+        let log_path = config_path.parent().unwrap().join("wechat-summary-app.log");
+        std::fs::write(&log_path, vec![b'x'; 1024 * 1024 + 16]).unwrap();
+
+        enforce_runtime_log_limit(&log_path, 0);
+
+        assert!(std::fs::metadata(&log_path).unwrap().len() > 1024 * 1024);
     }
 
     fn test_config() -> AgentConfig {

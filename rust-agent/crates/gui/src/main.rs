@@ -134,6 +134,7 @@ struct ConfigView {
     runtime_output_dir: String,
     runtime_log_level: String,
     runtime_cleanup_days: u32,
+    runtime_max_log_mb: u32,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1082,6 +1083,7 @@ fn runtime_tab(
             text_field(ui, "输出目录", &mut view.runtime_output_dir);
             text_field(ui, "日志等级", &mut view.runtime_log_level);
             number_u32(ui, "清理天数", &mut view.runtime_cleanup_days);
+            number_u32(ui, "日志上限 MB", &mut view.runtime_max_log_mb);
         },
     );
     ui.separator();
@@ -1714,6 +1716,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             runtime_output_dir: config.runtime.output_dir,
             runtime_log_level: config.runtime.log_level,
             runtime_cleanup_days: config.runtime.cleanup_after_days,
+            runtime_max_log_mb: config.runtime.max_log_mb.min(u32::MAX as u64) as u32,
         };
     }
 
@@ -1959,6 +1962,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         runtime_output_dir: get_str(doc, "runtime", "output_dir", ".\\runtime\\rust-output"),
         runtime_log_level: get_str(doc, "runtime", "log_level", "info"),
         runtime_cleanup_days: get_u64(doc, "runtime", "cleanup_after_days", 7) as u32,
+        runtime_max_log_mb: get_u64(doc, "runtime", "max_log_mb", 50) as u32,
     }
 }
 
@@ -2297,6 +2301,7 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         "cleanup_after_days",
         update.runtime_cleanup_days as i64,
     );
+    set_int(runtime, "max_log_mb", update.runtime_max_log_mb as i64);
 
     let new_text = doc.to_string();
     AgentConfig::from_toml_str(&new_text).context("updated config is invalid")?;

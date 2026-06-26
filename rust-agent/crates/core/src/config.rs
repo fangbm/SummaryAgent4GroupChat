@@ -673,6 +673,8 @@ pub struct RuntimeConfig {
     pub log_level: String,
     #[serde(default = "default_cleanup_days")]
     pub cleanup_after_days: u32,
+    #[serde(default = "default_max_log_mb")]
+    pub max_log_mb: u64,
 }
 
 fn default_true() -> bool {
@@ -980,6 +982,10 @@ fn default_cleanup_days() -> u32 {
     7
 }
 
+fn default_max_log_mb() -> u64 {
+    50
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,6 +1117,7 @@ api_key_env = "LLM_API_KEY""#,
         let cfg = AgentConfig::from_toml_str(include_str!("../../../config/agent.toml")).unwrap();
         assert_eq!(cfg.wx_cli.executable, "builtin");
         assert_eq!(cfg.history_message_limit(), 10_000);
+        assert_eq!(cfg.runtime.max_log_mb, 50);
     }
 
     #[test]
