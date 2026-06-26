@@ -125,7 +125,7 @@ pub fn query_history_with_config(
 
     for db_dir in &config.db_dirs {
         let store_started = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             db_dir = %db_dir.display(),
             chat_name = %query.chat_name,
             "wxdb store query started"
@@ -134,7 +134,7 @@ pub fn query_history_with_config(
             Ok(mut result) => {
                 result.meta.candidates_scanned = config.db_dirs.len();
                 result.meta.db_dir = Some(db_dir.clone());
-                tracing::info!(
+                tracing::debug!(
                     db_dir = %db_dir.display(),
                     chat_name = %query.chat_name,
                     count = result.count,
@@ -152,16 +152,21 @@ pub fn query_history_with_config(
             }
             Err(error) => {
                 let error = format!("{}: {error:#}", db_dir.display());
-                tracing::warn!(
-                    db_dir = %db_dir.display(),
-                    chat_name = %query.chat_name,
-                    error = %error,
-                    elapsed_ms = store_started.elapsed().as_millis(),
-                    "wxdb store query failed"
-                );
                 if is_missing_db_key_error(&error) {
+                    tracing::debug!(
+                        chat_name = %query.chat_name,
+                        elapsed_ms = store_started.elapsed().as_millis(),
+                        "wxdb store query skipped because database key is unavailable"
+                    );
                     missing_key_store_errors.push(error);
                 } else {
+                    tracing::warn!(
+                        db_dir = %db_dir.display(),
+                        chat_name = %query.chat_name,
+                        error = %error,
+                        elapsed_ms = store_started.elapsed().as_millis(),
+                        "wxdb store query failed"
+                    );
                     errors.push(error);
                 }
             }
@@ -226,7 +231,7 @@ fn query_history_in_store(
     query: &HistoryQuery,
 ) -> Result<HistoryResult> {
     let store_started = Instant::now();
-    tracing::info!(
+    tracing::debug!(
         db_dir = %db_dir.display(),
         chat_name = %query.chat_name,
         "wxdb store initialization started"
@@ -235,7 +240,7 @@ fn query_history_in_store(
     if keys.is_empty() {
         anyhow::bail!("没有可用数据库密钥；请确认微信正在运行，必要时用管理员权限执行 wxdb init");
     }
-    tracing::info!(
+    tracing::debug!(
         db_dir = %db_dir.display(),
         key_count = keys.len(),
         elapsed_ms = store_started.elapsed().as_millis(),
@@ -249,14 +254,14 @@ fn query_history_in_store(
         config.mtime_file_for(db_dir),
         keys,
     )?;
-    tracing::info!(
+    tracing::debug!(
         db_dir = %db_dir.display(),
         elapsed_ms = cache_started.elapsed().as_millis(),
         "wxdb cache opened"
     );
     let names_started = Instant::now();
     let names = load_names(&mut cache)?;
-    tracing::info!(
+    tracing::debug!(
         db_dir = %db_dir.display(),
         contacts = names.map.len(),
         known_message_shards = names.msg_db_keys.len(),
@@ -274,7 +279,7 @@ fn query_history_in_store(
     let shard_started = Instant::now();
     let (shards, scanned, mut warnings) = find_msg_shards(&mut cache, &names, &username)?;
     let unknown_shards = unknown_message_shards(&cache, &names);
-    tracing::info!(
+    tracing::debug!(
         db_dir = %db_dir.display(),
         chat_name = %query.chat_name,
         username = %username,
@@ -310,7 +315,7 @@ fn query_history_in_store(
     } else {
         HashMap::new()
     };
-    tracing::info!(
+    tracing::debug!(
         db_dir = %db_dir.display(),
         chat_name = %query.chat_name,
         group_nicknames = group_nicknames.len(),
@@ -350,7 +355,7 @@ fn query_history_in_store(
             shards_hit += 1;
         }
         all_messages.extend(rows);
-        tracing::info!(
+        tracing::debug!(
             db_dir = %db_dir.display(),
             chat_name = %query.chat_name,
             shard = %shard.rel_key,
@@ -365,7 +370,7 @@ fn query_history_in_store(
     all_messages.truncate(query.limit);
     all_messages.sort_by_key(|message| message.timestamp);
     let count = all_messages.len();
-    tracing::info!(
+    tracing::debug!(
         db_dir = %db_dir.display(),
         chat_name = %query.chat_name,
         count,
@@ -546,7 +551,7 @@ fn query_messages(
 ) -> Result<Vec<HistoryMessage>> {
     let started = Instant::now();
     let budget_before = *media_decode_remaining;
-    tracing::info!(
+    tracing::debug!(
         shard = %shard_rel_key,
         db_path = %db_path.display(),
         table,
@@ -730,7 +735,7 @@ fn query_messages(
             media_decode_error: media.as_ref().and_then(|media| media.decode_error.clone()),
         });
     }
-    tracing::info!(
+    tracing::debug!(
         shard = %shard_rel_key,
         db_path = %db_path.display(),
         table,
