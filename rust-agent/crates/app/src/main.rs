@@ -413,8 +413,10 @@ fn poll_wxdb_command_room(
         append_runtime_log(
             config,
             &format!(
-                "wxdb command watcher recovered trigger room={} ts={} content={:?}",
-                event.room_id, event.timestamp, event.content
+                "wxdb command watcher recovered trigger room={} ts={} content_len={}",
+                event.room_id,
+                event.timestamp,
+                event.content.chars().count()
             ),
         );
     }
@@ -829,50 +831,33 @@ async fn handle_platform_event(
     event: PlatformEvent,
 ) -> Result<()> {
     let source_platform = event.platform;
-    let event_preview = event.content.chars().take(40).collect::<String>();
-    info!(
-        platform = source_platform.as_str(),
-        room_id = ?event.room_id,
-        content_len = event.content.chars().count(),
-        content_preview = %event_preview,
-        "platform event received"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "event platform={} room={:?} len={} preview={:?}",
-            source_platform.as_str(),
-            event.room_id,
-            event.content.chars().count(),
-            event_preview
-        ),
-    );
     let incoming = IncomingMessage::from(event);
     if event_source == PlatformEventSource::Realtime {
         recent_observed_messages.record(&incoming, Utc::now());
     }
     let Some(trigger) = matcher.match_message(&incoming) else {
-        append_runtime_log(
-            config,
-            &format!(
-                "event did not match trigger room={} content={:?}",
-                incoming.room_id, incoming.content
-            ),
-        );
         return Ok(());
     };
+    let trigger_content_len = trigger.trigger_content.chars().count();
+    info!(
+        platform = source_platform.as_str(),
+        room_id = %trigger.room_id,
+        event_source = ?event_source,
+        content_len = trigger_content_len,
+        "platform trigger event received"
+    );
 
     let Some(command) = parse_summary_command(&trigger, source_platform) else {
         info!(
             room_id = %trigger.room_id,
-            trigger_content = %trigger.trigger_content,
+            content_len = trigger_content_len,
             "trigger-like message ignored because command arguments were not recognized"
         );
         append_runtime_log(
             config,
             &format!(
-                "trigger-like message ignored room={} content={:?} reason=unrecognized_command_args",
-                trigger.room_id, trigger.trigger_content
+                "trigger-like message ignored room={} content_len={} reason=unrecognized_command_args",
+                trigger.room_id, trigger_content_len
             ),
         );
         return Ok(());
@@ -887,16 +872,16 @@ async fn handle_platform_event(
     {
         info!(
             room_id = %trigger.room_id,
-            trigger_content = %trigger.trigger_content,
+            content_len = trigger_content_len,
             dedupe_seconds = WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS,
             "wxdb recovered trigger ignored because realtime listener already observed it"
         );
         append_runtime_log(
             config,
             &format!(
-                "wxdb recovered trigger ignored by realtime dedupe room={} content={:?} window_seconds={}",
+                "wxdb recovered trigger ignored by realtime dedupe room={} content_len={} window_seconds={}",
                 trigger.room_id,
-                trigger.trigger_content,
+                trigger_content_len,
                 WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS
             ),
         );
@@ -906,7 +891,7 @@ async fn handle_platform_event(
     if recent_trigger_attempts.is_duplicate(&trigger, incoming.timestamp) {
         info!(
             room_id = %trigger.room_id,
-            trigger_content = %trigger.trigger_content,
+            content_len = trigger_content_len,
             dedupe_window_seconds = TRIGGER_DEDUPE_WINDOW_SECONDS,
             dedupe_event_window_seconds = TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS,
             dedupe_retention_seconds = TRIGGER_DEDUPE_RETENTION_SECONDS,
@@ -915,9 +900,9 @@ async fn handle_platform_event(
         append_runtime_log(
             config,
             &format!(
-                "duplicate trigger ignored room={} content={:?} window_seconds={} event_window_seconds={} retention_seconds={}",
+                "duplicate trigger ignored room={} content_len={} window_seconds={} event_window_seconds={} retention_seconds={}",
                 trigger.room_id,
-                trigger.trigger_content,
+                trigger_content_len,
                 TRIGGER_DEDUPE_WINDOW_SECONDS,
                 TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS,
                 TRIGGER_DEDUPE_RETENTION_SECONDS
