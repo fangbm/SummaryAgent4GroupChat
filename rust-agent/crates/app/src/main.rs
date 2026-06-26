@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     sync::{mpsc, Arc},
     thread,
-    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+    time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -697,6 +697,10 @@ fn retry_notice_reason(reason: &str, max_chars: usize) -> String {
     } else {
         output
     }
+}
+
+fn compact_ai_error_for_runtime(error: &AiError) -> String {
+    retry_notice_reason(&error.to_string(), 700)
 }
 
 fn format_failure_message_for_chat(label: &str, error_message: &str) -> String {
@@ -2293,18 +2297,33 @@ async fn complete_image_prompt_with_refusal_retry(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String> {
-    let prompt = llm
-        .complete_without_max_tokens(system_prompt, user_prompt)
-        .await?;
+    let prompt = complete_llm_with_rate_limit_queue(
+        config,
+        llm,
+        room_id,
+        stage,
+        system_prompt,
+        user_prompt.to_string(),
+        LlmOutputLimit::Unlimited,
+    )
+    .await?;
     if !looks_like_text_summary_refusal(&prompt) {
         return Ok(prompt);
     }
 
     log_image_pipeline_refusal_retry(config, room_id, stage, prompt.chars().count());
     let retry_system_prompt = image_pipeline_retry_system_prompt(system_prompt);
-    let retry_prompt = llm
-        .complete_without_max_tokens(&retry_system_prompt, user_prompt)
-        .await?;
+    let retry_stage = format!("{stage} safety_retry");
+    let retry_prompt = complete_llm_with_rate_limit_queue(
+        config,
+        llm,
+        room_id,
+        &retry_stage,
+        &retry_system_prompt,
+        user_prompt.to_string(),
+        LlmOutputLimit::Unlimited,
+    )
+    .await?;
     if looks_like_text_summary_refusal(&retry_prompt) {
         let retry_failure_stage = format!("{stage} after safety-aware retry");
         ensure_image_pipeline_output_not_refusal(
@@ -2517,12 +2536,13 @@ async fn complete_chunk_requests(
                 });
             }
             Err(AiError::RateLimited(message)) => {
+                let safe_message = retry_notice_reason(&message, 500);
                 warn!(
                     room_id = %room_id,
                     stage,
                     chunk = chunk.index + 1,
                     total_chunks = chunks.len(),
-                    error = %message,
+                    error = %safe_message,
                     "LLM chunk hit rate limit; queueing retry"
                 );
                 append_runtime_log(
@@ -2533,7 +2553,7 @@ async fn complete_chunk_requests(
                         stage,
                         chunk.index + 1,
                         chunks.len(),
-                        message
+                        safe_message
                     ),
                 );
                 rate_limited.push(chunk);
@@ -2687,6 +2707,7 @@ async fn retry_chunk_after_rate_limit(
         {
             Ok(output) => return Ok(output),
             Err(AiError::RateLimited(message)) if attempt < LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS => {
+                let safe_message = retry_notice_reason(&message, 500);
                 warn!(
                     room_id = %room_id,
                     stage,
@@ -2694,7 +2715,7 @@ async fn retry_chunk_after_rate_limit(
                     attempt,
                     max_attempts = LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
                     delay_seconds = LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
-                    error = %message,
+                    error = %safe_message,
                     "LLM chunk queued retry stayed rate limited; waiting"
                 );
                 append_runtime_log(
@@ -2706,7 +2727,7 @@ async fn retry_chunk_after_rate_limit(
                         chunk.index + 1,
                         attempt,
                         LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
-                        message
+                        safe_message
                     ),
                 );
                 tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS))
@@ -2737,8 +2758,37 @@ async fn complete_llm_chunk_request_with_context_split(
     let mut pending = vec![(chunk.clone(), 0usize)];
     let mut outputs = Vec::new();
     while let Some((current, depth)) = pending.pop() {
+        append_runtime_log(
+            config,
+            &format!(
+                "llm chunk request started room={} stage={} chunk={} depth={} message_count={} input_chars={} prompt_chars={} output_limit={}",
+                room_id,
+                stage,
+                chunk.index + 1,
+                depth,
+                current.message_count,
+                current.input_chars,
+                current.prompt_chars,
+                output_limit.label()
+            ),
+        );
+        let started = Instant::now();
         match complete_llm_request(llm, system_prompt, &current.prompt, output_limit).await {
-            Ok(output) => outputs.push(output),
+            Ok(output) => {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm chunk request completed room={} stage={} chunk={} depth={} elapsed_ms={} output_chars={}",
+                        room_id,
+                        stage,
+                        chunk.index + 1,
+                        depth,
+                        started.elapsed().as_millis(),
+                        output.chars().count()
+                    ),
+                );
+                outputs.push(output);
+            }
             Err(error)
                 if is_context_length_exceeded_error(&error)
                     && current.messages.len() > 1
@@ -2765,11 +2815,12 @@ async fn complete_llm_chunk_request_with_context_split(
                 append_runtime_log(
                     config,
                     &format!(
-                        "llm chunk context exceeded; split retry room={} stage={} chunk={} depth={} messages={} prompt_chars={} left_messages={} left_prompt_chars={} right_messages={} right_prompt_chars={}",
+                        "llm chunk context exceeded; split retry room={} stage={} chunk={} depth={} elapsed_ms={} messages={} prompt_chars={} left_messages={} left_prompt_chars={} right_messages={} right_prompt_chars={}",
                         room_id,
                         stage,
                         chunk.index + 1,
                         depth,
+                        started.elapsed().as_millis(),
                         current.message_count,
                         current.prompt_chars,
                         left.message_count,
@@ -2781,7 +2832,21 @@ async fn complete_llm_chunk_request_with_context_split(
                 pending.push((right, depth + 1));
                 pending.push((left, depth + 1));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm chunk request failed room={} stage={} chunk={} depth={} elapsed_ms={} error={}",
+                        room_id,
+                        stage,
+                        chunk.index + 1,
+                        depth,
+                        started.elapsed().as_millis(),
+                        compact_ai_error_for_runtime(&error)
+                    ),
+                );
+                return Err(error);
+            }
         }
     }
 
@@ -2844,34 +2909,81 @@ async fn complete_llm_with_rate_limit_queue(
     prompt: String,
     output_limit: LlmOutputLimit,
 ) -> Result<String> {
+    let system_chars = system_prompt.chars().count();
+    let prompt_chars = prompt.chars().count();
     for attempt in 1..=LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS {
+        append_runtime_log(
+            config,
+            &format!(
+                "llm request started room={} stage={} attempt={}/{} system_chars={} prompt_chars={} output_limit={}",
+                room_id,
+                stage,
+                attempt,
+                LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
+                system_chars,
+                prompt_chars,
+                output_limit.label()
+            ),
+        );
+        let started = Instant::now();
         match complete_llm_request(llm, system_prompt, &prompt, output_limit).await {
-            Ok(output) => return Ok(output),
+            Ok(output) => {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm request completed room={} stage={} attempt={}/{} elapsed_ms={} output_chars={}",
+                        room_id,
+                        stage,
+                        attempt,
+                        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
+                        started.elapsed().as_millis(),
+                        output.chars().count()
+                    ),
+                );
+                return Ok(output);
+            }
             Err(AiError::RateLimited(message)) if attempt < LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS => {
+                let safe_message = retry_notice_reason(&message, 500);
                 warn!(
                     room_id = %room_id,
                     stage,
                     attempt,
                     max_attempts = LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
                     delay_seconds = LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
-                    error = %message,
+                    error = %safe_message,
                     "LLM request rate limited; queued retry waiting"
                 );
                 append_runtime_log(
                     config,
                     &format!(
-                        "llm rate limited queued retry room={} stage={} attempt={} delay_seconds={} error={}",
+                        "llm request rate limited room={} stage={} attempt={}/{} elapsed_ms={} delay_seconds={} error={}",
                         room_id,
                         stage,
                         attempt,
+                        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
+                        started.elapsed().as_millis(),
                         LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
-                        message
+                        safe_message
                     ),
                 );
                 tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS))
                     .await;
             }
-            Err(error) => return Err(anyhow::Error::new(error)),
+            Err(error) => {
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "llm request failed room={} stage={} attempt={}/{} elapsed_ms={} error={}",
+                        room_id,
+                        stage,
+                        attempt,
+                        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
+                        started.elapsed().as_millis(),
+                        compact_ai_error_for_runtime(&error)
+                    ),
+                );
+                return Err(anyhow::Error::new(error));
+            }
         }
     }
 
