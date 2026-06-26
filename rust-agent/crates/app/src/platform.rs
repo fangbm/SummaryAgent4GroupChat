@@ -27,6 +27,9 @@ use wechat_summary_core::{
 use wx4py_client::{Wx4pyClient, Wx4pyEvent, Wx4pyHistoryMessage, Wx4pySender};
 
 const DISCORD_TEXT_LIMIT: usize = 1_900;
+const WX4PY_TEXT_LIMIT: usize = 1_800;
+const WX4PY_TEXT_CHUNK_HEADER_RESERVE: usize = 40;
+const WX4PY_TEXT_CHUNK_BODY_LIMIT: usize = WX4PY_TEXT_LIMIT - WX4PY_TEXT_CHUNK_HEADER_RESERVE;
 
 pub enum PlatformClient {
     Wx4py(Wx4pyPlatform),
@@ -274,7 +277,13 @@ impl DiscordPlatform {
 impl PlatformSender {
     pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
         match self {
-            Self::Wx4py(sender) => sender.send_text(room_id, text).await.map_err(Into::into),
+            Self::Wx4py(sender) => {
+                let chunks = wx4py_text_chunks(text);
+                for chunk in chunks {
+                    sender.send_text(room_id, &chunk).await?;
+                }
+                Ok(())
+            }
             Self::Discord(sender) => sender.send_text(room_id, text).await,
         }
     }
@@ -586,21 +595,57 @@ fn has_audio_extension(filename: &str) -> bool {
 }
 
 fn discord_text_chunks(text: &str) -> Vec<String> {
+    text_chunks(text, DISCORD_TEXT_LIMIT)
+}
+
+fn wx4py_text_chunks(text: &str) -> Vec<String> {
+    let chunks = text_chunks(text, WX4PY_TEXT_CHUNK_BODY_LIMIT);
+    if chunks.len() <= 1 {
+        return chunks;
+    }
+    let total = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| format!("({}/{})\n{}", index + 1, total, chunk))
+        .collect()
+}
+
+fn text_chunks(text: &str, limit: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
+    }
+    if limit == 0 {
+        return vec![text.to_string()];
     }
 
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut current_len = 0usize;
+    let mut last_break_byte = None;
     for ch in text.chars() {
-        if current_len >= DISCORD_TEXT_LIMIT {
+        if current_len >= limit {
             chunks.push(current);
             current = String::new();
             current_len = 0;
+            last_break_byte = None;
         }
         current.push(ch);
         current_len += 1;
+        if ch == '\n' {
+            last_break_byte = Some(current.len());
+        }
+        if current_len >= limit {
+            if let Some(byte_index) = last_break_byte {
+                if byte_index < current.len() {
+                    let tail = current.split_off(byte_index);
+                    chunks.push(std::mem::take(&mut current));
+                    current = tail;
+                    current_len = current.chars().count();
+                    last_break_byte = current.rfind('\n').map(|index| index + '\n'.len_utf8());
+                }
+            }
+        }
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -694,6 +739,31 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|chunk| chunk.chars().count() <= DISCORD_TEXT_LIMIT));
+    }
+
+    #[test]
+    fn wx4py_text_chunks_add_part_headers_and_stay_under_limit() {
+        let text = "长".repeat(WX4PY_TEXT_CHUNK_BODY_LIMIT * 2 + 1);
+        let chunks = wx4py_text_chunks(&text);
+
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[0].starts_with("(1/3)\n"));
+        assert!(chunks[1].starts_with("(2/3)\n"));
+        assert!(chunks[2].starts_with("(3/3)\n"));
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= WX4PY_TEXT_LIMIT));
+    }
+
+    #[test]
+    fn text_chunks_prefer_newline_boundaries() {
+        let text = format!("{}\n{}", "a".repeat(8), "b".repeat(8));
+        let chunks = text_chunks(&text, 10);
+
+        assert_eq!(
+            chunks,
+            vec!["aaaaaaaa\n".to_string(), "bbbbbbbb".to_string()]
+        );
     }
 
     #[test]
