@@ -37,6 +37,7 @@ use crate::platform::{PlatformClient, PlatformEvent, PlatformHistoryMessage, Pla
 const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
 const TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS: i64 = 5;
 const TRIGGER_DEDUPE_RETENTION_SECONDS: i64 = 2 * 60 * 60;
+const WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS: i64 = 30 * 60;
 const RECENT_OBSERVED_WINDOW_HOURS: i64 = 6;
 const RECENT_OBSERVED_MAX_MESSAGES: usize = 5_000;
 const WXDB_COMMAND_WATCH_INTERVAL_SECONDS: u64 = 3;
@@ -157,6 +158,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 &client,
                 &mut recent_trigger_attempts,
                 &mut recent_observed_messages,
+                PlatformEventSource::WxdbRecovered,
                 event,
             )
             .await?;
@@ -173,6 +175,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 &client,
                 &mut recent_trigger_attempts,
                 &mut recent_observed_messages,
+                PlatformEventSource::Realtime,
                 event,
             )
             .await?;
@@ -214,6 +217,12 @@ fn reload_config_if_changed(
 
 struct WxdbCommandWatcher {
     receiver: Option<mpsc::Receiver<PlatformEvent>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PlatformEventSource {
+    Realtime,
+    WxdbRecovered,
 }
 
 impl WxdbCommandWatcher {
@@ -812,6 +821,7 @@ async fn handle_platform_event(
     client: &PlatformClient,
     recent_trigger_attempts: &mut RecentTriggerAttempts,
     recent_observed_messages: &mut RecentObservedMessages,
+    event_source: PlatformEventSource,
     event: PlatformEvent,
 ) -> Result<()> {
     let source_platform = event.platform;
@@ -834,7 +844,9 @@ async fn handle_platform_event(
         ),
     );
     let incoming = IncomingMessage::from(event);
-    recent_observed_messages.record(&incoming, Utc::now());
+    if event_source == PlatformEventSource::Realtime {
+        recent_observed_messages.record(&incoming, Utc::now());
+    }
     let Some(trigger) = matcher.match_message(&incoming) else {
         append_runtime_log(
             config,
@@ -861,6 +873,31 @@ async fn handle_platform_event(
         );
         return Ok(());
     };
+
+    if event_source == PlatformEventSource::WxdbRecovered
+        && recent_observed_messages.has_matching_trigger(
+            &trigger,
+            Utc::now(),
+            WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS,
+        )
+    {
+        info!(
+            room_id = %trigger.room_id,
+            trigger_content = %trigger.trigger_content,
+            dedupe_seconds = WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS,
+            "wxdb recovered trigger ignored because realtime listener already observed it"
+        );
+        append_runtime_log(
+            config,
+            &format!(
+                "wxdb recovered trigger ignored by realtime dedupe room={} content={:?} window_seconds={}",
+                trigger.room_id,
+                trigger.trigger_content,
+                WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS
+            ),
+        );
+        return Ok(());
+    }
 
     if recent_trigger_attempts.is_duplicate(&trigger, incoming.timestamp) {
         info!(
@@ -1137,6 +1174,23 @@ impl RecentObservedMessages {
                     && !is_agent_status_content(&message.content)
             })
             .count()
+    }
+
+    fn has_matching_trigger(
+        &self,
+        trigger: &TriggerMatch,
+        now: DateTime<Utc>,
+        window_seconds: i64,
+    ) -> bool {
+        let cutoff = now - Duration::seconds(window_seconds);
+        let target_content = trigger.trigger_content.trim();
+        self.messages.iter().any(|message| {
+            message.timestamp >= cutoff
+                && message.room_id == trigger.room_id
+                && message.msg_type == "text"
+                && !message.is_self
+                && message.content.trim() == target_content
+        })
     }
 
     fn prune(&mut self, now: DateTime<Utc>) {
@@ -4748,6 +4802,30 @@ mod tests {
             recent.count_user_text_in_range(room, now - Duration::hours(12), now, &incoming),
             1
         );
+    }
+
+    #[test]
+    fn recent_observed_messages_matches_delayed_wxdb_recovered_trigger() {
+        let room = "paper2galgame用户群2";
+        let base = Utc.with_ymd_and_hms(2026, 6, 26, 3, 43, 7).unwrap();
+        let mut recent = RecentObservedMessages::default();
+        recent.record(&incoming_message(room, "wxid_user", "/总结12h", base), base);
+        let trigger = TriggerMatch {
+            room_id: room.into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结12h".into(),
+        };
+
+        assert!(recent.has_matching_trigger(
+            &trigger,
+            base + Duration::minutes(13),
+            WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS
+        ));
+        assert!(!recent.has_matching_trigger(
+            &trigger,
+            base + Duration::minutes(31),
+            WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS
+        ));
     }
 
     fn incoming_message(
