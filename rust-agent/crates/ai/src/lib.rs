@@ -1,13 +1,14 @@
 use std::{
     env, fs,
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use base64::{engine::general_purpose, Engine};
+use chrono::Utc;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -73,6 +74,7 @@ pub struct OpenAiCompatibleLlm {
     base_url: String,
     model: String,
     retry_notifier: Option<RetryNotifier>,
+    trace_dir: Option<PathBuf>,
 }
 
 impl OpenAiCompatibleLlm {
@@ -98,11 +100,17 @@ impl OpenAiCompatibleLlm {
             base_url,
             model,
             retry_notifier: None,
+            trace_dir: None,
         })
     }
 
     pub fn with_retry_notifier(mut self, retry_notifier: RetryNotifier) -> Self {
         self.retry_notifier = Some(retry_notifier);
+        self
+    }
+
+    pub fn with_trace_dir(mut self, trace_dir: impl Into<PathBuf>) -> Self {
+        self.trace_dir = Some(trace_dir.into());
         self
     }
 
@@ -151,8 +159,10 @@ impl OpenAiCompatibleLlm {
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         for attempt in 1..=max_attempts {
+            let trace_id = Uuid::new_v4();
             let started = Instant::now();
             info!(
+                trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
                 system_chars = system_prompt.chars().count(),
@@ -176,7 +186,22 @@ impl OpenAiCompatibleLlm {
                     let elapsed_ms = started.elapsed().as_millis();
                     let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
                     let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    self.write_chat_completion_trace(ChatCompletionTrace {
+                        trace_id,
+                        endpoint: &endpoint,
+                        attempt,
+                        max_attempts,
+                        elapsed_ms,
+                        status: None,
+                        retry,
+                        retry_after_ms,
+                        max_tokens,
+                        request_body: &payload,
+                        response_body: None,
+                        error: Some(&error.to_string()),
+                    });
                     warn!(
+                        trace_id = %trace_id,
                         elapsed_ms,
                         attempt,
                         max_attempts,
@@ -215,7 +240,22 @@ impl OpenAiCompatibleLlm {
                 let retry_after_ms = retry
                     .then(|| http_retry_delay_ms_for_status(status, attempt))
                     .unwrap_or(0);
+                self.write_chat_completion_trace(ChatCompletionTrace {
+                    trace_id,
+                    endpoint: &endpoint,
+                    attempt,
+                    max_attempts,
+                    elapsed_ms,
+                    status: Some(status.as_u16()),
+                    retry,
+                    retry_after_ms,
+                    max_tokens,
+                    request_body: &payload,
+                    response_body: Some(&body),
+                    error: None,
+                });
                 warn!(
+                    trace_id = %trace_id,
                     status = %status,
                     elapsed_ms,
                     attempt,
@@ -246,6 +286,7 @@ impl OpenAiCompatibleLlm {
                 return Err(AiError::InvalidResponse(message));
             }
             info!(
+                trace_id = %trace_id,
                 status = %status,
                 elapsed_ms,
                 attempt,
@@ -254,9 +295,24 @@ impl OpenAiCompatibleLlm {
             );
 
             let body = response.text().await?;
+            self.write_chat_completion_trace(ChatCompletionTrace {
+                trace_id,
+                endpoint: &endpoint,
+                attempt,
+                max_attempts,
+                elapsed_ms,
+                status: Some(status.as_u16()),
+                retry: false,
+                retry_after_ms: 0,
+                max_tokens,
+                request_body: &payload,
+                response_body: Some(&body),
+                error: None,
+            });
             let response = serde_json::from_str::<Value>(&body).map_err(|error| {
                 let response_for_log = full_response_for_log(&body);
                 warn!(
+                    trace_id = %trace_id,
                     elapsed_ms,
                     response = %response_for_log,
                     "LLM chat completion JSON parsing failed"
@@ -269,6 +325,7 @@ impl OpenAiCompatibleLlm {
                 let finish_reason = chat_completion_finish_reason(&response);
                 let response_for_log = full_response_for_log(&response.to_string());
                 warn!(
+                    trace_id = %trace_id,
                     finish_reason = %finish_reason,
                     response = %response_for_log,
                     "LLM chat completion response is missing content"
@@ -278,6 +335,7 @@ impl OpenAiCompatibleLlm {
                 ))
             })?;
             info!(
+                trace_id = %trace_id,
                 output_chars = content.chars().count(),
                 "LLM chat completion response parsed"
             );
@@ -286,6 +344,76 @@ impl OpenAiCompatibleLlm {
 
         unreachable!("chat completion retry loop always returns")
     }
+
+    fn write_chat_completion_trace(&self, trace: ChatCompletionTrace<'_>) {
+        let Some(trace_dir) = &self.trace_dir else {
+            return;
+        };
+        if let Err(error) = fs::create_dir_all(trace_dir) {
+            warn!(error = %error, path = %trace_dir.display(), "failed to create AI trace directory");
+            return;
+        }
+        let timestamp = Utc::now();
+        let file_name = format!(
+            "{}-llm-chat-{}-attempt-{}.json",
+            timestamp.format("%Y%m%d-%H%M%S-%3f"),
+            trace.trace_id,
+            trace.attempt
+        );
+        let path = trace_dir.join(file_name);
+        let response_json = trace
+            .response_body
+            .and_then(|body| serde_json::from_str::<Value>(body).ok());
+        let response_body = match response_json {
+            Some(value) => redact_json_for_trace(&value),
+            None => trace
+                .response_body
+                .map(|body| Value::String(redact_secret_like_tokens(body)))
+                .unwrap_or(Value::Null),
+        };
+        let payload = json!({
+            "trace_id": trace.trace_id.to_string(),
+            "operation": "llm_chat_completion",
+            "created_at_utc": timestamp.to_rfc3339(),
+            "endpoint": trace.endpoint,
+            "model": self.model,
+            "attempt": trace.attempt,
+            "max_attempts": trace.max_attempts,
+            "elapsed_ms": trace.elapsed_ms,
+            "status": trace.status,
+            "retry": trace.retry,
+            "retry_after_ms": trace.retry_after_ms,
+            "max_tokens": trace.max_tokens,
+            "request_body": redact_json_for_trace(trace.request_body),
+            "response_body": response_body,
+            "error": trace.error.map(redact_secret_like_tokens),
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => {
+                if let Err(error) = fs::write(&path, text) {
+                    warn!(error = %error, path = %path.display(), "failed to write AI trace");
+                } else {
+                    info!(trace_id = %trace.trace_id, path = %path.display(), "AI trace written");
+                }
+            }
+            Err(error) => warn!(error = %error, "failed to serialize AI trace"),
+        }
+    }
+}
+
+struct ChatCompletionTrace<'a> {
+    trace_id: Uuid,
+    endpoint: &'a str,
+    attempt: usize,
+    max_attempts: usize,
+    elapsed_ms: u128,
+    status: Option<u16>,
+    retry: bool,
+    retry_after_ms: u64,
+    max_tokens: Option<u32>,
+    request_body: &'a Value,
+    response_body: Option<&'a str>,
+    error: Option<&'a str>,
 }
 
 pub struct OpenAiVisionCaptionClient {
@@ -2658,6 +2786,47 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     output
 }
 
+fn redact_json_for_trace(value: &Value) -> Value {
+    redact_json_value_for_trace(value, None)
+}
+
+fn redact_json_value_for_trace(value: &Value, key: Option<&str>) -> Value {
+    if key.map(is_sensitive_json_key).unwrap_or(false) {
+        return Value::String("<redacted-secret>".to_string());
+    }
+
+    match value {
+        Value::String(text) => Value::String(redact_secret_like_tokens(text)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_json_value_for_trace(item, None))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut redacted = Map::new();
+            for (key, value) in map {
+                redacted.insert(
+                    key.clone(),
+                    redact_json_value_for_trace(value, Some(key.as_str())),
+                );
+            }
+            Value::Object(redacted)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn is_sensitive_json_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    normalized.contains("apikey")
+        || normalized.contains("authorization")
+        || normalized.contains("accesstoken")
+        || normalized == "token"
+        || normalized.contains("secret")
+        || normalized.contains("password")
+}
+
 fn redact_secret_like_tokens(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut index = 0;
@@ -2696,6 +2865,32 @@ mod tests {
             model: "gpt-image-2".into(),
             retry_notifier: None,
         }
+    }
+
+    #[test]
+    fn trace_redaction_removes_secret_like_values() {
+        let payload = json!({
+            "api_key": "sk-test-secret-value",
+            "headers": {
+                "Authorization": "Bearer sk-auth-secret-value",
+                "x-safe": "plain"
+            },
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "token sk-inline-secret-value should not leak"
+                }
+            ]
+        });
+
+        let redacted = redact_json_for_trace(&payload);
+        assert_eq!(redacted["api_key"], "<redacted-secret>");
+        assert_eq!(redacted["headers"]["Authorization"], "<redacted-secret>");
+        assert_eq!(redacted["headers"]["x-safe"], "plain");
+        assert!(!redacted["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("sk-inline-secret-value"));
     }
 
     fn image_caption_config() -> ImageCaptionConfig {

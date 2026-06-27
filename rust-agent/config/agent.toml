@@ -486,3 +486,7 @@ output_dir = ".\\runtime\\rust-output"
 log_level = "info"
 cleanup_after_days = 7
 max_log_mb = 50
+# Persist redacted AI HTTP request/response bodies for debugging provider issues.
+ai_trace_enabled = true
+# Empty means "<output_dir>\\ai-traces".
+ai_trace_dir = ""

@@ -675,6 +675,10 @@ pub struct RuntimeConfig {
     pub cleanup_after_days: u32,
     #[serde(default = "default_max_log_mb")]
     pub max_log_mb: u64,
+    #[serde(default = "default_ai_trace_enabled")]
+    pub ai_trace_enabled: bool,
+    #[serde(default)]
+    pub ai_trace_dir: String,
 }
 
 fn default_true() -> bool {
@@ -986,6 +990,10 @@ fn default_max_log_mb() -> u64 {
     50
 }
 
+fn default_ai_trace_enabled() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1126,7 @@ api_key_env = "LLM_API_KEY""#,
         assert_eq!(cfg.wx_cli.executable, "builtin");
         assert_eq!(cfg.history_message_limit(), 10_000);
         assert_eq!(cfg.runtime.max_log_mb, 50);
+        assert!(cfg.runtime.ai_trace_enabled);
     }
 
     #[test]

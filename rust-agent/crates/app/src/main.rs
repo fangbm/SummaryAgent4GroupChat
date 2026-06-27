@@ -1923,8 +1923,12 @@ async fn run_summary_pipeline(
             ),
         );
     }
-    let mut llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
-        .context("initializing LLM client")?;
+    let mut llm = configure_llm_tracing(
+        OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
+            .context("initializing LLM client")?,
+        config,
+    )
+    .context("configuring LLM trace output")?;
     if let Some(retry_notifier) = retry_notifier.clone() {
         llm = llm.with_retry_notifier(retry_notifier);
     }
@@ -2293,9 +2297,13 @@ async fn run_background_image_pipeline_inner(
     image_cooldown_recorder: Option<&ImageCooldownRecorder>,
 ) -> Result<()> {
     let retry_notifier = retry_log_notifier(config, room_id.to_string());
-    let llm = OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
-        .context("initializing LLM client for background image pipeline")?
-        .with_retry_notifier(retry_notifier.clone());
+    let llm = configure_llm_tracing(
+        OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
+            .context("initializing LLM client for background image pipeline")?,
+        config,
+    )
+    .context("configuring LLM trace output for background image pipeline")?
+    .with_retry_notifier(retry_notifier.clone());
     let privacy = PrivacyFilter::new(config.privacy.clone());
     let image_summary_result = complete_image_summary_with_refusal_retry(
         config,
@@ -2421,6 +2429,23 @@ impl LlmOutputLimit {
             Self::Unlimited => "unlimited",
         }
     }
+}
+
+fn configure_llm_tracing(
+    llm: OpenAiCompatibleLlm,
+    config: &AgentConfig,
+) -> Result<OpenAiCompatibleLlm> {
+    if !config.runtime.ai_trace_enabled {
+        return Ok(llm);
+    }
+    let trace_dir = if config.runtime.ai_trace_dir.trim().is_empty() {
+        Path::new(&config.runtime.output_dir).join("ai-traces")
+    } else {
+        PathBuf::from(config.runtime.ai_trace_dir.trim())
+    };
+    fs::create_dir_all(&trace_dir)
+        .with_context(|| format!("creating AI trace directory {}", trace_dir.display()))?;
+    Ok(llm.with_trace_dir(trace_dir))
 }
 
 async fn complete_text_summary_with_refusal_retry(
