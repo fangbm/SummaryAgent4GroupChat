@@ -21,8 +21,8 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
 use wechat_summary_ai::{
-    AiError, AiRetryNotice, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm, OpenAiImageClient,
-    OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
+    AiError, AiRetryNotice, AiTraceContext, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm,
+    OpenAiImageClient, OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
 };
 use wechat_summary_core::{
     config::{ListenConfig, PlatformKindConfig, PrivacyConfig, TimeRangeMode},
@@ -2435,8 +2435,15 @@ fn configure_llm_tracing(
     llm: OpenAiCompatibleLlm,
     config: &AgentConfig,
 ) -> Result<OpenAiCompatibleLlm> {
+    Ok(match ai_trace_dir(config)? {
+        Some(trace_dir) => llm.with_trace_dir(trace_dir),
+        None => llm,
+    })
+}
+
+fn ai_trace_dir(config: &AgentConfig) -> Result<Option<PathBuf>> {
     if !config.runtime.ai_trace_enabled {
-        return Ok(llm);
+        return Ok(None);
     }
     let trace_dir = if config.runtime.ai_trace_dir.trim().is_empty() {
         Path::new(&config.runtime.output_dir).join("ai-traces")
@@ -2445,7 +2452,45 @@ fn configure_llm_tracing(
     };
     fs::create_dir_all(&trace_dir)
         .with_context(|| format!("creating AI trace directory {}", trace_dir.display()))?;
-    Ok(llm.with_trace_dir(trace_dir))
+    Ok(Some(trace_dir))
+}
+
+fn ai_trace_context(room_id: &str, stage: &str) -> AiTraceContext {
+    AiTraceContext {
+        room_id: Some(room_id.to_string()),
+        stage: Some(stage.to_string()),
+        ..Default::default()
+    }
+}
+
+fn ai_trace_context_for_chunk(
+    room_id: &str,
+    stage: &str,
+    chunk_index: usize,
+    chunk_total: usize,
+) -> AiTraceContext {
+    AiTraceContext {
+        room_id: Some(room_id.to_string()),
+        stage: Some(stage.to_string()),
+        chunk_index: Some(chunk_index),
+        chunk_total: Some(chunk_total),
+        ..Default::default()
+    }
+}
+
+fn ai_trace_context_for_item(
+    room_id: &str,
+    stage: &str,
+    item_index: usize,
+    item_total: usize,
+) -> AiTraceContext {
+    AiTraceContext {
+        room_id: Some(room_id.to_string()),
+        stage: Some(stage.to_string()),
+        item_index: Some(item_index),
+        item_total: Some(item_total),
+        ..Default::default()
+    }
 }
 
 async fn complete_text_summary_with_refusal_retry(
@@ -2586,6 +2631,7 @@ async fn complete_image_prompt_with_refusal_retry(
         system_prompt,
         user_prompt.to_string(),
         LlmOutputLimit::Unlimited,
+        None,
     )
     .await?;
     if !looks_like_text_summary_refusal(&prompt) {
@@ -2603,6 +2649,7 @@ async fn complete_image_prompt_with_refusal_retry(
         &retry_system_prompt,
         user_prompt.to_string(),
         LlmOutputLimit::Unlimited,
+        None,
     )
     .await?;
     if looks_like_text_summary_refusal(&retry_prompt) {
@@ -2681,6 +2728,7 @@ async fn complete_chat_summary_with_fallback(
             system_prompt,
             full_prompt,
             output_limit,
+            None,
         )
         .await?;
         return Ok(LongChatCompletion {
@@ -2787,6 +2835,7 @@ async fn complete_chunk_requests(
             privacy_config,
             chunks,
             chunks[next_chunk].clone(),
+            chunks.len(),
             output_limit,
         );
         next_chunk += 1;
@@ -2860,6 +2909,7 @@ async fn complete_chunk_requests(
                 privacy_config,
                 chunks,
                 chunks[next_chunk].clone(),
+                chunks.len(),
                 output_limit,
             );
             next_chunk += 1;
@@ -2894,6 +2944,7 @@ async fn complete_chunk_requests(
             user_prompt_template,
             privacy_config,
             &chunk,
+            chunks.len(),
             output_limit,
         )
         .await?;
@@ -2925,6 +2976,7 @@ fn spawn_llm_chunk_request(
     privacy_config: &PrivacyConfig,
     chunks: &[LlmChunkRequest],
     chunk: LlmChunkRequest,
+    chunk_total: usize,
     output_limit: LlmOutputLimit,
 ) {
     append_runtime_log(
@@ -2957,6 +3009,7 @@ fn spawn_llm_chunk_request(
             &user_prompt_template,
             &privacy_config,
             &chunk,
+            chunk_total,
             output_limit,
         )
         .await;
@@ -2973,6 +3026,7 @@ async fn retry_chunk_after_rate_limit(
     user_prompt_template: &str,
     privacy_config: &PrivacyConfig,
     chunk: &LlmChunkRequest,
+    chunk_total: usize,
     output_limit: LlmOutputLimit,
 ) -> Result<String> {
     for attempt in 1..=LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS {
@@ -2985,6 +3039,7 @@ async fn retry_chunk_after_rate_limit(
             user_prompt_template,
             privacy_config,
             chunk,
+            chunk_total,
             output_limit,
         )
         .await
@@ -3037,6 +3092,7 @@ async fn complete_llm_chunk_request_with_context_split(
     user_prompt_template: &str,
     privacy_config: &PrivacyConfig,
     chunk: &LlmChunkRequest,
+    chunk_total: usize,
     output_limit: LlmOutputLimit,
 ) -> std::result::Result<String, AiError> {
     let mut pending = vec![(chunk.clone(), 0usize)];
@@ -3057,7 +3113,14 @@ async fn complete_llm_chunk_request_with_context_split(
             ),
         );
         let started = Instant::now();
-        match complete_llm_request(llm, system_prompt, &current.prompt, output_limit).await {
+        let traced_llm = llm.clone().with_trace_context(ai_trace_context_for_chunk(
+            room_id,
+            stage,
+            chunk.index + 1,
+            chunk_total,
+        ));
+        match complete_llm_request(&traced_llm, system_prompt, &current.prompt, output_limit).await
+        {
             Ok(output) => {
                 append_runtime_log(
                     config,
@@ -3192,6 +3255,7 @@ async fn complete_llm_with_rate_limit_queue(
     system_prompt: &str,
     prompt: String,
     output_limit: LlmOutputLimit,
+    trace_chunk: Option<(usize, usize)>,
 ) -> Result<String> {
     let system_chars = system_prompt.chars().count();
     let prompt_chars = prompt.chars().count();
@@ -3210,7 +3274,15 @@ async fn complete_llm_with_rate_limit_queue(
             ),
         );
         let started = Instant::now();
-        match complete_llm_request(llm, system_prompt, &prompt, output_limit).await {
+        let traced_llm = match trace_chunk {
+            Some((chunk_index, chunk_total)) => llm.clone().with_trace_context(
+                ai_trace_context_for_chunk(room_id, stage, chunk_index, chunk_total),
+            ),
+            None => llm
+                .clone()
+                .with_trace_context(ai_trace_context(room_id, stage)),
+        };
+        match complete_llm_request(&traced_llm, system_prompt, &prompt, output_limit).await {
             Ok(output) => {
                 let output = sanitize_llm_visible_output_with_log(config, room_id, stage, &output);
                 append_runtime_log(
@@ -3594,6 +3666,11 @@ async fn generate_summary_image(
 ) -> Result<ImageArtifact> {
     let mut image_client = OpenAiImageClient::new(config.image_gen.clone(), &config.proxy)
         .context("initializing image client")?;
+    if let Some(trace_dir) = ai_trace_dir(config)? {
+        image_client = image_client.with_trace_dir(trace_dir);
+    }
+    image_client =
+        image_client.with_trace_context(ai_trace_context(room_id, "summary image generation"));
     if let Some(retry_notifier) = retry_notifier {
         image_client = image_client.with_retry_notifier(retry_notifier);
     }
@@ -4083,7 +4160,10 @@ async fn apply_image_captions(
     }
     let captioner =
         match OpenAiVisionCaptionClient::new(config.image_caption.clone(), &config.proxy) {
-            Ok(client) => client,
+            Ok(client) => match ai_trace_dir(config)? {
+                Some(trace_dir) => client.with_trace_dir(trace_dir),
+                None => client,
+            },
             Err(error) => {
                 let error = error.to_string();
                 warn!(
@@ -4145,6 +4225,8 @@ async fn apply_image_captions(
             &mut join_set,
             Arc::clone(&captioner),
             &candidates[next_candidate],
+            attempted,
+            room_id,
         );
         next_candidate += 1;
     }
@@ -4211,6 +4293,8 @@ async fn apply_image_captions(
                 &mut join_set,
                 Arc::clone(&captioner),
                 &candidates[next_candidate],
+                attempted,
+                room_id,
             );
             next_candidate += 1;
         }
@@ -4238,9 +4322,21 @@ fn spawn_image_caption_task(
     join_set: &mut JoinSet<CaptionTaskResult>,
     captioner: Arc<OpenAiVisionCaptionClient>,
     candidate: &(usize, usize, String),
+    item_total: usize,
+    room_id: &str,
 ) {
     let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
+    let room_id = room_id.to_string();
     join_set.spawn(async move {
+        let captioner = captioner
+            .as_ref()
+            .clone()
+            .with_trace_context(ai_trace_context_for_item(
+                &room_id,
+                "image caption",
+                attempted,
+                item_total,
+            ));
         CaptionTaskResult {
             history_index,
             attempted,
@@ -4294,7 +4390,10 @@ async fn apply_video_captions(
     }
     let captioner = match OpenAiVideoCaptionClient::new(config.video_caption.clone(), &config.proxy)
     {
-        Ok(client) => client,
+        Ok(client) => match ai_trace_dir(config)? {
+            Some(trace_dir) => client.with_trace_dir(trace_dir),
+            None => client,
+        },
         Err(error) => {
             let error = error.to_string();
             warn!(
@@ -4356,6 +4455,8 @@ async fn apply_video_captions(
             &mut join_set,
             Arc::clone(&captioner),
             &candidates[next_candidate],
+            attempted,
+            room_id,
         );
         next_candidate += 1;
     }
@@ -4422,6 +4523,8 @@ async fn apply_video_captions(
                 &mut join_set,
                 Arc::clone(&captioner),
                 &candidates[next_candidate],
+                attempted,
+                room_id,
             );
             next_candidate += 1;
         }
@@ -4441,9 +4544,21 @@ fn spawn_video_caption_task(
     join_set: &mut JoinSet<CaptionTaskResult>,
     captioner: Arc<OpenAiVideoCaptionClient>,
     candidate: &(usize, usize, String),
+    item_total: usize,
+    room_id: &str,
 ) {
     let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
+    let room_id = room_id.to_string();
     join_set.spawn(async move {
+        let captioner = captioner
+            .as_ref()
+            .clone()
+            .with_trace_context(ai_trace_context_for_item(
+                &room_id,
+                "video caption",
+                attempted,
+                item_total,
+            ));
         CaptionTaskResult {
             history_index,
             attempted,
@@ -4497,7 +4612,10 @@ async fn apply_voice_transcriptions(
         config.voice_transcription.clone(),
         &config.proxy,
     ) {
-        Ok(client) => client,
+        Ok(client) => match ai_trace_dir(config)? {
+            Some(trace_dir) => client.with_trace_dir(trace_dir),
+            None => client,
+        },
         Err(error) => {
             let error = error.to_string();
             warn!(
@@ -4564,6 +4682,8 @@ async fn apply_voice_transcriptions(
             Arc::clone(&transcriber),
             Arc::clone(&audio_prep),
             &candidates[next_candidate],
+            attempted,
+            room_id,
         );
         next_candidate += 1;
     }
@@ -4631,6 +4751,8 @@ async fn apply_voice_transcriptions(
                 Arc::clone(&transcriber),
                 Arc::clone(&audio_prep),
                 &candidates[next_candidate],
+                attempted,
+                room_id,
             );
             next_candidate += 1;
         }
@@ -4686,9 +4808,22 @@ fn spawn_voice_transcription_task(
     transcriber: Arc<OpenAiAudioTranscriptionClient>,
     audio_prep: Arc<VoiceTranscriptionAudioPrep>,
     candidate: &(usize, usize, String),
+    item_total: usize,
+    room_id: &str,
 ) {
     let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
+    let room_id = room_id.to_string();
     join_set.spawn(async move {
+        let transcriber =
+            transcriber
+                .as_ref()
+                .clone()
+                .with_trace_context(ai_trace_context_for_item(
+                    &room_id,
+                    "voice transcription",
+                    attempted,
+                    item_total,
+                ));
         let result = match prepare_voice_transcription_audio(audio_prep, source).await {
             Ok(source) => transcriber.transcribe_audio(&source).await,
             Err(error) => Err(error),

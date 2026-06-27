@@ -10,7 +10,7 @@ use std::{
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -66,6 +66,22 @@ pub struct AiRetryNotice {
 pub type RetryNotifier =
     Arc<dyn Fn(AiRetryNotice) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AiTraceContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_total: Option<usize>,
+}
+
 #[derive(Clone)]
 pub struct OpenAiCompatibleLlm {
     config: LlmConfig,
@@ -75,6 +91,7 @@ pub struct OpenAiCompatibleLlm {
     model: String,
     retry_notifier: Option<RetryNotifier>,
     trace_dir: Option<PathBuf>,
+    trace_context: Option<AiTraceContext>,
 }
 
 impl OpenAiCompatibleLlm {
@@ -101,6 +118,7 @@ impl OpenAiCompatibleLlm {
             model,
             retry_notifier: None,
             trace_dir: None,
+            trace_context: None,
         })
     }
 
@@ -111,6 +129,11 @@ impl OpenAiCompatibleLlm {
 
     pub fn with_trace_dir(mut self, trace_dir: impl Into<PathBuf>) -> Self {
         self.trace_dir = Some(trace_dir.into());
+        self
+    }
+
+    pub fn with_trace_context(mut self, trace_context: AiTraceContext) -> Self {
+        self.trace_context = Some(trace_context);
         self
     }
 
@@ -186,9 +209,13 @@ impl OpenAiCompatibleLlm {
                     let elapsed_ms = started.elapsed().as_millis();
                     let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
                     let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
-                    self.write_chat_completion_trace(ChatCompletionTrace {
+                    self.write_http_trace(AiHttpTrace {
                         trace_id,
+                        operation: "llm_chat_completion",
+                        context: self.trace_context.as_ref(),
+                        method: "POST",
                         endpoint: &endpoint,
+                        model: Some(&self.model),
                         attempt,
                         max_attempts,
                         elapsed_ms,
@@ -196,7 +223,7 @@ impl OpenAiCompatibleLlm {
                         retry,
                         retry_after_ms,
                         max_tokens,
-                        request_body: &payload,
+                        request_body: Some(&payload),
                         response_body: None,
                         error: Some(&error.to_string()),
                     });
@@ -240,9 +267,13 @@ impl OpenAiCompatibleLlm {
                 let retry_after_ms = retry
                     .then(|| http_retry_delay_ms_for_status(status, attempt))
                     .unwrap_or(0);
-                self.write_chat_completion_trace(ChatCompletionTrace {
+                self.write_http_trace(AiHttpTrace {
                     trace_id,
+                    operation: "llm_chat_completion",
+                    context: self.trace_context.as_ref(),
+                    method: "POST",
                     endpoint: &endpoint,
+                    model: Some(&self.model),
                     attempt,
                     max_attempts,
                     elapsed_ms,
@@ -250,7 +281,7 @@ impl OpenAiCompatibleLlm {
                     retry,
                     retry_after_ms,
                     max_tokens,
-                    request_body: &payload,
+                    request_body: Some(&payload),
                     response_body: Some(&body),
                     error: None,
                 });
@@ -295,9 +326,13 @@ impl OpenAiCompatibleLlm {
             );
 
             let body = response.text().await?;
-            self.write_chat_completion_trace(ChatCompletionTrace {
+            self.write_http_trace(AiHttpTrace {
                 trace_id,
+                operation: "llm_chat_completion",
+                context: self.trace_context.as_ref(),
+                method: "POST",
                 endpoint: &endpoint,
+                model: Some(&self.model),
                 attempt,
                 max_attempts,
                 elapsed_ms,
@@ -305,7 +340,7 @@ impl OpenAiCompatibleLlm {
                 retry: false,
                 retry_after_ms: 0,
                 max_tokens,
-                request_body: &payload,
+                request_body: Some(&payload),
                 response_body: Some(&body),
                 error: None,
             });
@@ -345,65 +380,21 @@ impl OpenAiCompatibleLlm {
         unreachable!("chat completion retry loop always returns")
     }
 
-    fn write_chat_completion_trace(&self, trace: ChatCompletionTrace<'_>) {
+    fn write_http_trace(&self, trace: AiHttpTrace<'_>) {
         let Some(trace_dir) = &self.trace_dir else {
             return;
         };
-        if let Err(error) = fs::create_dir_all(trace_dir) {
-            warn!(error = %error, path = %trace_dir.display(), "failed to create AI trace directory");
-            return;
-        }
-        let timestamp = Utc::now();
-        let file_name = format!(
-            "{}-llm-chat-{}-attempt-{}.json",
-            timestamp.format("%Y%m%d-%H%M%S-%3f"),
-            trace.trace_id,
-            trace.attempt
-        );
-        let path = trace_dir.join(file_name);
-        let response_json = trace
-            .response_body
-            .and_then(|body| serde_json::from_str::<Value>(body).ok());
-        let response_body = match response_json {
-            Some(value) => redact_json_for_trace(&value),
-            None => trace
-                .response_body
-                .map(|body| Value::String(redact_secret_like_tokens(body)))
-                .unwrap_or(Value::Null),
-        };
-        let payload = json!({
-            "trace_id": trace.trace_id.to_string(),
-            "operation": "llm_chat_completion",
-            "created_at_utc": timestamp.to_rfc3339(),
-            "endpoint": trace.endpoint,
-            "model": self.model,
-            "attempt": trace.attempt,
-            "max_attempts": trace.max_attempts,
-            "elapsed_ms": trace.elapsed_ms,
-            "status": trace.status,
-            "retry": trace.retry,
-            "retry_after_ms": trace.retry_after_ms,
-            "max_tokens": trace.max_tokens,
-            "request_body": redact_json_for_trace(trace.request_body),
-            "response_body": response_body,
-            "error": trace.error.map(redact_secret_like_tokens),
-        });
-        match serde_json::to_string_pretty(&payload) {
-            Ok(text) => {
-                if let Err(error) = fs::write(&path, text) {
-                    warn!(error = %error, path = %path.display(), "failed to write AI trace");
-                } else {
-                    info!(trace_id = %trace.trace_id, path = %path.display(), "AI trace written");
-                }
-            }
-            Err(error) => warn!(error = %error, "failed to serialize AI trace"),
-        }
+        write_ai_http_trace(trace_dir, trace);
     }
 }
 
-struct ChatCompletionTrace<'a> {
+struct AiHttpTrace<'a> {
     trace_id: Uuid,
+    operation: &'static str,
+    context: Option<&'a AiTraceContext>,
+    method: &'static str,
     endpoint: &'a str,
+    model: Option<&'a str>,
     attempt: usize,
     max_attempts: usize,
     elapsed_ms: u128,
@@ -411,11 +402,87 @@ struct ChatCompletionTrace<'a> {
     retry: bool,
     retry_after_ms: u64,
     max_tokens: Option<u32>,
-    request_body: &'a Value,
+    request_body: Option<&'a Value>,
     response_body: Option<&'a str>,
     error: Option<&'a str>,
 }
 
+fn write_ai_http_trace(trace_dir: &Path, trace: AiHttpTrace<'_>) {
+    if let Err(error) = fs::create_dir_all(trace_dir) {
+        warn!(error = %error, path = %trace_dir.display(), "failed to create AI trace directory");
+        return;
+    }
+    let timestamp = Utc::now();
+    let operation_slug = trace.operation.replace('_', "-");
+    let file_name = format!(
+        "{}-{}-{}-attempt-{}.json",
+        timestamp.format("%Y%m%d-%H%M%S-%3f"),
+        operation_slug,
+        trace.trace_id,
+        trace.attempt
+    );
+    let path = trace_dir.join(file_name);
+    let response_json = trace
+        .response_body
+        .and_then(|body| serde_json::from_str::<Value>(body).ok());
+    let response_body = match response_json {
+        Some(value) => redact_json_for_trace(&value),
+        None => trace
+            .response_body
+            .map(|body| Value::String(redact_secret_like_tokens(body)))
+            .unwrap_or(Value::Null),
+    };
+    let request_body = trace
+        .request_body
+        .map(redact_json_for_trace)
+        .unwrap_or(Value::Null);
+    let context = trace
+        .context
+        .and_then(|context| serde_json::to_value(context).ok())
+        .unwrap_or(Value::Null);
+    let payload = json!({
+        "trace_id": trace.trace_id.to_string(),
+        "operation": trace.operation,
+        "context": context,
+        "created_at_utc": timestamp.to_rfc3339(),
+        "method": trace.method,
+        "endpoint": trace.endpoint,
+        "model": trace.model,
+        "attempt": trace.attempt,
+        "max_attempts": trace.max_attempts,
+        "elapsed_ms": trace.elapsed_ms,
+        "status": trace.status,
+        "retry": trace.retry,
+        "retry_after_ms": trace.retry_after_ms,
+        "max_tokens": trace.max_tokens,
+        "request_body": request_body,
+        "response_body": response_body,
+        "error": trace.error.map(redact_secret_like_tokens),
+    });
+    match serde_json::to_string_pretty(&payload) {
+        Ok(text) => {
+            if let Err(error) = fs::write(&path, text) {
+                warn!(error = %error, path = %path.display(), "failed to write AI trace");
+            } else {
+                info!(
+                    trace_id = %trace.trace_id,
+                    operation = trace.operation,
+                    path = %path.display(),
+                    "AI trace written"
+                );
+            }
+        }
+        Err(error) => warn!(error = %error, "failed to serialize AI trace"),
+    }
+}
+
+fn write_optional_ai_http_trace(trace_dir: &Option<PathBuf>, trace: AiHttpTrace<'_>) {
+    if let Some(trace_dir) = trace_dir {
+        write_ai_http_trace(trace_dir, trace);
+    }
+}
+
+#[derive(Clone)]
 pub struct OpenAiVisionCaptionClient {
     config: ImageCaptionConfig,
     client: reqwest::Client,
@@ -423,6 +490,8 @@ pub struct OpenAiVisionCaptionClient {
     base_url: String,
     model: String,
     retry_notifier: Option<RetryNotifier>,
+    trace_dir: Option<PathBuf>,
+    trace_context: Option<AiTraceContext>,
 }
 
 impl OpenAiVisionCaptionClient {
@@ -451,11 +520,23 @@ impl OpenAiVisionCaptionClient {
             base_url,
             model,
             retry_notifier: None,
+            trace_dir: None,
+            trace_context: None,
         })
     }
 
     pub fn with_retry_notifier(mut self, retry_notifier: RetryNotifier) -> Self {
         self.retry_notifier = Some(retry_notifier);
+        self
+    }
+
+    pub fn with_trace_dir(mut self, trace_dir: impl Into<PathBuf>) -> Self {
+        self.trace_dir = Some(trace_dir.into());
+        self
+    }
+
+    pub fn with_trace_context(mut self, trace_context: AiTraceContext) -> Self {
+        self.trace_context = Some(trace_context);
         self
     }
 
@@ -602,8 +683,10 @@ impl OpenAiVisionCaptionClient {
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         for attempt in 1..=max_attempts {
+            let trace_id = Uuid::new_v4();
             let started = Instant::now();
             info!(
+                trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
                 prompt_chars = self.config.user_prompt.chars().count(),
@@ -624,10 +707,33 @@ impl OpenAiVisionCaptionClient {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    let elapsed_ms = started.elapsed().as_millis();
                     let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
                     let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    write_optional_ai_http_trace(
+                        &self.trace_dir,
+                        AiHttpTrace {
+                            trace_id,
+                            operation: "image_caption",
+                            context: self.trace_context.as_ref(),
+                            method: "POST",
+                            endpoint: &endpoint,
+                            model: Some(&self.model),
+                            attempt,
+                            max_attempts,
+                            elapsed_ms,
+                            status: None,
+                            retry,
+                            retry_after_ms,
+                            max_tokens: Some(self.config.max_output_tokens),
+                            request_body: Some(&payload),
+                            response_body: None,
+                            error: Some(&error.to_string()),
+                        },
+                    );
                     warn!(
-                        elapsed_ms = started.elapsed().as_millis(),
+                        trace_id = %trace_id,
+                        elapsed_ms,
                         attempt,
                         max_attempts,
                         retry,
@@ -653,6 +759,7 @@ impl OpenAiVisionCaptionClient {
             };
 
             let status = response.status();
+            let elapsed_ms = started.elapsed().as_millis();
             if !status.is_success() {
                 let body = response
                     .text()
@@ -665,9 +772,31 @@ impl OpenAiVisionCaptionClient {
                 let retry_after_ms = retry
                     .then(|| http_retry_delay_ms_for_status(status, attempt))
                     .unwrap_or(0);
+                write_optional_ai_http_trace(
+                    &self.trace_dir,
+                    AiHttpTrace {
+                        trace_id,
+                        operation: "image_caption",
+                        context: self.trace_context.as_ref(),
+                        method: "POST",
+                        endpoint: &endpoint,
+                        model: Some(&self.model),
+                        attempt,
+                        max_attempts,
+                        elapsed_ms,
+                        status: Some(status.as_u16()),
+                        retry,
+                        retry_after_ms,
+                        max_tokens: Some(self.config.max_output_tokens),
+                        request_body: Some(&payload),
+                        response_body: Some(&body),
+                        error: None,
+                    },
+                );
                 warn!(
+                    trace_id = %trace_id,
                     status = %status,
-                    elapsed_ms = started.elapsed().as_millis(),
+                    elapsed_ms,
                     attempt,
                     max_attempts,
                     retry,
@@ -702,9 +831,31 @@ impl OpenAiVisionCaptionClient {
             }
 
             let body = response.text().await?;
+            write_optional_ai_http_trace(
+                &self.trace_dir,
+                AiHttpTrace {
+                    trace_id,
+                    operation: "image_caption",
+                    context: self.trace_context.as_ref(),
+                    method: "POST",
+                    endpoint: &endpoint,
+                    model: Some(&self.model),
+                    attempt,
+                    max_attempts,
+                    elapsed_ms,
+                    status: Some(status.as_u16()),
+                    retry: false,
+                    retry_after_ms: 0,
+                    max_tokens: Some(self.config.max_output_tokens),
+                    request_body: Some(&payload),
+                    response_body: Some(&body),
+                    error: None,
+                },
+            );
             let response = serde_json::from_str::<Value>(&body).map_err(|error| {
                 let response_for_log = full_response_for_log(&body);
                 warn!(
+                    trace_id = %trace_id,
                     response = %response_for_log,
                     "image caption JSON parsing failed"
                 );
@@ -716,6 +867,7 @@ impl OpenAiVisionCaptionClient {
                 let finish_reason = chat_completion_finish_reason(&response);
                 let response_for_log = full_response_for_log(&response.to_string());
                 warn!(
+                    trace_id = %trace_id,
                     finish_reason = %finish_reason,
                     response = %response_for_log,
                     "image caption response is missing content"
@@ -725,6 +877,7 @@ impl OpenAiVisionCaptionClient {
                 ))
             })?;
             info!(
+                trace_id = %trace_id,
                 output_chars = content.chars().count(),
                 "image caption response parsed"
             );
@@ -735,20 +888,26 @@ impl OpenAiVisionCaptionClient {
     }
 }
 
+#[derive(Clone)]
 pub struct OpenAiAudioTranscriptionClient {
     config: VoiceTranscriptionConfig,
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     model: String,
+    trace_dir: Option<PathBuf>,
+    trace_context: Option<AiTraceContext>,
 }
 
+#[derive(Clone)]
 pub struct OpenAiVideoCaptionClient {
     config: VideoCaptionConfig,
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     model: String,
+    trace_dir: Option<PathBuf>,
+    trace_context: Option<AiTraceContext>,
 }
 
 impl OpenAiVideoCaptionClient {
@@ -776,7 +935,19 @@ impl OpenAiVideoCaptionClient {
             api_key,
             base_url,
             model,
+            trace_dir: None,
+            trace_context: None,
         })
+    }
+
+    pub fn with_trace_dir(mut self, trace_dir: impl Into<PathBuf>) -> Self {
+        self.trace_dir = Some(trace_dir.into());
+        self
+    }
+
+    pub fn with_trace_context(mut self, trace_context: AiTraceContext) -> Self {
+        self.trace_context = Some(trace_context);
+        self
     }
 
     pub async fn caption_video(&self, video_source: &str) -> Result<String, AiError> {
@@ -904,8 +1075,10 @@ impl OpenAiVideoCaptionClient {
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         for attempt in 1..=max_attempts {
+            let trace_id = Uuid::new_v4();
             let started = Instant::now();
             info!(
+                trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
                 prompt_chars = self.config.user_prompt.chars().count(),
@@ -926,10 +1099,33 @@ impl OpenAiVideoCaptionClient {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    let elapsed_ms = started.elapsed().as_millis();
                     let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
                     let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    write_optional_ai_http_trace(
+                        &self.trace_dir,
+                        AiHttpTrace {
+                            trace_id,
+                            operation: "video_caption",
+                            context: self.trace_context.as_ref(),
+                            method: "POST",
+                            endpoint: &endpoint,
+                            model: Some(&self.model),
+                            attempt,
+                            max_attempts,
+                            elapsed_ms,
+                            status: None,
+                            retry,
+                            retry_after_ms,
+                            max_tokens: Some(self.config.max_output_tokens),
+                            request_body: Some(&payload),
+                            response_body: None,
+                            error: Some(&error.to_string()),
+                        },
+                    );
                     warn!(
-                        elapsed_ms = started.elapsed().as_millis(),
+                        trace_id = %trace_id,
+                        elapsed_ms,
                         attempt,
                         max_attempts,
                         retry,
@@ -946,6 +1142,7 @@ impl OpenAiVideoCaptionClient {
             };
 
             let status = response.status();
+            let elapsed_ms = started.elapsed().as_millis();
             if !status.is_success() {
                 let body = response
                     .text()
@@ -958,9 +1155,31 @@ impl OpenAiVideoCaptionClient {
                 let retry_after_ms = retry
                     .then(|| http_retry_delay_ms_for_status(status, attempt))
                     .unwrap_or(0);
+                write_optional_ai_http_trace(
+                    &self.trace_dir,
+                    AiHttpTrace {
+                        trace_id,
+                        operation: "video_caption",
+                        context: self.trace_context.as_ref(),
+                        method: "POST",
+                        endpoint: &endpoint,
+                        model: Some(&self.model),
+                        attempt,
+                        max_attempts,
+                        elapsed_ms,
+                        status: Some(status.as_u16()),
+                        retry,
+                        retry_after_ms,
+                        max_tokens: Some(self.config.max_output_tokens),
+                        request_body: Some(&payload),
+                        response_body: Some(&body),
+                        error: None,
+                    },
+                );
                 warn!(
+                    trace_id = %trace_id,
                     status = %status,
-                    elapsed_ms = started.elapsed().as_millis(),
+                    elapsed_ms,
                     attempt,
                     max_attempts,
                     retry,
@@ -986,9 +1205,31 @@ impl OpenAiVideoCaptionClient {
             }
 
             let body = response.text().await?;
+            write_optional_ai_http_trace(
+                &self.trace_dir,
+                AiHttpTrace {
+                    trace_id,
+                    operation: "video_caption",
+                    context: self.trace_context.as_ref(),
+                    method: "POST",
+                    endpoint: &endpoint,
+                    model: Some(&self.model),
+                    attempt,
+                    max_attempts,
+                    elapsed_ms,
+                    status: Some(status.as_u16()),
+                    retry: false,
+                    retry_after_ms: 0,
+                    max_tokens: Some(self.config.max_output_tokens),
+                    request_body: Some(&payload),
+                    response_body: Some(&body),
+                    error: None,
+                },
+            );
             let response = serde_json::from_str::<Value>(&body).map_err(|error| {
                 let response_for_log = full_response_for_log(&body);
                 warn!(
+                    trace_id = %trace_id,
                     response = %response_for_log,
                     "video caption JSON parsing failed"
                 );
@@ -1000,6 +1241,7 @@ impl OpenAiVideoCaptionClient {
                 let finish_reason = chat_completion_finish_reason(&response);
                 let response_for_log = full_response_for_log(&response.to_string());
                 warn!(
+                    trace_id = %trace_id,
                     finish_reason = %finish_reason,
                     response = %response_for_log,
                     "video caption response is missing content"
@@ -1009,6 +1251,7 @@ impl OpenAiVideoCaptionClient {
                 ))
             })?;
             info!(
+                trace_id = %trace_id,
                 output_chars = content.chars().count(),
                 "video caption response parsed"
             );
@@ -1044,7 +1287,19 @@ impl OpenAiAudioTranscriptionClient {
             api_key,
             base_url,
             model,
+            trace_dir: None,
+            trace_context: None,
         })
+    }
+
+    pub fn with_trace_dir(mut self, trace_dir: impl Into<PathBuf>) -> Self {
+        self.trace_dir = Some(trace_dir.into());
+        self
+    }
+
+    pub fn with_trace_context(mut self, trace_context: AiTraceContext) -> Self {
+        self.trace_context = Some(trace_context);
+        self
     }
 
     pub async fn transcribe_audio(&self, audio_path: &str) -> Result<String, AiError> {
@@ -1064,9 +1319,11 @@ impl OpenAiAudioTranscriptionClient {
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
 
         for attempt in 1..=max_attempts {
+            let trace_id = Uuid::new_v4();
             let started = Instant::now();
             let mut file_part =
                 reqwest::multipart::Part::bytes(bytes.clone()).file_name(file_name.clone());
+            let mime = audio_mime_type(path);
             if let Some(mime) = audio_mime_type(path) {
                 file_part = file_part
                     .mime_str(mime)
@@ -1093,8 +1350,11 @@ impl OpenAiAudioTranscriptionClient {
                 }
                 form = form.text(key.clone(), toml_value_to_multipart_string(value));
             }
+            let trace_payload =
+                voice_transcription_multipart_trace_payload(self, &file_name, mime, &bytes);
 
             info!(
+                trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
                 file = %file_name,
@@ -1114,10 +1374,33 @@ impl OpenAiAudioTranscriptionClient {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    let elapsed_ms = started.elapsed().as_millis();
                     let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
                     let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    write_optional_ai_http_trace(
+                        &self.trace_dir,
+                        AiHttpTrace {
+                            trace_id,
+                            operation: "voice_transcription",
+                            context: self.trace_context.as_ref(),
+                            method: "POST",
+                            endpoint: &endpoint,
+                            model: Some(&self.model),
+                            attempt,
+                            max_attempts,
+                            elapsed_ms,
+                            status: None,
+                            retry,
+                            retry_after_ms,
+                            max_tokens: None,
+                            request_body: Some(&trace_payload),
+                            response_body: None,
+                            error: Some(&error.to_string()),
+                        },
+                    );
                     warn!(
-                        elapsed_ms = started.elapsed().as_millis(),
+                        trace_id = %trace_id,
+                        elapsed_ms,
                         attempt,
                         max_attempts,
                         retry,
@@ -1134,6 +1417,7 @@ impl OpenAiAudioTranscriptionClient {
             };
 
             let status = response.status();
+            let elapsed_ms = started.elapsed().as_millis();
             let body = response.text().await?;
             if !status.is_success() {
                 let snippet = truncate_for_log(&body, 500);
@@ -1143,9 +1427,31 @@ impl OpenAiAudioTranscriptionClient {
                 let retry_after_ms = retry
                     .then(|| http_retry_delay_ms_for_status(status, attempt))
                     .unwrap_or(0);
+                write_optional_ai_http_trace(
+                    &self.trace_dir,
+                    AiHttpTrace {
+                        trace_id,
+                        operation: "voice_transcription",
+                        context: self.trace_context.as_ref(),
+                        method: "POST",
+                        endpoint: &endpoint,
+                        model: Some(&self.model),
+                        attempt,
+                        max_attempts,
+                        elapsed_ms,
+                        status: Some(status.as_u16()),
+                        retry,
+                        retry_after_ms,
+                        max_tokens: None,
+                        request_body: Some(&trace_payload),
+                        response_body: Some(&body),
+                        error: None,
+                    },
+                );
                 warn!(
+                    trace_id = %trace_id,
                     status = %status,
-                    elapsed_ms = started.elapsed().as_millis(),
+                    elapsed_ms,
                     attempt,
                     max_attempts,
                     retry,
@@ -1171,10 +1477,32 @@ impl OpenAiAudioTranscriptionClient {
                 return Err(AiError::InvalidResponse(message));
             }
 
+            write_optional_ai_http_trace(
+                &self.trace_dir,
+                AiHttpTrace {
+                    trace_id,
+                    operation: "voice_transcription",
+                    context: self.trace_context.as_ref(),
+                    method: "POST",
+                    endpoint: &endpoint,
+                    model: Some(&self.model),
+                    attempt,
+                    max_attempts,
+                    elapsed_ms,
+                    status: Some(status.as_u16()),
+                    retry: false,
+                    retry_after_ms: 0,
+                    max_tokens: None,
+                    request_body: Some(&trace_payload),
+                    response_body: Some(&body),
+                    error: None,
+                },
+            );
             let text = extract_transcription_text(&body, &self.config.response_format)?;
             info!(
+                trace_id = %trace_id,
                 output_chars = text.chars().count(),
-                elapsed_ms = started.elapsed().as_millis(),
+                elapsed_ms,
                 "voice transcription response parsed"
             );
             return Ok(text);
@@ -1204,8 +1532,10 @@ impl OpenAiAudioTranscriptionClient {
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
 
         for attempt in 1..=max_attempts {
+            let trace_id = Uuid::new_v4();
             let started = Instant::now();
             info!(
+                trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
                 file = %file_name,
@@ -1227,10 +1557,33 @@ impl OpenAiAudioTranscriptionClient {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    let elapsed_ms = started.elapsed().as_millis();
                     let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
                     let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    write_optional_ai_http_trace(
+                        &self.trace_dir,
+                        AiHttpTrace {
+                            trace_id,
+                            operation: "voice_transcription_stepfun",
+                            context: self.trace_context.as_ref(),
+                            method: "POST",
+                            endpoint: &endpoint,
+                            model: Some(&self.model),
+                            attempt,
+                            max_attempts,
+                            elapsed_ms,
+                            status: None,
+                            retry,
+                            retry_after_ms,
+                            max_tokens: None,
+                            request_body: Some(&payload),
+                            response_body: None,
+                            error: Some(&error.to_string()),
+                        },
+                    );
                     warn!(
-                        elapsed_ms = started.elapsed().as_millis(),
+                        trace_id = %trace_id,
+                        elapsed_ms,
                         attempt,
                         max_attempts,
                         retry,
@@ -1247,6 +1600,7 @@ impl OpenAiAudioTranscriptionClient {
             };
 
             let status = response.status();
+            let elapsed_ms = started.elapsed().as_millis();
             let body = response.text().await?;
             if !status.is_success() {
                 let snippet = truncate_for_log(&body, 500);
@@ -1256,9 +1610,31 @@ impl OpenAiAudioTranscriptionClient {
                 let retry_after_ms = retry
                     .then(|| http_retry_delay_ms_for_status(status, attempt))
                     .unwrap_or(0);
+                write_optional_ai_http_trace(
+                    &self.trace_dir,
+                    AiHttpTrace {
+                        trace_id,
+                        operation: "voice_transcription_stepfun",
+                        context: self.trace_context.as_ref(),
+                        method: "POST",
+                        endpoint: &endpoint,
+                        model: Some(&self.model),
+                        attempt,
+                        max_attempts,
+                        elapsed_ms,
+                        status: Some(status.as_u16()),
+                        retry,
+                        retry_after_ms,
+                        max_tokens: None,
+                        request_body: Some(&payload),
+                        response_body: Some(&body),
+                        error: None,
+                    },
+                );
                 warn!(
+                    trace_id = %trace_id,
                     status = %status,
-                    elapsed_ms = started.elapsed().as_millis(),
+                    elapsed_ms,
                     attempt,
                     max_attempts,
                     retry,
@@ -1285,10 +1661,32 @@ impl OpenAiAudioTranscriptionClient {
                 return Err(AiError::InvalidResponse(message));
             }
 
+            write_optional_ai_http_trace(
+                &self.trace_dir,
+                AiHttpTrace {
+                    trace_id,
+                    operation: "voice_transcription_stepfun",
+                    context: self.trace_context.as_ref(),
+                    method: "POST",
+                    endpoint: &endpoint,
+                    model: Some(&self.model),
+                    attempt,
+                    max_attempts,
+                    elapsed_ms,
+                    status: Some(status.as_u16()),
+                    retry: false,
+                    retry_after_ms: 0,
+                    max_tokens: None,
+                    request_body: Some(&payload),
+                    response_body: Some(&body),
+                    error: None,
+                },
+            );
             let text = extract_stepfun_asr_text(&body)?;
             info!(
+                trace_id = %trace_id,
                 output_chars = text.chars().count(),
-                elapsed_ms = started.elapsed().as_millis(),
+                elapsed_ms,
                 "StepFun voice transcription response parsed"
             );
             return Ok(text);
@@ -1395,6 +1793,51 @@ fn toml_value_to_multipart_string(value: &toml::Value) -> String {
         toml::Value::Datetime(value) => value.to_string(),
         toml::Value::Array(_) | toml::Value::Table(_) => value.to_string(),
     }
+}
+
+fn voice_transcription_multipart_trace_payload(
+    client: &OpenAiAudioTranscriptionClient,
+    file_name: &str,
+    mime: Option<&str>,
+    bytes: &[u8],
+) -> Value {
+    let mut fields = Map::new();
+    fields.insert("model".to_string(), json!(client.model));
+    fields.insert(
+        "file".to_string(),
+        json!({
+            "file_name": file_name,
+            "mime": mime,
+            "size_bytes": bytes.len(),
+            "sha256": sha256_hex(bytes),
+            "base64": general_purpose::STANDARD.encode(bytes),
+        }),
+    );
+    if !client.config.language.trim().is_empty() {
+        fields.insert("language".to_string(), json!(client.config.language.trim()));
+    }
+    if !client.config.prompt.trim().is_empty() {
+        fields.insert("prompt".to_string(), json!(client.config.prompt.trim()));
+    }
+    if !client.config.response_format.trim().is_empty() {
+        fields.insert(
+            "response_format".to_string(),
+            json!(client.config.response_format.trim()),
+        );
+    }
+    for (key, value) in &client.config.request_body_overrides {
+        if key == "file" || key == "model" {
+            continue;
+        }
+        fields.insert(key.clone(), json!(toml_value_to_multipart_string(value)));
+    }
+    Value::Object(fields)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn extract_transcription_text(body: &str, response_format: &str) -> Result<String, AiError> {
@@ -2011,6 +2454,7 @@ fn merge_json_override(target: &mut Value, override_value: Value) {
     }
 }
 
+#[derive(Clone)]
 pub struct OpenAiImageClient {
     config: ImageGenConfig,
     client: reqwest::Client,
@@ -2018,6 +2462,8 @@ pub struct OpenAiImageClient {
     base_url: String,
     model: String,
     retry_notifier: Option<RetryNotifier>,
+    trace_dir: Option<PathBuf>,
+    trace_context: Option<AiTraceContext>,
 }
 
 impl OpenAiImageClient {
@@ -2046,11 +2492,23 @@ impl OpenAiImageClient {
             base_url,
             model,
             retry_notifier: None,
+            trace_dir: None,
+            trace_context: None,
         })
     }
 
     pub fn with_retry_notifier(mut self, retry_notifier: RetryNotifier) -> Self {
         self.retry_notifier = Some(retry_notifier);
+        self
+    }
+
+    pub fn with_trace_dir(mut self, trace_dir: impl Into<PathBuf>) -> Self {
+        self.trace_dir = Some(trace_dir.into());
+        self
+    }
+
+    pub fn with_trace_context(mut self, trace_context: AiTraceContext) -> Self {
+        self.trace_context = Some(trace_context);
         self
     }
 
@@ -2078,8 +2536,10 @@ impl OpenAiImageClient {
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         for attempt in 1..=max_attempts {
+            let trace_id = Uuid::new_v4();
             let started = Instant::now();
             info!(
+                trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
                 prompt_chars = prompt.chars().count(),
@@ -2101,10 +2561,33 @@ impl OpenAiImageClient {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    let elapsed_ms = started.elapsed().as_millis();
                     let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
                     let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    write_optional_ai_http_trace(
+                        &self.trace_dir,
+                        AiHttpTrace {
+                            trace_id,
+                            operation: "image_generation",
+                            context: self.trace_context.as_ref(),
+                            method: "POST",
+                            endpoint: &endpoint,
+                            model: Some(&self.model),
+                            attempt,
+                            max_attempts,
+                            elapsed_ms,
+                            status: None,
+                            retry,
+                            retry_after_ms,
+                            max_tokens: None,
+                            request_body: Some(&payload),
+                            response_body: None,
+                            error: Some(&error.to_string()),
+                        },
+                    );
                     warn!(
-                        elapsed_ms = started.elapsed().as_millis(),
+                        trace_id = %trace_id,
+                        elapsed_ms,
                         attempt,
                         max_attempts,
                         retry,
@@ -2141,7 +2624,29 @@ impl OpenAiImageClient {
                 let retry_after_ms = retry
                     .then(|| http_retry_delay_ms_for_status(status, attempt))
                     .unwrap_or(0);
+                write_optional_ai_http_trace(
+                    &self.trace_dir,
+                    AiHttpTrace {
+                        trace_id,
+                        operation: "image_generation",
+                        context: self.trace_context.as_ref(),
+                        method: "POST",
+                        endpoint: &endpoint,
+                        model: Some(&self.model),
+                        attempt,
+                        max_attempts,
+                        elapsed_ms,
+                        status: Some(status.as_u16()),
+                        retry,
+                        retry_after_ms,
+                        max_tokens: None,
+                        request_body: Some(&payload),
+                        response_body: Some(&body),
+                        error: None,
+                    },
+                );
                 warn!(
+                    trace_id = %trace_id,
                     status = %status,
                     elapsed_ms,
                     attempt,
@@ -2175,6 +2680,7 @@ impl OpenAiImageClient {
                 )));
             }
             info!(
+                trace_id = %trace_id,
                 status = %status,
                 elapsed_ms,
                 attempt,
@@ -2182,7 +2688,39 @@ impl OpenAiImageClient {
                 "image generation HTTP request completed"
             );
 
-            let response = response.json::<Value>().await?;
+            let body = response.text().await?;
+            write_optional_ai_http_trace(
+                &self.trace_dir,
+                AiHttpTrace {
+                    trace_id,
+                    operation: "image_generation",
+                    context: self.trace_context.as_ref(),
+                    method: "POST",
+                    endpoint: &endpoint,
+                    model: Some(&self.model),
+                    attempt,
+                    max_attempts,
+                    elapsed_ms,
+                    status: Some(status.as_u16()),
+                    retry: false,
+                    retry_after_ms: 0,
+                    max_tokens: None,
+                    request_body: Some(&payload),
+                    response_body: Some(&body),
+                    error: None,
+                },
+            );
+            let response = serde_json::from_str::<Value>(&body).map_err(|error| {
+                let response_for_log = full_response_for_log(&body);
+                warn!(
+                    trace_id = %trace_id,
+                    response = %response_for_log,
+                    "image generation JSON parsing failed"
+                );
+                AiError::InvalidResponse(format!(
+                    "invalid image generation JSON: {error}; response={response_for_log}"
+                ))
+            })?;
             let bytes = self.image_bytes_from_generation_response(response).await?;
             return self.write_image(output_dir, &bytes);
         }
@@ -2262,33 +2800,55 @@ impl OpenAiImageClient {
             let response = {
                 let mut final_response = None;
                 for http_attempt in 1..=max_attempts {
+                    let trace_id = Uuid::new_v4();
                     let poll_started = Instant::now();
+                    let endpoint = format!("{}/tasks/{}", api_root_url(&self.base_url), task_id);
+                    let request_body = json!({ "task_id": task_id });
                     let response = match self
                         .client
-                        .get(format!(
-                            "{}/tasks/{}",
-                            api_root_url(&self.base_url),
-                            task_id
-                        ))
+                        .get(&endpoint)
                         .bearer_auth(&self.api_key)
                         .send()
                         .await
                     {
                         Ok(response) => response,
                         Err(error) => {
+                            let elapsed_ms = poll_started.elapsed().as_millis();
                             let retry = http_attempt < max_attempts
                                 && should_retry_http_transport_error(&error);
                             let retry_after_ms = retry
                                 .then(|| http_retry_delay_ms(http_attempt))
                                 .unwrap_or(0);
+                            write_optional_ai_http_trace(
+                                &self.trace_dir,
+                                AiHttpTrace {
+                                    trace_id,
+                                    operation: "image_task_poll",
+                                    context: self.trace_context.as_ref(),
+                                    method: "GET",
+                                    endpoint: &endpoint,
+                                    model: Some(&self.model),
+                                    attempt: http_attempt,
+                                    max_attempts,
+                                    elapsed_ms,
+                                    status: None,
+                                    retry,
+                                    retry_after_ms,
+                                    max_tokens: None,
+                                    request_body: Some(&request_body),
+                                    response_body: None,
+                                    error: Some(&error.to_string()),
+                                },
+                            );
                             warn!(
+                                trace_id = %trace_id,
                                 task_id = %task_id,
                                 attempt,
                                 http_attempt,
                                 max_attempts,
                                 retry,
                                 retry_after_ms,
-                                elapsed_ms = poll_started.elapsed().as_millis(),
+                                elapsed_ms,
                                 error = %error,
                                 "image task poll transport failed"
                             );
@@ -2321,7 +2881,29 @@ impl OpenAiImageClient {
                         let retry_after_ms = retry
                             .then(|| http_retry_delay_ms_for_status(status, http_attempt))
                             .unwrap_or(0);
+                        write_optional_ai_http_trace(
+                            &self.trace_dir,
+                            AiHttpTrace {
+                                trace_id,
+                                operation: "image_task_poll",
+                                context: self.trace_context.as_ref(),
+                                method: "GET",
+                                endpoint: &endpoint,
+                                model: Some(&self.model),
+                                attempt: http_attempt,
+                                max_attempts,
+                                elapsed_ms,
+                                status: Some(status.as_u16()),
+                                retry,
+                                retry_after_ms,
+                                max_tokens: None,
+                                request_body: Some(&request_body),
+                                response_body: Some(&body),
+                                error: None,
+                            },
+                        );
                         warn!(
+                            trace_id = %trace_id,
                             task_id = %task_id,
                             attempt,
                             http_attempt,
@@ -2356,15 +2938,49 @@ impl OpenAiImageClient {
                             "image task API returned {status}: {response_for_log}"
                         )));
                     }
-                    final_response = Some((response, elapsed_ms, http_attempt));
+                    let body = response.text().await?;
+                    write_optional_ai_http_trace(
+                        &self.trace_dir,
+                        AiHttpTrace {
+                            trace_id,
+                            operation: "image_task_poll",
+                            context: self.trace_context.as_ref(),
+                            method: "GET",
+                            endpoint: &endpoint,
+                            model: Some(&self.model),
+                            attempt: http_attempt,
+                            max_attempts,
+                            elapsed_ms,
+                            status: Some(status.as_u16()),
+                            retry: false,
+                            retry_after_ms: 0,
+                            max_tokens: None,
+                            request_body: Some(&request_body),
+                            response_body: Some(&body),
+                            error: None,
+                        },
+                    );
+                    final_response = Some((body, elapsed_ms, http_attempt, trace_id));
                     break;
                 }
                 final_response
                     .expect("image task poll retry loop always returns a response or error")
             };
-            let (response, elapsed_ms, http_attempt) = response;
-            let response = response.json::<Value>().await?;
+            let (body, elapsed_ms, http_attempt, trace_id) = response;
+            let response = serde_json::from_str::<Value>(&body).map_err(|error| {
+                let response_for_log = full_response_for_log(&body);
+                warn!(
+                    trace_id = %trace_id,
+                    task_id = %task_id,
+                    response = %response_for_log,
+                    "image task poll JSON parsing failed"
+                );
+                AiError::InvalidResponse(format!(
+                    "invalid image task JSON: {error}; response={response_for_log}"
+                ))
+            })?;
             info!(
+                trace_id = %trace_id,
                 task_id = %task_id,
                 attempt,
                 http_attempt,
@@ -2503,15 +3119,11 @@ impl OpenAiImageClient {
         let path = output_dir.as_ref().join(filename);
         fs::write(&path, bytes)?;
 
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let sha256 = format!("{:x}", hasher.finalize());
-
         let artifact = ImageArtifact {
             path: path.to_string_lossy().to_string(),
             mime_type: "image/png".to_string(),
             size_bytes: bytes.len() as u64,
-            sha256,
+            sha256: sha256_hex(bytes),
         };
         info!(
             path = %artifact.path,
@@ -2864,6 +3476,8 @@ mod tests {
             base_url: "https://api.apimart.ai/v1".into(),
             model: "gpt-image-2".into(),
             retry_notifier: None,
+            trace_dir: None,
+            trace_context: None,
         }
     }
 
