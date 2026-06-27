@@ -2719,8 +2719,9 @@ async fn complete_chat_summary_with_fallback(
             combined_input.chars().count()
         ),
     );
+    let output = sanitize_llm_visible_output_with_log(config, room_id, stage, &combined_input);
     Ok(LongChatCompletion {
-        output: combined_input.clone(),
+        output,
         followup_chat_input: combined_input,
     })
 }
@@ -2773,6 +2774,7 @@ async fn complete_chunk_requests(
         let (chunk, result) = joined.context("joining LLM chunk request task")?;
         match result {
             Ok(output) => {
+                let output = sanitize_llm_visible_output_with_log(config, room_id, stage, &output);
                 append_runtime_log(
                     config,
                     &format!(
@@ -2870,6 +2872,7 @@ async fn complete_chunk_requests(
             output_limit,
         )
         .await?;
+        let output = sanitize_llm_visible_output_with_log(config, room_id, stage, &output);
         summaries[chunk.index] = Some(ChunkSummary {
             index: chunk.index,
             message_count: chunk.message_count,
@@ -3184,6 +3187,7 @@ async fn complete_llm_with_rate_limit_queue(
         let started = Instant::now();
         match complete_llm_request(llm, system_prompt, &prompt, output_limit).await {
             Ok(output) => {
+                let output = sanitize_llm_visible_output_with_log(config, room_id, stage, &output);
                 append_runtime_log(
                     config,
                     &format!(
@@ -3403,6 +3407,132 @@ fn format_chunk_summaries_for_output(summaries: &[ChunkSummary]) -> String {
         ));
     }
     parts.join("\n\n")
+}
+
+fn sanitize_llm_visible_output_with_log(
+    config: &AgentConfig,
+    room_id: &str,
+    stage: &str,
+    output: &str,
+) -> String {
+    let sanitized = sanitize_llm_visible_output(output);
+    if sanitized != output {
+        warn!(
+            room_id = %room_id,
+            stage,
+            before_chars = output.chars().count(),
+            after_chars = sanitized.chars().count(),
+            "LLM visible output was sanitized before use"
+        );
+        append_runtime_log(
+            config,
+            &format!(
+                "llm output sanitized room={} stage={} before_chars={} after_chars={}",
+                room_id,
+                stage,
+                output.chars().count(),
+                sanitized.chars().count()
+            ),
+        );
+    }
+    sanitized
+}
+
+fn sanitize_llm_visible_output(output: &str) -> String {
+    let without_think_blocks = strip_tag_blocks_case_insensitive(output, "think");
+    let without_chunk_header = strip_chunk_summary_header(&without_think_blocks);
+    strip_reasoning_prelude(&without_chunk_header)
+        .trim()
+        .to_string()
+}
+
+fn strip_tag_blocks_case_insensitive(input: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut remaining = input;
+    let mut output = String::new();
+    loop {
+        let Some(open_start) = find_case_insensitive(remaining, &open) else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..open_start]);
+        let after_open = &remaining[open_start..];
+        let Some(open_end_rel) = after_open.find('>') else {
+            break;
+        };
+        let after_open_tag = &after_open[open_end_rel + 1..];
+        if let Some(close_start_rel) = find_case_insensitive(after_open_tag, &close) {
+            let after_close = &after_open_tag[close_start_rel + close.len()..];
+            remaining = after_close;
+        } else {
+            break;
+        }
+    }
+    output
+}
+
+fn strip_chunk_summary_header(input: &str) -> String {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with("[CHUNK_SUMMARIES]") {
+        return input.to_string();
+    }
+    let without_marker = trimmed
+        .strip_prefix("[CHUNK_SUMMARIES]")
+        .unwrap_or(trimmed)
+        .trim_start();
+    without_marker
+        .strip_prefix("以下是同一段群聊按时间顺序切分后的分段总结。")
+        .unwrap_or(without_marker)
+        .trim_start()
+        .to_string()
+}
+
+fn strip_reasoning_prelude(input: &str) -> String {
+    let markers = [
+        "第一个，",
+        "第一个时间段",
+        "首先是",
+        "1.",
+        "一、",
+        "群聊总结",
+        "以下是",
+        "主要内容",
+        "本次群聊",
+    ];
+    let suspicious = [
+        "用户现在需要总结",
+        "需要总结这个超长",
+        "首先得",
+        "首先先",
+        "我需要",
+        "我们需要",
+    ];
+    let trimmed = input.trim_start();
+    if !suspicious.iter().any(|marker| trimmed.contains(marker)) {
+        return input.to_string();
+    }
+
+    let search_limit = trimmed
+        .char_indices()
+        .nth(600)
+        .map(|(index, _)| index)
+        .unwrap_or(trimmed.len());
+    let search_area = &trimmed[..search_limit];
+    let Some(cut) = markers
+        .iter()
+        .filter_map(|marker| search_area.find(marker))
+        .filter(|index| *index > 0)
+        .min()
+    else {
+        return input.to_string();
+    };
+
+    trimmed[cut..].to_string()
+}
+
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.to_lowercase().find(&needle.to_lowercase())
 }
 
 fn chat_input_for_followup_prompt(
@@ -5010,6 +5140,25 @@ mod tests {
         assert_eq!(summary_media_decode_limit(&config), Some(10));
         assert_eq!(format_media_decode_limit(Some(7)), "7");
         assert_eq!(format_media_decode_limit(None), "unlimited");
+    }
+
+    #[test]
+    fn llm_visible_output_sanitizer_strips_thinking_blocks_and_preludes() {
+        let output = "<think>hidden chain of thought</think>\n用户现在需要总结这个超长的群聊记录，首先得按时间线来。第一个，5月24日下午大家讨论AI工具。";
+        let sanitized = sanitize_llm_visible_output(output);
+
+        assert!(!sanitized.contains("hidden chain of thought"));
+        assert!(!sanitized.contains("用户现在需要总结"));
+        assert_eq!(sanitized, "第一个，5月24日下午大家讨论AI工具。");
+    }
+
+    #[test]
+    fn llm_visible_output_sanitizer_strips_internal_chunk_header() {
+        let output = "[CHUNK_SUMMARIES]\n以下是同一段群聊按时间顺序切分后的分段总结。\n\n===== 分段 1/2，10 条 =====\n第一段总结";
+        let sanitized = sanitize_llm_visible_output(output);
+
+        assert!(!sanitized.contains("[CHUNK_SUMMARIES]"));
+        assert!(sanitized.starts_with("===== 分段 1/2"));
     }
 
     #[test]

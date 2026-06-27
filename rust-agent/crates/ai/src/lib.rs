@@ -2589,7 +2589,6 @@ fn extract_chat_completion_content(response: &Value) -> Option<String> {
     let choice = response.pointer("/choices/0")?;
     non_empty_content_value_to_text(choice.pointer("/message/content"))
         .or_else(|| non_empty_content_value_to_text(choice.pointer("/text")))
-        .or_else(|| non_empty_content_value_to_text(choice.pointer("/message/reasoning_content")))
         .map(|content| content.trim().to_string())
 }
 
@@ -3179,7 +3178,7 @@ data: {"type":"transcript.text.delta","delta":"文字"}
     }
 
     #[test]
-    fn chat_completion_content_can_fall_back_to_reasoning_content() {
+    fn chat_completion_content_does_not_fall_back_to_reasoning_content() {
         let response = json!({
             "choices": [{
                 "message": {
@@ -3190,10 +3189,7 @@ data: {"type":"transcript.text.delta","delta":"文字"}
             }]
         });
 
-        assert_eq!(
-            extract_chat_completion_content(&response).as_deref(),
-            Some("fallback text")
-        );
+        assert_eq!(extract_chat_completion_content(&response).as_deref(), None);
     }
 
     #[test]
