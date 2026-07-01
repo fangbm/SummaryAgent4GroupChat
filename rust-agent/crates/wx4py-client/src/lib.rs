@@ -464,8 +464,26 @@ fn query_text_messages_via_builtin_wxdb(
         media_decode_limit = ?media_decode_limit,
         "querying builtin wxdb history"
     );
-    let mut result =
-        query_builtin_wxdb_history(wx_cli, chat_name, since, until, limit, media_decode_limit)?;
+    let mut result = match query_builtin_wxdb_history(
+        wx_cli,
+        chat_name,
+        since,
+        until,
+        limit,
+        media_decode_limit,
+    ) {
+        Ok(result) => result,
+        Err(error) if should_retry_builtin_wxdb_history_error(&error) => {
+            tracing::warn!(
+                chat_name,
+                error = %error,
+                "builtin wxdb history failed with a transient cache/decrypt error; retrying once"
+            );
+            thread::sleep(StdDuration::from_millis(800));
+            query_builtin_wxdb_history(wx_cli, chat_name, since, until, limit, media_decode_limit)?
+        }
+        Err(error) => return Err(error),
+    };
     if result.messages.is_empty() && until.signed_duration_since(since) >= Duration::minutes(5) {
         tracing::warn!(
             chat_name,
@@ -533,6 +551,17 @@ fn query_text_messages_via_builtin_wxdb(
             })
         })
         .collect()
+}
+
+fn should_retry_builtin_wxdb_history_error(error: &Wx4pyError) -> bool {
+    let error = error.to_string();
+    if error.contains("wxdb 缓存磁盘空间不足") || error.contains("磁盘空间不足") {
+        return false;
+    }
+    error.contains("源数据库在解密期间发生变化")
+        || error.contains("file is not a database")
+        || error.contains("File opened that is not a database file")
+        || error.contains("解密结果不是可读 SQLite 数据库")
 }
 
 fn empty_builtin_wxdb_result_uncertain_reason(

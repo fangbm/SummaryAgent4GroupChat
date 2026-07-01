@@ -301,8 +301,11 @@ fn run_wxdb_command_watcher(
     append_runtime_log(
         &config,
         &format!(
-            "wxdb command watcher started rooms={:?} interval_seconds={} lookback_seconds={}",
-            rooms, WXDB_COMMAND_WATCH_INTERVAL_SECONDS, WXDB_COMMAND_WATCH_LOOKBACK_SECONDS
+            "wxdb command watcher started rooms={:?} interval_seconds={} lookback_seconds={} cache_dir={}",
+            rooms,
+            WXDB_COMMAND_WATCH_INTERVAL_SECONDS,
+            WXDB_COMMAND_WATCH_LOOKBACK_SECONDS,
+            effective_wxdb_cache_dir(&config)
         ),
     );
 
@@ -407,15 +410,19 @@ fn poll_wxdb_command_room(
         .get(room)
         .map(String::as_str)
         .unwrap_or(room);
-    let result = wechat_summary_wxdb::query_history(wechat_summary_wxdb::HistoryQuery {
-        chat_name: chat_name.to_string(),
-        since: Some(since),
-        until: Some(until),
-        limit: WXDB_COMMAND_WATCH_LIMIT,
-        text_only: true,
-        msg_types: vec!["text".to_string()],
-        media_decode_limit: Some(0),
-    })
+    let wxdb_config = wxdb_runtime_config_for_agent(config);
+    let result = wechat_summary_wxdb::query_history_with_config(
+        &wxdb_config,
+        wechat_summary_wxdb::HistoryQuery {
+            chat_name: chat_name.to_string(),
+            since: Some(since),
+            until: Some(until),
+            limit: WXDB_COMMAND_WATCH_LIMIT,
+            text_only: true,
+            msg_types: vec!["text".to_string()],
+            media_decode_limit: Some(0),
+        },
+    )
     .with_context(|| format!("querying wxdb command watcher history for {chat_name}"))?;
 
     let mut latest_by_room: HashMap<String, PlatformEvent> = HashMap::new();
@@ -477,6 +484,25 @@ fn poll_wxdb_command_room(
         );
     }
     Ok(events)
+}
+
+fn wxdb_runtime_config_for_agent(config: &AgentConfig) -> wechat_summary_wxdb::RuntimeConfig {
+    let runtime = wechat_summary_wxdb::RuntimeConfig::load();
+    let cache_dir = config.wx_cli.cache_dir.trim();
+    if cache_dir.is_empty() {
+        runtime
+    } else {
+        runtime.with_cache_dir(cache_dir)
+    }
+}
+
+fn effective_wxdb_cache_dir(config: &AgentConfig) -> String {
+    let cache_dir = config.wx_cli.cache_dir.trim();
+    if cache_dir.is_empty() {
+        "<default>".to_string()
+    } else {
+        cache_dir.to_string()
+    }
 }
 
 fn wxdb_seen_message_key(chat_name: &str, message: &wechat_summary_wxdb::HistoryMessage) -> String {
@@ -572,7 +598,7 @@ impl ConfigReloader {
         append_runtime_log(
             &self.config,
             &format!(
-                "config hot reloaded path={} note=startup-only settings still require restart: platform listener, storage path, runtime log writer",
+                "config hot reloaded path={} note=startup-only settings still require restart: platform listener, wxdb command watcher, storage path, runtime log writer",
                 self.path.display()
             ),
         );

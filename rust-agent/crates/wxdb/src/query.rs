@@ -4,7 +4,8 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 use crate::cache::{CacheMode, DbCache};
 use crate::config::{self, RuntimeConfig};
@@ -130,7 +131,23 @@ pub fn query_history_with_config(
             chat_name = %query.chat_name,
             "wxdb store query started"
         );
-        match query_history_in_store(config, db_dir, &query) {
+        let store_result = match query_history_in_store(config, db_dir, &query) {
+            Err(error) if should_retry_store_query_error(&error) => {
+                let first_error = format!("{error:#}");
+                tracing::warn!(
+                    db_dir = %db_dir.display(),
+                    chat_name = %query.chat_name,
+                    error = %first_error,
+                    "wxdb store query failed with a transient cache/decrypt error; retrying once"
+                );
+                thread::sleep(StdDuration::from_millis(800));
+                query_history_in_store(config, db_dir, &query)
+                    .with_context(|| format!("重试后仍无法读取微信数据库；首次错误: {first_error}"))
+            }
+            other => other,
+        };
+
+        match store_result {
             Ok(mut result) => {
                 result.meta.candidates_scanned = config.db_dirs.len();
                 result.meta.db_dir = Some(db_dir.clone());
@@ -198,6 +215,17 @@ pub fn query_history_with_config(
 
 fn is_missing_db_key_error(error: &str) -> bool {
     error.contains("没有可用数据库密钥")
+}
+
+fn should_retry_store_query_error(error: &anyhow::Error) -> bool {
+    let error = format!("{error:#}");
+    if error.contains("wxdb 缓存磁盘空间不足") || error.contains("磁盘空间不足") {
+        return false;
+    }
+    error.contains("源数据库在解密期间发生变化")
+        || error.contains("file is not a database")
+        || error.contains("File opened that is not a database file")
+        || error.contains("解密结果不是可读 SQLite 数据库")
 }
 
 fn format_store_query_failure(errors: &[String], missing_key_errors: &[String]) -> String {
@@ -2050,9 +2078,11 @@ mod tests {
     fn voice_media_finds_nested_rectmp_candidate() {
         let root = temp_test_dir("wxdb-voice-rectmp-source");
         let chat_hash = format!("{:x}", md5::compute("chat@chatroom".as_bytes()));
+        let now = Local::now();
+        let month = now.format("%Y-%m").to_string();
         let rec_voice_dir = root
             .join("cache")
-            .join("2026-06")
+            .join(&month)
             .join("Message")
             .join(&chat_hash)
             .join("RecTmp")
@@ -2061,7 +2091,7 @@ mod tests {
         std::fs::create_dir_all(&rec_voice_dir).unwrap();
         let voice = rec_voice_dir.join("voice.silk");
         std::fs::write(&voice, b"not-a-real-silk").unwrap();
-        let timestamp = Local::now().timestamp();
+        let timestamp = now.timestamp();
         let mut resolver = ImageResolveContext::default();
 
         let media = resolve_voice_media(
