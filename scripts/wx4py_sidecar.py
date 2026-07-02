@@ -402,6 +402,11 @@ class Wx4pySidecar:
                 if not path.exists():
                     raise FileNotFoundError(str(path))
                 ok = self.send_image_guarded(room, path)
+            elif cmd == "send_file":
+                path = Path(str(command.get("path") or "")).resolve()
+                if not path.exists():
+                    raise FileNotFoundError(str(path))
+                ok = self.send_file_guarded(room, path)
             else:
                 raise ValueError(f"unsupported command: {cmd}")
 
@@ -564,19 +569,22 @@ class Wx4pySidecar:
         return False
 
     def send_image_guarded(self, room: str, path: Path) -> bool:
+        return self.send_file_guarded(room, path, label="send_image_guarded")
+
+    def send_file_guarded(self, room: str, path: Path, label: str = "send_file_guarded") -> bool:
         for attempt in range(1, 3):
             try:
-                diag_log(f"send_image_guarded target={room!r} attempt={attempt}")
+                diag_log(f"{label} target={room!r} attempt={attempt}")
                 if not self.open_chat_guarded(room):
                     continue
                 ok = self.client.chat_window.send_file(str(path))
                 diag_log(
-                    f"send_image_guarded result target={room!r} attempt={attempt} ok={ok}"
+                    f"{label} result target={room!r} attempt={attempt} ok={ok}"
                 )
                 if ok:
                     return True
             except Exception as exc:
-                diag_log(f"send_image_guarded failed target={room!r}: {type(exc).__name__}: {exc}")
+                diag_log(f"{label} failed target={room!r}: {type(exc).__name__}: {exc}")
             self.active_send_room = None
             time.sleep(1.0)
         return False

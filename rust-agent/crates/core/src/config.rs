@@ -130,6 +130,12 @@ pub struct Wx4pyConfig {
     pub ready_timeout_seconds: u64,
     #[serde(default)]
     pub groups: Vec<String>,
+    #[serde(default)]
+    pub long_text_delivery: Wx4pyLongTextDelivery,
+    #[serde(default = "default_wx4py_long_text_file_min_chunks")]
+    pub long_text_file_min_chunks: usize,
+    #[serde(default)]
+    pub long_text_file_dir: String,
 }
 
 impl Default for Wx4pyConfig {
@@ -139,7 +145,23 @@ impl Default for Wx4pyConfig {
             sidecar_script: default_wx4py_sidecar_script(),
             ready_timeout_seconds: default_wx4py_ready_timeout(),
             groups: Vec::new(),
+            long_text_delivery: Wx4pyLongTextDelivery::default(),
+            long_text_file_min_chunks: default_wx4py_long_text_file_min_chunks(),
+            long_text_file_dir: String::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wx4pyLongTextDelivery {
+    Chunks,
+    File,
+}
+
+impl Default for Wx4pyLongTextDelivery {
+    fn default() -> Self {
+        Self::Chunks
     }
 }
 
@@ -701,6 +723,10 @@ fn default_wx4py_ready_timeout() -> u64 {
     60
 }
 
+fn default_wx4py_long_text_file_min_chunks() -> usize {
+    3
+}
+
 fn default_discord_token_env() -> String {
     "DISCORD_BOT_TOKEN".to_string()
 }
@@ -1110,6 +1136,9 @@ api_key_env = "LLM_API_KEY""#,
 
         assert!(wx4py.python_executable.contains("python"));
         assert!(wx4py.sidecar_script.contains("wx4py_sidecar.py"));
+        assert_eq!(wx4py.long_text_delivery, Wx4pyLongTextDelivery::Chunks);
+        assert_eq!(wx4py.long_text_file_min_chunks, 3);
+        assert!(wx4py.long_text_file_dir.is_empty());
         assert_eq!(discord.token_env, "DISCORD_BOT_TOKEN");
         assert!(discord.channels.is_empty());
         assert_eq!(wxdb.executable, "builtin");

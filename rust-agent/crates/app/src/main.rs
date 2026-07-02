@@ -131,7 +131,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
     }
 
     loop {
-        reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run)?;
+        reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run, &client)?;
 
         let now = Utc::now();
         let config = config_reloader.config();
@@ -149,7 +149,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
         }
 
         while let Some(event) = wxdb_command_watcher.try_recv() {
-            reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run)?;
+            reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run, &client)?;
             let config = config_reloader.config();
             let matcher = config_reloader.matcher();
             handle_platform_event(
@@ -166,7 +166,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
         }
 
         if let Some(event) = client.next_event_timeout(StdDuration::from_secs(1))? {
-            reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run)?;
+            reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run, &client)?;
             let config = config_reloader.config();
             let matcher = config_reloader.matcher();
             handle_platform_event(
@@ -187,12 +187,14 @@ async fn run_agent(config_path: &str) -> Result<()> {
 fn reload_config_if_changed(
     config_reloader: &mut ConfigReloader,
     next_scheduled_run: &mut Option<DateTime<Utc>>,
+    client: &PlatformClient,
 ) -> Result<()> {
     if !config_reloader.reload_if_changed()? {
         return Ok(());
     }
 
     let config = config_reloader.config();
+    client.refresh_runtime_options(config)?;
     *next_scheduled_run = next_scheduled_run_after(Utc::now(), config);
     if let Some(run_at) = next_scheduled_run {
         info!(

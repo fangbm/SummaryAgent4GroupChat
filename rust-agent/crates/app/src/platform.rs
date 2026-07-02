@@ -1,15 +1,16 @@
 use std::{
     collections::HashSet,
-    env,
+    env, fs,
+    path::PathBuf,
     sync::{
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc,
+        Arc, RwLock,
     },
     time::Duration as StdDuration,
 };
 
-use anyhow::{bail, Context as AnyhowContext, Result};
-use chrono::{DateTime, Utc};
+use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
+use chrono::{DateTime, Local, Utc};
 use serenity::{
     all::{
         Attachment, ChannelId, CreateAttachment, CreateMessage, GatewayIntents, GetMessages,
@@ -20,7 +21,7 @@ use serenity::{
     http::Http,
 };
 use wechat_summary_core::{
-    config::{ListenConfig, PlatformKindConfig},
+    config::{ListenConfig, PlatformKindConfig, Wx4pyLongTextDelivery},
     models::IncomingMessage,
     AgentConfig,
 };
@@ -38,7 +39,10 @@ pub enum PlatformClient {
 
 #[derive(Clone)]
 pub enum PlatformSender {
-    Wx4py(Wx4pySender),
+    Wx4py {
+        sender: Wx4pySender,
+        options: Arc<RwLock<Wx4pySendOptions>>,
+    },
     Discord(DiscordSender),
 }
 
@@ -49,6 +53,14 @@ pub struct DiscordSender {
 
 pub struct Wx4pyPlatform {
     client: Wx4pyClient,
+    send_options: Arc<RwLock<Wx4pySendOptions>>,
+}
+
+#[derive(Clone)]
+pub struct Wx4pySendOptions {
+    long_text_delivery: Wx4pyLongTextDelivery,
+    long_text_file_min_chunks: usize,
+    long_text_file_dir: PathBuf,
 }
 
 pub struct DiscordPlatform {
@@ -68,6 +80,7 @@ impl PlatformClient {
         match config.platform.kind {
             PlatformKindConfig::Wx4py => Ok(Self::Wx4py(Wx4pyPlatform {
                 client: Wx4pyClient::start(&config.wx4py, &config.listen, &config.wx_cli)?,
+                send_options: Arc::new(RwLock::new(wx4py_send_options(config))),
             })),
             PlatformKindConfig::Discord => Ok(Self::Discord(DiscordPlatform::start(config).await?)),
         }
@@ -108,11 +121,25 @@ impl PlatformClient {
 
     pub fn sender(&self) -> PlatformSender {
         match self {
-            Self::Wx4py(platform) => PlatformSender::Wx4py(platform.client.sender()),
+            Self::Wx4py(platform) => PlatformSender::Wx4py {
+                sender: platform.client.sender(),
+                options: Arc::clone(&platform.send_options),
+            },
             Self::Discord(platform) => PlatformSender::Discord(DiscordSender {
                 http: Arc::clone(&platform.http),
             }),
         }
+    }
+
+    pub fn refresh_runtime_options(&self, config: &AgentConfig) -> Result<()> {
+        if let Self::Wx4py(platform) = self {
+            let mut send_options = platform
+                .send_options
+                .write()
+                .map_err(|_| anyhow!("wx4py send options lock poisoned"))?;
+            *send_options = wx4py_send_options(config);
+        }
+        Ok(())
     }
 
     pub async fn query_text_messages(
@@ -277,12 +304,24 @@ impl DiscordPlatform {
 impl PlatformSender {
     pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
         match self {
-            Self::Wx4py(sender) => {
-                let chunks = wx4py_text_chunks(text);
-                for chunk in chunks {
-                    sender.send_text(room_id, &chunk).await?;
+            Self::Wx4py { sender, options } => {
+                let options = options
+                    .read()
+                    .map_err(|_| anyhow!("wx4py send options lock poisoned"))?
+                    .clone();
+                let raw_chunks = text_chunks(text, WX4PY_TEXT_CHUNK_BODY_LIMIT);
+                if should_send_wx4py_text_as_file(&options, raw_chunks.len()) {
+                    let path = write_wx4py_long_text_file(&options, room_id, text)?;
+                    sender
+                        .send_file(room_id, path.to_string_lossy().as_ref())
+                        .await
+                        .map_err(Into::into)
+                } else {
+                    for chunk in wx4py_numbered_text_chunks(raw_chunks) {
+                        sender.send_text(room_id, &chunk).await?;
+                    }
+                    Ok(())
                 }
-                Ok(())
             }
             Self::Discord(sender) => sender.send_text(room_id, text).await,
         }
@@ -290,12 +329,62 @@ impl PlatformSender {
 
     pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
         match self {
-            Self::Wx4py(sender) => sender
+            Self::Wx4py { sender, .. } => sender
                 .send_image(room_id, image_path)
                 .await
                 .map_err(Into::into),
             Self::Discord(sender) => sender.send_image(room_id, image_path).await,
         }
+    }
+}
+
+fn should_send_wx4py_text_as_file(options: &Wx4pySendOptions, chunk_count: usize) -> bool {
+    options.long_text_delivery == Wx4pyLongTextDelivery::File
+        && chunk_count >= options.long_text_file_min_chunks.max(1)
+}
+
+fn write_wx4py_long_text_file(
+    options: &Wx4pySendOptions,
+    room_id: &str,
+    text: &str,
+) -> Result<PathBuf> {
+    fs::create_dir_all(&options.long_text_file_dir).with_context(|| {
+        format!(
+            "creating wx4py long text file dir {}",
+            options.long_text_file_dir.display()
+        )
+    })?;
+    let file_name = format!(
+        "summary-{}-{}.txt",
+        safe_filename_component(room_id),
+        Local::now().format("%Y%m%d-%H%M%S-%3f")
+    );
+    let path = options.long_text_file_dir.join(file_name);
+    let mut content = String::from("\u{feff}");
+    content.push_str(text);
+    fs::write(&path, content.as_bytes())
+        .with_context(|| format!("writing wx4py long text file {}", path.display()))?;
+    Ok(path)
+}
+
+fn safe_filename_component(value: &str) -> String {
+    let mut safe = value
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            ch if ch.is_control() => '-',
+            ch => ch,
+        })
+        .collect::<String>();
+    safe = safe
+        .trim_matches(|ch| ch == ' ' || ch == '.')
+        .chars()
+        .take(48)
+        .collect();
+    if safe.is_empty() {
+        "room".to_string()
+    } else {
+        safe
     }
 }
 
@@ -598,8 +687,12 @@ fn discord_text_chunks(text: &str) -> Vec<String> {
     text_chunks(text, DISCORD_TEXT_LIMIT)
 }
 
+#[cfg(test)]
 fn wx4py_text_chunks(text: &str) -> Vec<String> {
-    let chunks = text_chunks(text, WX4PY_TEXT_CHUNK_BODY_LIMIT);
+    wx4py_numbered_text_chunks(text_chunks(text, WX4PY_TEXT_CHUNK_BODY_LIMIT))
+}
+
+fn wx4py_numbered_text_chunks(chunks: Vec<String>) -> Vec<String> {
     if chunks.len() <= 1 {
         return chunks;
     }
@@ -655,6 +748,19 @@ fn text_chunks(text: &str, limit: usize) -> Vec<String> {
 
 fn wx4py_rooms(config: &AgentConfig) -> Vec<String> {
     listen_groups(&config.wx4py.groups, &config.listen)
+}
+
+fn wx4py_send_options(config: &AgentConfig) -> Wx4pySendOptions {
+    let long_text_file_dir = if config.wx4py.long_text_file_dir.trim().is_empty() {
+        PathBuf::from(&config.runtime.output_dir).join("long-text")
+    } else {
+        PathBuf::from(config.wx4py.long_text_file_dir.trim())
+    };
+    Wx4pySendOptions {
+        long_text_delivery: config.wx4py.long_text_delivery,
+        long_text_file_min_chunks: config.wx4py.long_text_file_min_chunks,
+        long_text_file_dir,
+    }
 }
 
 fn discord_rooms(config: &AgentConfig) -> Vec<String> {
@@ -753,6 +859,45 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|chunk| chunk.chars().count() <= WX4PY_TEXT_LIMIT));
+    }
+
+    #[test]
+    fn wx4py_file_mode_obeys_threshold() {
+        let options = Wx4pySendOptions {
+            long_text_delivery: Wx4pyLongTextDelivery::File,
+            long_text_file_min_chunks: 3,
+            long_text_file_dir: PathBuf::from("unused"),
+        };
+
+        assert!(!should_send_wx4py_text_as_file(&options, 2));
+        assert!(should_send_wx4py_text_as_file(&options, 3));
+    }
+
+    #[test]
+    fn wx4py_long_text_file_keeps_original_text() {
+        let dir = env::temp_dir().join(format!(
+            "summary-agent-long-text-test-{}",
+            Utc::now().timestamp_millis()
+        ));
+        let options = Wx4pySendOptions {
+            long_text_delivery: Wx4pyLongTextDelivery::File,
+            long_text_file_min_chunks: 1,
+            long_text_file_dir: dir.clone(),
+        };
+        let text = "第一段\n第二段";
+
+        let path = write_wx4py_long_text_file(&options, "room:/?*", text).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(content.trim_start_matches('\u{feff}'), text);
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("room----"));
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 
     #[test]

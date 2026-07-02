@@ -6,6 +6,12 @@ kind = "wx"
 python_executable = "..\\.venv\\Scripts\\python.exe"
 sidecar_script = "..\\scripts\\wx4py_sidecar.py"
 ready_timeout_seconds = 60
+# chunks: send long text as numbered messages.
+# file: when chunk count reaches long_text_file_min_chunks, send one UTF-8 .txt file.
+long_text_delivery = "chunks"
+long_text_file_min_chunks = 3
+# Empty means "<runtime.output_dir>\\long-text".
+long_text_file_dir = ""
 groups = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galgame用户群3", "脑机2galgame"]
 
 [discord]

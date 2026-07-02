@@ -374,6 +374,13 @@ impl Wx4pySender {
         })
     }
 
+    pub async fn send_file(&self, room_id: &str, file_path: &str) -> Result<()> {
+        self.send_command(SidecarCommand::SendFile {
+            room: room_id.to_string(),
+            path: file_path.to_string(),
+        })
+    }
+
     fn send_command(&self, command: SidecarCommand) -> Result<()> {
         let mut stdin = self
             .stdin
@@ -790,6 +797,7 @@ enum SidecarMessage {
 enum SidecarCommand {
     SendText { room: String, text: String },
     SendImage { room: String, path: String },
+    SendFile { room: String, path: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

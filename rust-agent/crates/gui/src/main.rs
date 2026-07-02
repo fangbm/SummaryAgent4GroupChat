@@ -46,6 +46,9 @@ struct ConfigView {
     wx_python: String,
     wx_sidecar: String,
     wx_ready_timeout: u64,
+    wx_long_text_delivery: String,
+    wx_long_text_file_min_chunks: u32,
+    wx_long_text_file_dir: String,
     discord_channels: String,
     discord_token_env: String,
     triggers: String,
@@ -821,6 +824,33 @@ fn platform_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             text_field(ui, "Python 路径", &mut view.wx_python);
             text_field(ui, "wx4py 脚本", &mut view.wx_sidecar);
             number_u64(ui, "就绪超时秒数", &mut view.wx_ready_timeout);
+            ui.horizontal(|ui| {
+                ui.label("长文本发送模式");
+                egui::ComboBox::from_id_salt("wx-long-text-delivery")
+                    .selected_text(if view.wx_long_text_delivery.eq_ignore_ascii_case("file") {
+                        "文件"
+                    } else {
+                        "分段消息"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut view.wx_long_text_delivery,
+                            "chunks".to_string(),
+                            "分段消息",
+                        );
+                        ui.selectable_value(
+                            &mut view.wx_long_text_delivery,
+                            "file".to_string(),
+                            "文件",
+                        );
+                    });
+            });
+            number_u32(
+                ui,
+                "文件模式分段阈值",
+                &mut view.wx_long_text_file_min_chunks,
+            );
+            text_field(ui, "长文本文件目录", &mut view.wx_long_text_file_dir);
         },
         |ui| {
             multiline_field(ui, "Discord 频道 ID", &mut view.discord_channels, 6);
@@ -1605,6 +1635,13 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             wx_python: config.wx4py.python_executable,
             wx_sidecar: config.wx4py.sidecar_script,
             wx_ready_timeout: config.wx4py.ready_timeout_seconds,
+            wx_long_text_delivery: format!("{:?}", config.wx4py.long_text_delivery)
+                .to_ascii_lowercase(),
+            wx_long_text_file_min_chunks: config
+                .wx4py
+                .long_text_file_min_chunks
+                .min(u32::MAX as usize) as u32,
+            wx_long_text_file_dir: config.wx4py.long_text_file_dir,
             discord_channels: join_lines(&config.discord.channels),
             discord_token_env: config.discord.token_env,
             triggers: join_lines(&config.listen.triggers),
@@ -1772,6 +1809,10 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             "..\\scripts\\wx4py_sidecar.py",
         ),
         wx_ready_timeout: get_u64(doc, "wx4py", "ready_timeout_seconds", 60),
+        wx_long_text_delivery: get_str(doc, "wx4py", "long_text_delivery", "chunks"),
+        wx_long_text_file_min_chunks: get_u64(doc, "wx4py", "long_text_file_min_chunks", 3)
+            .min(u32::MAX as u64) as u32,
+        wx_long_text_file_dir: get_str(doc, "wx4py", "long_text_file_dir", ""),
         discord_channels: join_lines(&get_array(doc, "discord", "channels")),
         discord_token_env: get_str(doc, "discord", "token_env", "DISCORD_BOT_TOKEN"),
         triggers: join_lines(&get_array(doc, "listen", "triggers")),
@@ -1998,6 +2039,18 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         "ready_timeout_seconds",
         update.wx_ready_timeout as i64,
     );
+    let wx_long_text_delivery = if update.wx_long_text_delivery.eq_ignore_ascii_case("file") {
+        "file"
+    } else {
+        "chunks"
+    };
+    set_str(wx4py, "long_text_delivery", wx_long_text_delivery);
+    set_int(
+        wx4py,
+        "long_text_file_min_chunks",
+        update.wx_long_text_file_min_chunks as i64,
+    );
+    set_str(wx4py, "long_text_file_dir", &update.wx_long_text_file_dir);
     set_array(wx4py, "groups", &split_lines(&update.wx_groups));
 
     let discord = table_mut(&mut doc, "discord");
