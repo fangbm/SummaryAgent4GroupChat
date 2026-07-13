@@ -15,7 +15,7 @@ pub struct KeyEntry {
 pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     #[cfg(target_os = "windows")]
     {
-        return windows::scan_keys(db_dir);
+        windows::scan_keys(db_dir)
     }
 
     #[cfg(not(target_os = "windows"))]

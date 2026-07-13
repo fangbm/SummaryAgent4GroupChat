@@ -41,7 +41,7 @@ pub fn decrypt_page(enc_key: &[u8; 32], page_data: &[u8], pgno: u32) -> Result<V
 }
 
 fn aes_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>> {
-    if data.is_empty() || data.len() % 16 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
         bail!("密文长度不是 AES 块大小的倍数: {}", data.len());
     }
     let mut blocks: Vec<Block> = data.chunks_exact(16).map(Block::clone_from_slice).collect();
@@ -64,7 +64,7 @@ pub fn full_decrypt(db_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Resu
     }
 
     let mut output = std::fs::File::create(out_path)?;
-    let total_pages = (file_size + PAGE_SZ - 1) / PAGE_SZ;
+    let total_pages = file_size.div_ceil(PAGE_SZ);
     let mut page_buf = vec![0u8; PAGE_SZ];
 
     for pgno in 1..=total_pages {

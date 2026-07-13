@@ -9,13 +9,13 @@ use std::{
 
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep, timeout, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 use wechat_summary_core::{
@@ -28,9 +28,64 @@ use wechat_summary_core::{
 
 const HTTP_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
 const HTTP_RETRY_MAX_DELAY_MS: u64 = 30_000;
-const HTTP_RATE_LIMIT_QUEUE_DELAY_MS: u64 = 60_000;
+const HTTP_RETRY_TOTAL_DELAY_BUDGET_MS: u64 = 180_000;
 
 static HTTP_RATE_LIMIT_RETRY_QUEUE: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct RetryBudget {
+    started: Instant,
+    deadline: Option<Instant>,
+    retry_delay_budget: Option<Duration>,
+}
+
+impl RetryBudget {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            deadline: None,
+            retry_delay_budget: Some(Duration::from_millis(HTTP_RETRY_TOTAL_DELAY_BUDGET_MS)),
+        }
+    }
+
+    fn with_deadline(deadline: Instant) -> Self {
+        Self {
+            started: Instant::now(),
+            deadline: Some(deadline),
+            retry_delay_budget: None,
+        }
+    }
+
+    fn allows(&self, delay_ms: u64) -> bool {
+        delay_ms <= self.remaining_ms()
+    }
+
+    fn remaining_ms(&self) -> u64 {
+        self.remaining_duration().as_millis() as u64
+    }
+
+    fn remaining_duration(&self) -> Duration {
+        let retry_budget = self
+            .retry_delay_budget
+            .map(|budget| budget.saturating_sub(self.started.elapsed()))
+            .unwrap_or(Duration::MAX);
+        let deadline_budget = self.deadline.map(|deadline| {
+            let now = Instant::now();
+            if deadline > now {
+                deadline - now
+            } else {
+                Duration::ZERO
+            }
+        });
+        deadline_budget.map_or(retry_budget, |budget| retry_budget.min(budget))
+    }
+
+    fn deadline_exhausted(&self) -> bool {
+        self.deadline
+            .map(|deadline| Instant::now() >= deadline)
+            .unwrap_or(false)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum AiError {
@@ -181,6 +236,7 @@ impl OpenAiCompatibleLlm {
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
             let started = Instant::now();
@@ -207,8 +263,14 @@ impl OpenAiCompatibleLlm {
                 Ok(response) => response,
                 Err(error) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     self.write_http_trace(AiHttpTrace {
                         trace_id,
                         operation: "llm_chat_completion",
@@ -254,6 +316,7 @@ impl OpenAiCompatibleLlm {
                 }
             };
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let elapsed_ms = started.elapsed().as_millis();
             if !status.is_success() {
                 let body = response
@@ -262,11 +325,33 @@ impl OpenAiCompatibleLlm {
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts
-                    && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_chat_completion_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "LLM chat completion",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 self.write_http_trace(AiHttpTrace {
                     trace_id,
                     operation: "llm_chat_completion",
@@ -306,8 +391,6 @@ impl OpenAiCompatibleLlm {
                         retry_reason_from_status(status, &snippet),
                     )
                     .await;
-                    wait_before_status_retry("LLM chat completion", status, attempt, max_attempts)
-                        .await;
                     continue;
                 }
                 let message = format!("chat completion API returned {status}: {response_for_log}");
@@ -429,7 +512,7 @@ fn write_ai_http_trace(trace_dir: &Path, trace: AiHttpTrace<'_>) {
         Some(value) => redact_json_for_trace(&value),
         None => trace
             .response_body
-            .map(|body| Value::String(redact_secret_like_tokens(body)))
+            .map(|body| Value::String(redact_trace_text(body)))
             .unwrap_or(Value::Null),
     };
     let request_body = trace
@@ -446,7 +529,7 @@ fn write_ai_http_trace(trace_dir: &Path, trace: AiHttpTrace<'_>) {
         "context": context,
         "created_at_utc": timestamp.to_rfc3339(),
         "method": trace.method,
-        "endpoint": trace.endpoint,
+        "endpoint": redact_endpoint_for_trace(trace.endpoint),
         "model": trace.model,
         "attempt": trace.attempt,
         "max_attempts": trace.max_attempts,
@@ -457,7 +540,7 @@ fn write_ai_http_trace(trace_dir: &Path, trace: AiHttpTrace<'_>) {
         "max_tokens": trace.max_tokens,
         "request_body": request_body,
         "response_body": response_body,
-        "error": trace.error.map(redact_secret_like_tokens),
+        "error": trace.error.map(redact_trace_text),
     });
     match serde_json::to_string_pretty(&payload) {
         Ok(text) => {
@@ -562,6 +645,7 @@ impl OpenAiVisionCaptionClient {
     async fn download_image_as_data_url(&self, url: &str) -> Result<String, AiError> {
         let source = redacted_url_source(url);
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let started = Instant::now();
             info!(
@@ -573,8 +657,14 @@ impl OpenAiVisionCaptionClient {
             let response = match self.client.get(url).send().await {
                 Ok(response) => response,
                 Err(error) => {
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     warn!(
                         source = %source,
                         attempt,
@@ -602,6 +692,7 @@ impl OpenAiVisionCaptionClient {
                 }
             };
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let content_type = response
                 .headers()
                 .get(CONTENT_TYPE)
@@ -614,10 +705,33 @@ impl OpenAiVisionCaptionClient {
                     .unwrap_or_else(|error| format!("failed to read image response body: {error}"));
                 let snippet = truncate_for_log(&body, 300);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_http_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "image caption remote image download",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 warn!(
                     source = %source,
                     status = %status,
@@ -637,13 +751,6 @@ impl OpenAiVisionCaptionClient {
                         max_attempts,
                         retry_after_ms,
                         retry_reason_from_status(status, &snippet),
-                    )
-                    .await;
-                    wait_before_status_retry(
-                        "image caption remote image download",
-                        status,
-                        attempt,
-                        max_attempts,
                     )
                     .await;
                     continue;
@@ -682,6 +789,7 @@ impl OpenAiVisionCaptionClient {
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
             let started = Instant::now();
@@ -708,8 +816,14 @@ impl OpenAiVisionCaptionClient {
                 Ok(response) => response,
                 Err(error) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     write_optional_ai_http_trace(
                         &self.trace_dir,
                         AiHttpTrace {
@@ -759,6 +873,7 @@ impl OpenAiVisionCaptionClient {
             };
 
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let elapsed_ms = started.elapsed().as_millis();
             if !status.is_success() {
                 let body = response
@@ -767,11 +882,33 @@ impl OpenAiVisionCaptionClient {
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts
-                    && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_chat_completion_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "image caption request",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 write_optional_ai_http_trace(
                     &self.trace_dir,
                     AiHttpTrace {
@@ -812,13 +949,6 @@ impl OpenAiVisionCaptionClient {
                         max_attempts,
                         retry_after_ms,
                         retry_reason_from_status(status, &snippet),
-                    )
-                    .await;
-                    wait_before_status_retry(
-                        "image caption request",
-                        status,
-                        attempt,
-                        max_attempts,
                     )
                     .await;
                     continue;
@@ -972,6 +1102,7 @@ impl OpenAiVideoCaptionClient {
     async fn download_video_as_data_url(&self, url: &str) -> Result<String, AiError> {
         let source = redacted_url_source(url);
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let started = Instant::now();
             info!(
@@ -983,8 +1114,14 @@ impl OpenAiVideoCaptionClient {
             let response = match self.client.get(url).send().await {
                 Ok(response) => response,
                 Err(error) => {
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     warn!(
                         source = %source,
                         attempt,
@@ -1003,6 +1140,7 @@ impl OpenAiVideoCaptionClient {
                 }
             };
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let content_type = response
                 .headers()
                 .get(CONTENT_TYPE)
@@ -1015,10 +1153,33 @@ impl OpenAiVideoCaptionClient {
                     .unwrap_or_else(|error| format!("failed to read video response body: {error}"));
                 let snippet = truncate_for_log(&body, 300);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_http_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "video caption remote video download",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 warn!(
                     source = %source,
                     status = %status,
@@ -1031,13 +1192,6 @@ impl OpenAiVideoCaptionClient {
                     "video caption remote video download failed"
                 );
                 if retry {
-                    wait_before_status_retry(
-                        "video caption remote video download",
-                        status,
-                        attempt,
-                        max_attempts,
-                    )
-                    .await;
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
@@ -1074,6 +1228,7 @@ impl OpenAiVideoCaptionClient {
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
             let started = Instant::now();
@@ -1100,8 +1255,14 @@ impl OpenAiVideoCaptionClient {
                 Ok(response) => response,
                 Err(error) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     write_optional_ai_http_trace(
                         &self.trace_dir,
                         AiHttpTrace {
@@ -1142,6 +1303,7 @@ impl OpenAiVideoCaptionClient {
             };
 
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let elapsed_ms = started.elapsed().as_millis();
             if !status.is_success() {
                 let body = response
@@ -1150,11 +1312,33 @@ impl OpenAiVideoCaptionClient {
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts
-                    && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_chat_completion_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "video caption request",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 write_optional_ai_http_trace(
                     &self.trace_dir,
                     AiHttpTrace {
@@ -1188,13 +1372,6 @@ impl OpenAiVideoCaptionClient {
                     "video caption request failed"
                 );
                 if retry {
-                    wait_before_status_retry(
-                        "video caption request",
-                        status,
-                        attempt,
-                        max_attempts,
-                    )
-                    .await;
                     continue;
                 }
                 let message = format!("video caption API returned {status}: {response_for_log}");
@@ -1317,6 +1494,7 @@ impl OpenAiAudioTranscriptionClient {
 
         let endpoint = audio_transcriptions_endpoint(&self.base_url);
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
 
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
@@ -1375,8 +1553,14 @@ impl OpenAiAudioTranscriptionClient {
                 Ok(response) => response,
                 Err(error) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     write_optional_ai_http_trace(
                         &self.trace_dir,
                         AiHttpTrace {
@@ -1417,16 +1601,39 @@ impl OpenAiAudioTranscriptionClient {
             };
 
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let elapsed_ms = started.elapsed().as_millis();
             let body = response.text().await?;
             if !status.is_success() {
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts
-                    && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_chat_completion_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "voice transcription request",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 write_optional_ai_http_trace(
                     &self.trace_dir,
                     AiHttpTrace {
@@ -1460,13 +1667,6 @@ impl OpenAiAudioTranscriptionClient {
                     "voice transcription request failed"
                 );
                 if retry {
-                    wait_before_status_retry(
-                        "voice transcription request",
-                        status,
-                        attempt,
-                        max_attempts,
-                    )
-                    .await;
                     continue;
                 }
                 let message =
@@ -1530,6 +1730,7 @@ impl OpenAiAudioTranscriptionClient {
         let endpoint = stepfun_asr_endpoint(&self.base_url);
         let payload = stepfun_asr_payload(&self.model, &self.config, path, &bytes)?;
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
 
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
@@ -1558,8 +1759,14 @@ impl OpenAiAudioTranscriptionClient {
                 Ok(response) => response,
                 Err(error) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     write_optional_ai_http_trace(
                         &self.trace_dir,
                         AiHttpTrace {
@@ -1600,16 +1807,39 @@ impl OpenAiAudioTranscriptionClient {
             };
 
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let elapsed_ms = started.elapsed().as_millis();
             let body = response.text().await?;
             if !status.is_success() {
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts
-                    && should_retry_chat_completion_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_chat_completion_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "StepFun voice transcription request",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 write_optional_ai_http_trace(
                     &self.trace_dir,
                     AiHttpTrace {
@@ -1643,13 +1873,6 @@ impl OpenAiAudioTranscriptionClient {
                     "StepFun voice transcription request failed"
                 );
                 if retry {
-                    wait_before_status_retry(
-                        "StepFun voice transcription request",
-                        status,
-                        attempt,
-                        max_attempts,
-                    )
-                    .await;
                     continue;
                 }
                 let message = format!(
@@ -1808,9 +2031,11 @@ fn voice_transcription_multipart_trace_payload(
         json!({
             "file_name": file_name,
             "mime": mime,
+            "media_type": mime,
+            "encoded_length": general_purpose::STANDARD.encode(bytes).len(),
+            "decoded_size": bytes.len(),
             "size_bytes": bytes.len(),
             "sha256": sha256_hex(bytes),
-            "base64": general_purpose::STANDARD.encode(bytes),
         }),
     );
     if !client.config.language.trim().is_empty() {
@@ -2018,12 +2243,55 @@ fn http_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(http_retry_delay_ms(attempt))
 }
 
-fn http_retry_delay_ms_for_status(status: reqwest::StatusCode, attempt: usize) -> u64 {
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        HTTP_RATE_LIMIT_QUEUE_DELAY_MS
+fn http_retry_delay_ms_for_status(
+    status: reqwest::StatusCode,
+    attempt: usize,
+    server_retry_after_ms: Option<u64>,
+) -> u64 {
+    let exponential = http_retry_delay_ms(attempt);
+    let base = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        exponential.max(server_retry_after_ms.unwrap_or(0))
     } else {
-        http_retry_delay_ms(attempt)
+        exponential
+    };
+    base.saturating_add(deterministic_retry_jitter_ms(base, attempt))
+        .min(HTTP_RETRY_TOTAL_DELAY_BUDGET_MS)
+}
+
+fn deterministic_retry_jitter_ms(base_ms: u64, attempt: usize) -> u64 {
+    let window = (base_ms / 5).min(5_000);
+    if window == 0 {
+        return 0;
     }
+    let seed = (attempt as u64)
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    seed % (window + 1)
+}
+
+fn retry_after_ms_from_headers(headers: &HeaderMap, now: chrono::DateTime<Utc>) -> Option<u64> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1_000));
+    }
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let millis = retry_at
+        .with_timezone(&Utc)
+        .signed_duration_since(now)
+        .num_milliseconds();
+    Some(millis.max(0) as u64)
+}
+
+async fn sleep_for_retry_budget(retry_budget: &RetryBudget, delay: Duration) -> bool {
+    let remaining = retry_budget.remaining_duration();
+    if delay > remaining {
+        if !remaining.is_zero() {
+            sleep(remaining).await;
+        }
+        return false;
+    }
+    sleep(delay).await;
+    true
 }
 
 fn http_retry_delay_ms(attempt: usize) -> u64 {
@@ -2042,22 +2310,64 @@ async fn wait_before_status_retry(
     status: reqwest::StatusCode,
     attempt: usize,
     max_attempts: usize,
-) {
-    let delay_ms = http_retry_delay_ms_for_status(status, attempt);
+    retry_budget: &RetryBudget,
+    delay_ms: u64,
+) -> Option<u64> {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let queue = HTTP_RATE_LIMIT_RETRY_QUEUE.get_or_init(|| Mutex::new(()));
+        wait_in_rate_limit_retry_queue(
+            queue,
+            operation,
+            attempt,
+            max_attempts,
+            retry_budget,
+            delay_ms,
+        )
+        .await
+    } else {
+        let wait_ms = delay_ms.min(retry_budget.remaining_ms());
+        if wait_ms == 0 {
+            return None;
+        }
+        sleep(Duration::from_millis(wait_ms)).await;
+        Some(wait_ms)
+    }
+}
+
+async fn wait_in_rate_limit_retry_queue(
+    queue: &Mutex<()>,
+    operation: &'static str,
+    attempt: usize,
+    max_attempts: usize,
+    retry_budget: &RetryBudget,
+    delay_ms: u64,
+) -> Option<u64> {
+    let remaining_ms = retry_budget.remaining_ms();
+    if remaining_ms == 0 {
+        return None;
+    }
+    let Ok(_guard) = tokio::time::timeout(Duration::from_millis(remaining_ms), queue.lock()).await
+    else {
         info!(
             operation,
             attempt,
             max_attempts,
-            wait_ms = delay_ms,
-            "AI request rate limited; waiting in serial retry queue"
+            wait_ms = 0,
+            "AI request rate limit retry budget exhausted in serial retry queue"
         );
-        let _guard = queue.lock().await;
-        sleep(Duration::from_millis(delay_ms)).await;
-    } else {
-        sleep(Duration::from_millis(delay_ms)).await;
+        return None;
+    };
+
+    let wait_ms = delay_ms.min(retry_budget.remaining_ms());
+    if wait_ms == 0 {
+        return None;
     }
+    info!(
+        operation,
+        attempt, max_attempts, wait_ms, "AI request rate limited; waiting in serial retry queue"
+    );
+    sleep(Duration::from_millis(wait_ms)).await;
+    Some(wait_ms)
 }
 
 async fn notify_retry(
@@ -2535,6 +2845,7 @@ impl OpenAiImageClient {
         let payload = self.image_generation_payload(prompt);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
             let started = Instant::now();
@@ -2562,8 +2873,14 @@ impl OpenAiImageClient {
                 Ok(response) => response,
                 Err(error) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     write_optional_ai_http_trace(
                         &self.trace_dir,
                         AiHttpTrace {
@@ -2612,6 +2929,7 @@ impl OpenAiImageClient {
                 }
             };
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let elapsed_ms = started.elapsed().as_millis();
             if !status.is_success() {
                 let body = response
@@ -2620,10 +2938,33 @@ impl OpenAiImageClient {
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_http_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "image generation request",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 write_optional_ai_http_trace(
                     &self.trace_dir,
                     AiHttpTrace {
@@ -2664,13 +3005,6 @@ impl OpenAiImageClient {
                         max_attempts,
                         retry_after_ms,
                         retry_reason_from_status(status, &snippet),
-                    )
-                    .await;
-                    wait_before_status_retry(
-                        "image generation request",
-                        status,
-                        attempt,
-                        max_attempts,
                     )
                     .await;
                     continue;
@@ -2780,18 +3114,21 @@ impl OpenAiImageClient {
 
     async fn poll_apimart_task(&self, task_id: &str) -> Result<Vec<u8>, AiError> {
         let deadline = Instant::now() + Duration::from_secs(self.config.timeout_seconds.max(1));
+        let retry_budget = RetryBudget::with_deadline(deadline);
         info!(
             task_id = %task_id,
             initial_delay_seconds = self.config.poll_initial_delay_seconds.min(self.config.timeout_seconds),
             poll_interval_seconds = self.config.poll_interval_seconds.max(1),
             "image task initial poll delay started"
         );
-        sleep(Duration::from_secs(
+        let initial_delay = Duration::from_secs(
             self.config
                 .poll_initial_delay_seconds
                 .min(self.config.timeout_seconds),
-        ))
-        .await;
+        );
+        if !sleep_for_retry_budget(&retry_budget, initial_delay).await {
+            return Err(AiError::ImageTaskTimeout(self.config.timeout_seconds));
+        }
 
         let mut attempt = 0u32;
         loop {
@@ -2804,21 +3141,30 @@ impl OpenAiImageClient {
                     let poll_started = Instant::now();
                     let endpoint = format!("{}/tasks/{}", api_root_url(&self.base_url), task_id);
                     let request_body = json!({ "task_id": task_id });
-                    let response = match self
-                        .client
-                        .get(&endpoint)
-                        .bearer_auth(&self.api_key)
-                        .send()
-                        .await
+                    let remaining = retry_budget.remaining_duration();
+                    if remaining.is_zero() {
+                        return Err(AiError::ImageTaskTimeout(self.config.timeout_seconds));
+                    }
+                    let response = match timeout(
+                        remaining,
+                        self.client.get(&endpoint).bearer_auth(&self.api_key).send(),
+                    )
+                    .await
                     {
-                        Ok(response) => response,
-                        Err(error) => {
+                        Err(_) => {
+                            return Err(AiError::ImageTaskTimeout(self.config.timeout_seconds));
+                        }
+                        Ok(Ok(response)) => response,
+                        Ok(Err(error)) => {
                             let elapsed_ms = poll_started.elapsed().as_millis();
                             let retry = http_attempt < max_attempts
-                                && should_retry_http_transport_error(&error);
-                            let retry_after_ms = retry
-                                .then(|| http_retry_delay_ms(http_attempt))
-                                .unwrap_or(0);
+                                && should_retry_http_transport_error(&error)
+                                && retry_budget.allows(http_retry_delay_ms(http_attempt));
+                            let retry_after_ms = if retry {
+                                http_retry_delay_ms(http_attempt)
+                            } else {
+                                0
+                            };
                             write_optional_ai_http_trace(
                                 &self.trace_dir,
                                 AiHttpTrace {
@@ -2862,25 +3208,77 @@ impl OpenAiImageClient {
                                     retry_reason_from_transport_error(&error),
                                 )
                                 .await;
-                                sleep(http_retry_delay(http_attempt)).await;
+                                if !sleep_for_retry_budget(
+                                    &retry_budget,
+                                    http_retry_delay(http_attempt),
+                                )
+                                .await
+                                {
+                                    return Err(AiError::ImageTaskTimeout(
+                                        self.config.timeout_seconds,
+                                    ));
+                                }
                                 continue;
                             }
                             return Err(AiError::Http(error));
                         }
                     };
                     let status = response.status();
+                    let server_retry_after_ms =
+                        retry_after_ms_from_headers(response.headers(), Utc::now());
                     let elapsed_ms = poll_started.elapsed().as_millis();
                     if !status.is_success() {
-                        let body = response.text().await.unwrap_or_else(|error| {
-                            format!("failed to read error response body: {error}")
-                        });
+                        let body = match timeout(retry_budget.remaining_duration(), response.text())
+                            .await
+                        {
+                            Ok(Ok(body)) => body,
+                            Ok(Err(error)) => {
+                                format!("failed to read error response body: {error}")
+                            }
+                            Err(_) => {
+                                return Err(AiError::ImageTaskTimeout(self.config.timeout_seconds));
+                            }
+                        };
                         let snippet = truncate_for_log(&body, 500);
                         let response_for_log = full_response_for_log(&body);
-                        let retry = http_attempt < max_attempts
-                            && should_retry_http_failure(status, &snippet);
-                        let retry_after_ms = retry
-                            .then(|| http_retry_delay_ms_for_status(status, http_attempt))
-                            .unwrap_or(0);
+                        let retry_candidate = http_attempt < max_attempts
+                            && should_retry_http_failure(status, &snippet)
+                            && retry_budget.allows(http_retry_delay_ms_for_status(
+                                status,
+                                http_attempt,
+                                server_retry_after_ms,
+                            ));
+                        let retry_delay_ms = if retry_candidate {
+                            http_retry_delay_ms_for_status(
+                                status,
+                                http_attempt,
+                                server_retry_after_ms,
+                            )
+                        } else {
+                            0
+                        };
+                        let retry_after_ms = if retry_candidate {
+                            wait_before_status_retry(
+                                "image task poll",
+                                status,
+                                http_attempt,
+                                max_attempts,
+                                &retry_budget,
+                                retry_delay_ms,
+                            )
+                            .await
+                            .unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        if retry_candidate
+                            && retry_after_ms == 0
+                            && (retry_budget.deadline_exhausted()
+                                || retry_budget.remaining_duration().is_zero())
+                        {
+                            return Err(AiError::ImageTaskTimeout(self.config.timeout_seconds));
+                        }
+                        let retry = retry_after_ms > 0;
                         write_optional_ai_http_trace(
                             &self.trace_dir,
                             AiHttpTrace {
@@ -2925,20 +3323,19 @@ impl OpenAiImageClient {
                                 retry_reason_from_status(status, &snippet),
                             )
                             .await;
-                            wait_before_status_retry(
-                                "image task poll",
-                                status,
-                                http_attempt,
-                                max_attempts,
-                            )
-                            .await;
                             continue;
                         }
                         return Err(AiError::InvalidResponse(format!(
                             "image task API returned {status}: {response_for_log}"
                         )));
                     }
-                    let body = response.text().await?;
+                    let body =
+                        match timeout(retry_budget.remaining_duration(), response.text()).await {
+                            Ok(body) => body?,
+                            Err(_) => {
+                                return Err(AiError::ImageTaskTimeout(self.config.timeout_seconds));
+                            }
+                        };
                     write_optional_ai_http_trace(
                         &self.trace_dir,
                         AiHttpTrace {
@@ -2997,10 +3394,14 @@ impl OpenAiImageClient {
             if Instant::now() >= deadline {
                 return Err(AiError::ImageTaskTimeout(self.config.timeout_seconds));
             }
-            sleep(Duration::from_secs(
-                self.config.poll_interval_seconds.max(1),
-            ))
-            .await;
+            if !sleep_for_retry_budget(
+                &retry_budget,
+                Duration::from_secs(self.config.poll_interval_seconds.max(1)),
+            )
+            .await
+            {
+                return Err(AiError::ImageTaskTimeout(self.config.timeout_seconds));
+            }
         }
     }
 
@@ -3019,14 +3420,21 @@ impl OpenAiImageClient {
     async fn download_image(&self, url: String) -> Result<Vec<u8>, AiError> {
         let source = redacted_url_source(&url);
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let started = Instant::now();
             info!(source = %source, attempt, max_attempts, "image download started");
             let response = match self.client.get(&url).send().await {
                 Ok(response) => response,
                 Err(error) => {
-                    let retry = attempt < max_attempts && should_retry_http_transport_error(&error);
-                    let retry_after_ms = retry.then(|| http_retry_delay_ms(attempt)).unwrap_or(0);
+                    let retry = attempt < max_attempts
+                        && should_retry_http_transport_error(&error)
+                        && retry_budget.allows(http_retry_delay_ms(attempt));
+                    let retry_after_ms = if retry {
+                        http_retry_delay_ms(attempt)
+                    } else {
+                        0
+                    };
                     warn!(
                         source = %source,
                         attempt,
@@ -3054,6 +3462,7 @@ impl OpenAiImageClient {
                 }
             };
             let status = response.status();
+            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
             let elapsed_ms = started.elapsed().as_millis();
             if !status.is_success() {
                 let body = response
@@ -3062,10 +3471,33 @@ impl OpenAiImageClient {
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let snippet = truncate_for_log(&body, 500);
                 let response_for_log = full_response_for_log(&body);
-                let retry = attempt < max_attempts && should_retry_http_failure(status, &snippet);
-                let retry_after_ms = retry
-                    .then(|| http_retry_delay_ms_for_status(status, attempt))
-                    .unwrap_or(0);
+                let retry_candidate = attempt < max_attempts
+                    && should_retry_http_failure(status, &snippet)
+                    && retry_budget.allows(http_retry_delay_ms_for_status(
+                        status,
+                        attempt,
+                        server_retry_after_ms,
+                    ));
+                let retry_delay_ms = if retry_candidate {
+                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
+                } else {
+                    0
+                };
+                let retry_after_ms = if retry_candidate {
+                    wait_before_status_retry(
+                        "image download",
+                        status,
+                        attempt,
+                        max_attempts,
+                        &retry_budget,
+                        retry_delay_ms,
+                    )
+                    .await
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let retry = retry_after_ms > 0;
                 warn!(
                     source = %source,
                     status = %status,
@@ -3087,7 +3519,6 @@ impl OpenAiImageClient {
                         retry_reason_from_status(status, &snippet),
                     )
                     .await;
-                    wait_before_status_retry("image download", status, attempt, max_attempts).await;
                     continue;
                 }
                 return Err(AiError::InvalidResponse(format!(
@@ -3385,12 +3816,30 @@ fn redacted_url_source(url: &str) -> String {
         .unwrap_or_else(|| "<unparseable-url>".to_string())
 }
 
+fn redact_endpoint_for_trace(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return redact_trace_text(endpoint);
+    };
+
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    if let Some(query) = url.query().map(ToOwned::to_owned) {
+        let redacted = redact_trace_text(&query);
+        url.set_query(Some(&redacted));
+    }
+    if let Some(fragment) = url.fragment().map(ToOwned::to_owned) {
+        let redacted = redact_trace_text(&fragment);
+        url.set_fragment(Some(&redacted));
+    }
+    redact_trace_text(url.as_str())
+}
+
 fn full_response_for_log(input: &str) -> String {
-    redact_secret_like_tokens(input)
+    redact_trace_text(input)
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
-    let redacted = redact_secret_like_tokens(input);
+    let redacted = redact_trace_text(input);
     let mut output = redacted.chars().take(max_chars).collect::<String>();
     if redacted.chars().count() > max_chars {
         output.push_str("...");
@@ -3399,28 +3848,41 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 }
 
 fn redact_json_for_trace(value: &Value) -> Value {
-    redact_json_value_for_trace(value, None)
+    redact_json_value_for_trace(value, None, None)
 }
 
-fn redact_json_value_for_trace(value: &Value, key: Option<&str>) -> Value {
+fn redact_json_value_for_trace(
+    value: &Value,
+    key: Option<&str>,
+    parent_key: Option<&str>,
+) -> Value {
     if key.map(is_sensitive_json_key).unwrap_or(false) {
         return Value::String("<redacted-secret>".to_string());
     }
 
     match value {
-        Value::String(text) => Value::String(redact_secret_like_tokens(text)),
+        Value::String(text) => {
+            if let Some(metadata) = media_data_url_trace_metadata(text) {
+                metadata
+            } else if let Some(metadata) = base64_field_trace_metadata(key, parent_key, text) {
+                metadata
+            } else {
+                Value::String(redact_trace_text(text))
+            }
+        }
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| redact_json_value_for_trace(item, None))
+                .map(|item| redact_json_value_for_trace(item, None, key))
                 .collect(),
         ),
         Value::Object(map) => {
             let mut redacted = Map::new();
+            let object_key = key;
             for (key, value) in map {
                 redacted.insert(
                     key.clone(),
-                    redact_json_value_for_trace(value, Some(key.as_str())),
+                    redact_json_value_for_trace(value, Some(key.as_str()), object_key),
                 );
             }
             Value::Object(redacted)
@@ -3429,14 +3891,308 @@ fn redact_json_value_for_trace(value: &Value, key: Option<&str>) -> Value {
     }
 }
 
+fn media_data_url_trace_metadata(value: &str) -> Option<Value> {
+    let (header, body) = value.strip_prefix("data:")?.split_once(',')?;
+    let media_type = header.split(';').next()?.trim();
+    if !(media_type.starts_with("image/")
+        || media_type.starts_with("video/")
+        || media_type.starts_with("audio/"))
+    {
+        return None;
+    }
+    Some(encoded_media_trace_metadata(
+        media_type,
+        body,
+        header.contains(";base64"),
+    ))
+}
+
+fn base64_field_trace_metadata(
+    key: Option<&str>,
+    parent_key: Option<&str>,
+    value: &str,
+) -> Option<Value> {
+    let key = key.unwrap_or_default().to_ascii_lowercase();
+    let parent_key = parent_key.unwrap_or_default().to_ascii_lowercase();
+    let normalized_key = key.replace(['-', '_'], "");
+    let normalized_parent = parent_key.replace(['-', '_'], "");
+    let media_type = if normalized_parent == "audio" || key.contains("audio") {
+        "audio/*"
+    } else if normalized_parent == "image" || key.contains("image") {
+        "image/*"
+    } else if normalized_parent == "video" || key.contains("video") {
+        "video/*"
+    } else if normalized_key.contains("base64") || normalized_key.contains("encoded") {
+        "application/octet-stream"
+    } else {
+        return None;
+    };
+
+    if normalized_parent == "audio" && normalized_key == "data"
+        || normalized_key.contains("base64")
+        || normalized_key.contains("encoded")
+    {
+        Some(encoded_media_trace_metadata(media_type, value, true))
+    } else {
+        None
+    }
+}
+
+fn encoded_media_trace_metadata(media_type: &str, encoded: &str, is_base64: bool) -> Value {
+    let decoded = if is_base64 {
+        general_purpose::STANDARD
+            .decode(encoded)
+            .or_else(|_| general_purpose::URL_SAFE.decode(encoded))
+            .ok()
+    } else {
+        None
+    };
+    let (decoded_size, sha256) = match decoded {
+        Some(bytes) => (Some(bytes.len()), sha256_hex(&bytes)),
+        None => (None, sha256_hex(encoded.as_bytes())),
+    };
+    let mut metadata = Map::new();
+    metadata.insert("media_type".into(), json!(media_type));
+    metadata.insert("encoded_length".into(), json!(encoded.len()));
+    if let Some(decoded_size) = decoded_size {
+        metadata.insert("decoded_size".into(), json!(decoded_size));
+    }
+    metadata.insert("sha256".into(), json!(sha256));
+    Value::Object(metadata)
+}
+
 fn is_sensitive_json_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
-    normalized.contains("apikey")
-        || normalized.contains("authorization")
-        || normalized.contains("accesstoken")
-        || normalized == "token"
-        || normalized.contains("secret")
-        || normalized.contains("password")
+    if normalized.ends_with("env") || normalized.ends_with("envvar") {
+        return false;
+    }
+    [
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "token",
+        "password",
+        "passwd",
+        "clientsecret",
+        "secret",
+        "authorization",
+        "credential",
+        "privatekey",
+    ]
+    .iter()
+    .any(|marker| normalized == *marker || normalized.ends_with(marker))
+}
+
+fn redact_trace_text(input: &str) -> String {
+    let assignments = redact_sensitive_assignments(input);
+    let bearer_tokens = redact_bearer_tokens(&assignments);
+    redact_secret_like_tokens(&bearer_tokens)
+}
+
+fn redact_sensitive_assignments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut last = 0;
+    let mut index = 0;
+
+    while index < input.len() {
+        let ch = input[index..]
+            .chars()
+            .next()
+            .expect("index is on a char boundary");
+        if !is_assignment_key_char(ch)
+            || (index > 0
+                && input[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_assignment_key_char))
+        {
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let key_end = input[index..]
+            .char_indices()
+            .find_map(|(offset, ch)| (!is_assignment_key_char(ch)).then_some(index + offset))
+            .unwrap_or(input.len());
+        let key = &input[index..key_end];
+        if !is_sensitive_json_key(key) {
+            index = key_end;
+            continue;
+        }
+
+        let mut separator = key_end;
+        while separator < input.len()
+            && input[separator..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_whitespace())
+        {
+            separator += input[separator..]
+                .chars()
+                .next()
+                .expect("separator is on a char boundary")
+                .len_utf8();
+        }
+        if matches!(input[separator..].chars().next(), Some('"' | '\'')) {
+            let quote = input[separator..]
+                .chars()
+                .next()
+                .expect("quote was checked");
+            separator += quote.len_utf8();
+            while separator < input.len()
+                && input[separator..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_whitespace())
+            {
+                separator += input[separator..]
+                    .chars()
+                    .next()
+                    .expect("separator is on a char boundary")
+                    .len_utf8();
+            }
+        }
+        if !matches!(input[separator..].chars().next(), Some(':' | '=')) {
+            index = key_end;
+            continue;
+        }
+
+        let mut value_start = separator + 1;
+        while value_start < input.len()
+            && input[value_start..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_whitespace())
+        {
+            value_start += input[value_start..]
+                .chars()
+                .next()
+                .expect("value start is on a char boundary")
+                .len_utf8();
+        }
+        if value_start == input.len() {
+            index = value_start;
+            continue;
+        }
+
+        let quoted = matches!(input[value_start..].chars().next(), Some('"' | '\''));
+        let (content_start, content_end) = if quoted {
+            let quote = input[value_start..]
+                .chars()
+                .next()
+                .expect("quote was checked");
+            let content_start = value_start + quote.len_utf8();
+            let content_end = input[content_start..]
+                .find(quote)
+                .map(|offset| content_start + offset)
+                .unwrap_or(input.len());
+            (content_start, content_end)
+        } else {
+            let allow_spaces = key.eq_ignore_ascii_case("authorization");
+            let content_end = input[value_start..]
+                .char_indices()
+                .find_map(|(offset, ch)| {
+                    (is_assignment_value_delimiter(ch, allow_spaces))
+                        .then_some(value_start + offset)
+                })
+                .unwrap_or(input.len());
+            (value_start, content_end)
+        };
+        if content_start == content_end {
+            index = content_end;
+            continue;
+        }
+
+        let value = &input[content_start..content_end];
+        let replacement = if value
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
+            && value[6..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_whitespace())
+        {
+            "Bearer <redacted-secret>"
+        } else {
+            "<redacted-secret>"
+        };
+        output.push_str(&input[last..content_start]);
+        output.push_str(replacement);
+        last = content_end;
+        index = content_end;
+    }
+
+    output.push_str(&input[last..]);
+    output
+}
+
+fn is_assignment_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')
+}
+
+fn is_assignment_value_delimiter(ch: char, allow_spaces: bool) -> bool {
+    (!allow_spaces && ch.is_ascii_whitespace()) || matches!(ch, ',' | ';' | '}' | ']' | '&' | '#')
+}
+
+fn redact_bearer_tokens(input: &str) -> String {
+    let lowercase = input.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut last = 0;
+    let mut search_from = 0;
+
+    while let Some(relative) = lowercase[search_from..].find("bearer") {
+        let start = search_from + relative;
+        let end = start + "bearer".len();
+        let boundary_before = start == 0
+            || !input[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric());
+        let boundary_after = end == input.len()
+            || !input[end..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric());
+        if !boundary_before || !boundary_after {
+            search_from = end;
+            continue;
+        }
+
+        let mut token_start = end;
+        while token_start < input.len()
+            && input[token_start..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_whitespace())
+        {
+            token_start += input[token_start..]
+                .chars()
+                .next()
+                .expect("token start is on a char boundary")
+                .len_utf8();
+        }
+        let token_end = input[token_start..]
+            .char_indices()
+            .find_map(|(offset, ch)| {
+                matches!(ch, ',' | ';' | '}' | ']' | '&' | '#' | '"' | '\'')
+                    .then_some(token_start + offset)
+            })
+            .unwrap_or(input.len());
+        let token = input[token_start..token_end].trim_end();
+        if token.len() < 8 || token.starts_with("<redacted") {
+            search_from = end;
+            continue;
+        }
+
+        output.push_str(&input[last..start]);
+        output.push_str("Bearer <redacted-secret>");
+        last = token_end - (input[token_start..token_end].len() - token.len());
+        search_from = token_end;
+    }
+
+    output.push_str(&input[last..]);
+    output
 }
 
 fn redact_secret_like_tokens(input: &str) -> String {
@@ -3485,6 +4241,11 @@ mod tests {
     fn trace_redaction_removes_secret_like_values() {
         let payload = json!({
             "api_key": "sk-test-secret-value",
+            "refresh_token": "refresh-secret-value",
+            "id_token": "id-secret-value",
+            "credential": "credential-secret-value",
+            "private_key": "private-key-secret-value",
+            "api_key_env": "LLM_API_KEY",
             "headers": {
                 "Authorization": "Bearer sk-auth-secret-value",
                 "x-safe": "plain"
@@ -3499,12 +4260,117 @@ mod tests {
 
         let redacted = redact_json_for_trace(&payload);
         assert_eq!(redacted["api_key"], "<redacted-secret>");
+        assert_eq!(redacted["refresh_token"], "<redacted-secret>");
+        assert_eq!(redacted["id_token"], "<redacted-secret>");
+        assert_eq!(redacted["credential"], "<redacted-secret>");
+        assert_eq!(redacted["private_key"], "<redacted-secret>");
+        assert_eq!(redacted["api_key_env"], "LLM_API_KEY");
         assert_eq!(redacted["headers"]["Authorization"], "<redacted-secret>");
         assert_eq!(redacted["headers"]["x-safe"], "plain");
         assert!(!redacted["messages"][0]["content"]
             .as_str()
             .unwrap()
             .contains("sk-inline-secret-value"));
+    }
+
+    #[test]
+    fn trace_endpoint_removes_url_credentials_but_keeps_safe_parts() {
+        let endpoint = "https://trace-user:trace-password@example.com/v1/tasks?model=vision&api_key=query-secret#token=fragment-secret";
+
+        let redacted = redact_endpoint_for_trace(endpoint);
+
+        assert!(!redacted.contains("trace-user"));
+        assert!(!redacted.contains("trace-password"));
+        assert!(!redacted.contains("query-secret"));
+        assert!(!redacted.contains("fragment-secret"));
+        assert!(redacted.contains("https://example.com/v1/tasks"));
+        assert!(redacted.contains("model=vision"));
+        assert!(redacted.contains("api_key=<redacted-secret>"));
+        assert!(redacted.contains("token=<redacted-secret>"));
+    }
+
+    #[test]
+    fn trace_text_redacts_common_assignments_without_erasing_normal_text() {
+        let text = "Authorization: Bearer bearer-secret-value, api_key=api-secret-value; token=token-secret-value password: pass-secret secret='secret-value'; token_count=3; ordinary content stays";
+
+        let redacted = redact_trace_text(text);
+
+        assert!(!redacted.contains("bearer-secret-value"));
+        assert!(!redacted.contains("api-secret-value"));
+        assert!(!redacted.contains("token-secret-value"));
+        assert!(!redacted.contains("pass-secret"));
+        assert!(!redacted.contains("secret-value"));
+        assert!(redacted.contains("token_count=3"));
+        assert!(redacted.contains("ordinary content stays"));
+    }
+
+    #[test]
+    fn trace_redaction_replaces_image_and_video_data_urls_with_metadata() {
+        let payload = json!({
+            "image": "data:image/png;base64,AAAA",
+            "video": "data:video/mp4,raw-video-data",
+            "base64": "c2Vuc2l0aXZlLWJhc2U2NC1iaW5hcnk=",
+        });
+
+        let redacted = redact_json_for_trace(&payload);
+        assert_eq!(redacted["image"]["media_type"], "image/png");
+        assert_eq!(redacted["image"]["encoded_length"], 4);
+        assert_eq!(redacted["video"]["media_type"], "video/mp4");
+        assert_eq!(redacted["video"]["encoded_length"], 14);
+        assert!(redacted["image"].get("sha256").is_some());
+        assert!(redacted["video"].get("sha256").is_some());
+        assert_eq!(redacted["base64"]["media_type"], "application/octet-stream");
+        assert!(!serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("c2Vuc2l0aXZlLWJhc2U2NC1iaW5hcnk="));
+    }
+
+    #[test]
+    fn multipart_voice_trace_contains_audio_metadata_without_base64() {
+        let client = OpenAiAudioTranscriptionClient {
+            config: voice_transcription_config(),
+            client: reqwest::Client::new(),
+            api_key: "test-key".into(),
+            base_url: "https://api.example.com/v1".into(),
+            model: "voice-model".into(),
+            trace_dir: None,
+            trace_context: None,
+        };
+        let bytes = b"audio-secret-binary";
+        let encoded = general_purpose::STANDARD.encode(bytes);
+        let trace = voice_transcription_multipart_trace_payload(
+            &client,
+            "voice.mp3",
+            Some("audio/mpeg"),
+            bytes,
+        );
+        let serialized = serde_json::to_string(&trace).unwrap();
+
+        assert!(!serialized.contains(&encoded));
+        assert_eq!(trace["file"]["media_type"], "audio/mpeg");
+        assert_eq!(trace["file"]["encoded_length"], encoded.len());
+        assert_eq!(trace["file"]["decoded_size"], bytes.len());
+        assert_eq!(trace["file"]["mime"], "audio/mpeg");
+        assert_eq!(trace["file"]["size_bytes"], bytes.len());
+        assert_eq!(trace["file"]["sha256"], sha256_hex(bytes));
+    }
+
+    #[test]
+    fn stepfun_asr_trace_redacts_audio_data_without_changing_http_payload() {
+        let config = voice_transcription_config();
+        let bytes = b"stepfun-audio-secret";
+        let payload =
+            stepfun_asr_payload("stepaudio-2.5-asr", &config, Path::new("voice.mp3"), bytes)
+                .unwrap();
+        let encoded = payload["audio"]["data"].as_str().unwrap();
+        let redacted = redact_json_for_trace(&payload);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+
+        assert_eq!(encoded, general_purpose::STANDARD.encode(bytes));
+        assert!(!serialized.contains(encoded));
+        assert_eq!(redacted["audio"]["data"]["media_type"], "audio/*");
+        assert_eq!(redacted["audio"]["data"]["decoded_size"], bytes.len());
+        assert_eq!(redacted["audio"]["data"]["sha256"], sha256_hex(bytes));
     }
 
     fn image_caption_config() -> ImageCaptionConfig {
@@ -4081,19 +4947,82 @@ reasoning_effort = "none"
     }
 
     #[test]
-    fn rate_limit_retry_uses_serial_queue_delay() {
-        assert_eq!(
-            http_retry_delay_ms_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS, 1),
-            60_000
-        );
-        assert_eq!(
-            http_retry_delay_ms_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS, 5),
-            60_000
-        );
-        assert_eq!(
-            http_retry_delay_ms_for_status(reqwest::StatusCode::BAD_GATEWAY, 3),
-            4_000
-        );
+    fn rate_limit_retry_uses_bounded_exponential_backoff_with_jitter() {
+        let first = http_retry_delay_ms_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS, 1, None);
+        let later = http_retry_delay_ms_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS, 5, None);
+        assert!((1_000..=1_200).contains(&first));
+        assert!((16_000..=19_200).contains(&later));
+        let gateway = http_retry_delay_ms_for_status(reqwest::StatusCode::BAD_GATEWAY, 3, None);
+        assert!((4_000..=4_800).contains(&gateway));
+    }
+
+    #[test]
+    fn rate_limit_retry_honors_retry_after_without_exceeding_budget() {
+        let delay =
+            http_retry_delay_ms_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS, 1, Some(5_000));
+        assert!((5_000..=6_000).contains(&delay));
+    }
+
+    #[test]
+    fn retry_budget_bounds_cumulative_wait_time() {
+        let budget = RetryBudget {
+            started: Instant::now() - Duration::from_millis(HTTP_RETRY_TOTAL_DELAY_BUDGET_MS),
+            deadline: None,
+            retry_delay_budget: Some(Duration::from_millis(HTTP_RETRY_TOTAL_DELAY_BUDGET_MS)),
+        };
+
+        assert!(!budget.allows(1));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_queue_wait_is_counted_against_retry_budget() {
+        let queue = Arc::new(Mutex::new(()));
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let holder_queue = Arc::clone(&queue);
+        tokio::spawn(async move {
+            let _guard = holder_queue.lock().await;
+            locked_tx.send(()).unwrap();
+            sleep(Duration::from_millis(30)).await;
+        });
+        locked_rx.await.unwrap();
+
+        let retry_budget = RetryBudget {
+            started: Instant::now() - Duration::from_millis(HTTP_RETRY_TOTAL_DELAY_BUDGET_MS - 50),
+            deadline: None,
+            retry_delay_budget: Some(Duration::from_millis(HTTP_RETRY_TOTAL_DELAY_BUDGET_MS)),
+        };
+        let started = Instant::now();
+        let waited =
+            wait_in_rate_limit_retry_queue(queue.as_ref(), "test retry", 1, 2, &retry_budget, 100)
+                .await;
+
+        assert!(waited.unwrap() < 100);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn exhausted_rate_limit_budget_returns_no_retry_plan() {
+        let queue = Mutex::new(());
+        let retry_budget = RetryBudget {
+            started: Instant::now() - Duration::from_millis(HTTP_RETRY_TOTAL_DELAY_BUDGET_MS),
+            deadline: None,
+            retry_delay_budget: Some(Duration::from_millis(HTTP_RETRY_TOTAL_DELAY_BUDGET_MS)),
+        };
+
+        let plan =
+            wait_in_rate_limit_retry_queue(&queue, "test retry", 1, 2, &retry_budget, 100).await;
+
+        assert!(plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn outer_retry_deadline_bounds_backoff_sleep() {
+        let budget = RetryBudget::with_deadline(Instant::now() + Duration::from_millis(25));
+        let started = Instant::now();
+
+        assert!(!sleep_for_retry_budget(&budget, Duration::from_millis(200)).await);
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert!(budget.deadline_exhausted());
     }
 
     #[test]

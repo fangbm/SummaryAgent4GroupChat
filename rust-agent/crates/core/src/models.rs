@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct IncomingMessage {
     pub room_id: String,
     pub room_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
     pub sender_id: String,
     pub sender_name: Option<String>,
     pub content: String,

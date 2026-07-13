@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use crate::config;
 use crate::crypto::{self, wal};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
     CacheHit,
@@ -500,7 +500,7 @@ fn cleanup_stale_temp_artifacts(cache_dir: &Path) {
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
-            .map_or(true, |age| age >= STALE_TEMP_MAX_AGE);
+            .is_none_or(|age| age >= STALE_TEMP_MAX_AGE);
         if stale {
             remove_cache_snapshot(&path);
         }

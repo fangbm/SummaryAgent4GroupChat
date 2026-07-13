@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Install Python checks
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+      - name: Rust format
+        working-directory: rust-agent
+        run: cargo fmt --all -- --check
+      - name: Rust clippy
+        working-directory: rust-agent
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust tests and GUI compile check
+        working-directory: rust-agent
+        run: |
+          cargo test --workspace --exclude wechat-summary-gui
+          cargo check -p wechat-summary-gui
+      - name: Python lint and tests
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m ruff check .
+          .\.venv\Scripts\python.exe -m mypy src
+          .\.venv\Scripts\python.exe -m pytest -q

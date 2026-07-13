@@ -26,10 +26,10 @@ else:
 sys.stdout = sys.stderr
 logging.raiseExceptions = False
 
-from wx4py import CallbackHandler, WeChatClient
-from wx4py.core import uiautomation as uia
-from wx4py.core.uia_wrapper import UIAWrapper
-from wx4py.features.messaging import WeChatGroupProcessor
+from wx4py import CallbackHandler, WeChatClient  # noqa: E402
+from wx4py.core import uiautomation as uia  # noqa: E402
+from wx4py.core.uia_wrapper import UIAWrapper  # noqa: E402
+from wx4py.features.messaging import WeChatGroupProcessor  # noqa: E402
 
 try:
     import win32con
@@ -123,7 +123,10 @@ class Wx4pySidecar:
                 self.start_group_processor(group)
             except Exception as exc:
                 self.pending_groups.add(group)
-                diag_log(f"group listener start failed group={group!r}: {type(exc).__name__}: {exc}")
+                diag_log(
+                    f"group listener start failed group={group!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     def start_group_processor(self, group: str) -> None:
         self.restore_main_window()
@@ -205,7 +208,10 @@ class Wx4pySidecar:
         try:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
         except Exception as exc:
-            diag_log(f"uia restart permission check failed hwnd={hwnd}: {type(exc).__name__}: {exc}")
+            diag_log(
+                f"uia restart permission check failed hwnd={hwnd}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             return False
         if not pid:
             return False
@@ -248,7 +254,7 @@ class Wx4pySidecar:
             return None
         try:
             wrapper = UIAWrapper(hwnd)
-            setattr(window, "_uia", wrapper)
+            window._uia = wrapper
             return wrapper.root
         except Exception as exc:
             diag_log(f"uia refresh failed hwnd={hwnd}: {type(exc).__name__}: {exc}")
@@ -333,10 +339,10 @@ class Wx4pySidecar:
         group = str(getattr(event, "group", "") or "")
         content = str(getattr(event, "content", "") or "")
         timestamp = int(float(getattr(event, "timestamp", time.time()) or time.time()))
-        preview = content.replace("\r", " ").replace("\n", " ")[:40]
-        diag_log(f"message group={group!r} len={len(content)} preview={preview!r}")
+        stable_id = self.message_stable_id(event)
+        diag_log(f"message group={group!r} len={len(content)}")
         print(
-            f"[wx4py-sidecar] message group={group!r} len={len(content)} preview={preview!r}",
+            f"[wx4py-sidecar] message group={group!r} len={len(content)}",
             file=sys.stderr,
             flush=True,
         )
@@ -345,12 +351,24 @@ class Wx4pySidecar:
                 "kind": "event",
                 "room_id": group,
                 "room_name": group,
+                "stable_id": stable_id,
                 "content": content,
                 "sender_id": None,
                 "sender_name": None,
                 "timestamp": timestamp,
             }
         )
+
+    @staticmethod
+    def message_stable_id(event: Any) -> str | None:
+        for field in ("msg_id", "message_id", "local_id", "id"):
+            value = getattr(event, field, None)
+            if value is None:
+                continue
+            stable_id = str(value).strip()
+            if stable_id:
+                return f"wx4py:{stable_id}"
+        return None
 
     def read_commands(self) -> None:
         while True:
@@ -377,15 +395,29 @@ class Wx4pySidecar:
             try:
                 self.handle_command(command)
             except Exception as exc:
-                diag_log(f"command failed: {type(exc).__name__}: {exc}")
+                request_id = str(command.get("request_id") or "unknown")
+                message = f"command failed: {type(exc).__name__}: {exc}"
+                diag_log(f"command failed request_id={request_id}: {type(exc).__name__}: {exc}")
                 emit(
                     {
                         "kind": "command_error",
-                        "message": f"command failed: {type(exc).__name__}: {exc}",
+                        "request_id": request_id,
+                        "message": message,
+                    }
+                )
+            else:
+                emit(
+                    {
+                        "kind": "command_result",
+                        "request_id": str(command.get("request_id") or "unknown"),
+                        "ok": True,
                     }
                 )
 
     def handle_command(self, command: dict[str, Any]) -> None:
+        request_id = str(command.get("request_id") or "").strip()
+        if not request_id:
+            raise ValueError("request_id is required")
         cmd = command.get("cmd")
         room = str(command.get("room") or "").strip()
         if not room:
@@ -395,7 +427,7 @@ class Wx4pySidecar:
             if cmd == "send_text":
                 text = str(command.get("text") or "").strip()
                 if not text:
-                    return
+                    raise ValueError("text is required")
                 ok = self.send_text_guarded(room, text)
             elif cmd == "send_image":
                 path = Path(str(command.get("path") or "")).resolve()
@@ -419,7 +451,8 @@ class Wx4pySidecar:
         rounds = 2 if self.active_send_room != room else 1
         for index in range(rounds):
             diag_log(
-                f"open_guard target={room!r} previous={self.active_send_room!r} round={index + 1}/{rounds}"
+                f"open_guard target={room!r} previous={self.active_send_room!r} "
+                f"round={index + 1}/{rounds}"
             )
             if not self.open_chat_once_guarded(room):
                 self.active_send_room = None
@@ -439,9 +472,7 @@ class Wx4pySidecar:
                 return True
             diag_log(f"open_guard primary returned false target={room!r}")
         except Exception as exc:
-            diag_log(
-                f"open_guard primary failed target={room!r}: {type(exc).__name__}: {exc}"
-            )
+            diag_log(f"open_guard primary failed target={room!r}: {type(exc).__name__}: {exc}")
 
         return self.open_chat_from_search_fallback(room)
 
@@ -454,9 +485,7 @@ class Wx4pySidecar:
             for item in self.iter_matching_search_results(room, results):
                 group = str(getattr(item, "group", "") or "")
                 name = str(getattr(item, "name", "") or "")
-                diag_log(
-                    f"open_fallback clicking target={room!r} group={group!r} name={name!r}"
-                )
+                diag_log(f"open_fallback clicking target={room!r} group={group!r} name={name!r}")
                 if not self.click_search_result(item):
                     continue
                 time.sleep(1.0)
@@ -465,22 +494,20 @@ class Wx4pySidecar:
                     try:
                         if not get_chat_input():
                             diag_log(
-                                f"open_fallback clicked but no chat input target={room!r} group={group!r} name={name!r}"
+                                f"open_fallback clicked but no chat input target={room!r} "
+                                f"group={group!r} name={name!r}"
                             )
                             continue
                     except Exception as exc:
                         diag_log(
-                            f"open_fallback input check failed target={room!r}: {type(exc).__name__}: {exc}"
+                            f"open_fallback input check failed target={room!r}: "
+                            f"{type(exc).__name__}: {exc}"
                         )
                         continue
-                diag_log(
-                    f"open_fallback succeeded target={room!r} group={group!r} name={name!r}"
-                )
+                diag_log(f"open_fallback succeeded target={room!r} group={group!r} name={name!r}")
                 return True
         except Exception as exc:
-            diag_log(
-                f"open_fallback failed target={room!r}: {type(exc).__name__}: {exc}"
-            )
+            diag_log(f"open_fallback failed target={room!r}: {type(exc).__name__}: {exc}")
 
         try:
             clear_search = getattr(self.client.chat_window, "_clear_search", None)
@@ -543,7 +570,8 @@ class Wx4pySidecar:
                 return True
             except Exception as exc:
                 diag_log(
-                    f"open_fallback {method_name} failed name={getattr(item, 'name', '')!r}: {type(exc).__name__}: {exc}"
+                    f"open_fallback {method_name} failed "
+                    f"name={getattr(item, 'name', '')!r}: {type(exc).__name__}: {exc}"
                 )
         return False
 
@@ -557,9 +585,7 @@ class Wx4pySidecar:
                 if registry:
                     registry.record(room, text)
                 ok = self.client.chat_window.send_message(text)
-                diag_log(
-                    f"send_text_guarded result target={room!r} attempt={attempt} ok={ok}"
-                )
+                diag_log(f"send_text_guarded result target={room!r} attempt={attempt} ok={ok}")
                 if ok:
                     return True
             except Exception as exc:
@@ -578,9 +604,7 @@ class Wx4pySidecar:
                 if not self.open_chat_guarded(room):
                     continue
                 ok = self.client.chat_window.send_file(str(path))
-                diag_log(
-                    f"{label} result target={room!r} attempt={attempt} ok={ok}"
-                )
+                diag_log(f"{label} result target={room!r} attempt={attempt} ok={ok}")
                 if ok:
                     return True
             except Exception as exc:

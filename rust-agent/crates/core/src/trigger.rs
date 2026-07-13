@@ -115,6 +115,7 @@ mod tests {
         IncomingMessage {
             room_id: "room@chatroom".into(),
             room_name: Some("测试群".into()),
+            stable_id: None,
             sender_id: "wxid_user".into(),
             sender_name: Some("Alice".into()),
             content: content.into(),

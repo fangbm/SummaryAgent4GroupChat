@@ -10,6 +10,7 @@ pub struct RuntimeConfig {
     pub cache_dir: PathBuf,
     pub keys_file: PathBuf,
     pub legacy_wx_cli_dir: PathBuf,
+    pub explicit_db_dir: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +74,10 @@ impl RuntimeConfig {
             .unwrap_or_else(|| app_dir.join("keys.json"));
 
         let mut db_dirs = BTreeSet::new();
+        let explicit_db_dir = std::env::var_os("WXDB_DB_DIR").is_some()
+            || file_config
+                .as_ref()
+                .is_some_and(|config| config.db_dir.is_some() || !config.db_dirs.is_empty());
         for path in env_paths("WXDB_DB_DIR") {
             add_db_dir_candidate(&mut db_dirs, path);
         }
@@ -103,6 +108,7 @@ impl RuntimeConfig {
             cache_dir,
             keys_file,
             legacy_wx_cli_dir,
+            explicit_db_dir,
         }
     }
 
@@ -112,6 +118,12 @@ impl RuntimeConfig {
 
     pub fn with_cache_dir(mut self, cache_dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = cache_dir.into();
+        self
+    }
+
+    pub fn with_db_dir(mut self, db_dir: impl Into<PathBuf>) -> Self {
+        self.db_dirs = vec![db_dir.into()];
+        self.explicit_db_dir = true;
         self
     }
 

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
@@ -17,6 +17,7 @@ pub struct HistoryQuery {
     pub chat_name: String,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    pub before_local_id: Option<i64>,
     pub limit: usize,
     pub text_only: bool,
     pub msg_types: Vec<String>,
@@ -55,7 +56,7 @@ pub struct HistoryMessage {
     pub media_decode_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryResult {
     pub chat: String,
     pub username: String,
@@ -65,7 +66,7 @@ pub struct HistoryResult {
     pub meta: HistoryMeta,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HistoryMeta {
     pub db_dir: Option<PathBuf>,
     pub candidates_scanned: usize,
@@ -107,6 +108,7 @@ pub fn query_history_with_config(
     }
 
     let mut best: Option<HistoryResult> = None;
+    let mut successful_stores = 0usize;
     let mut errors = Vec::new();
     let mut missing_key_store_errors = Vec::new();
     let mut global_warnings = Vec::new();
@@ -149,6 +151,7 @@ pub fn query_history_with_config(
 
         match store_result {
             Ok(mut result) => {
+                successful_stores += 1;
                 result.meta.candidates_scanned = config.db_dirs.len();
                 result.meta.db_dir = Some(db_dir.clone());
                 tracing::debug!(
@@ -161,9 +164,10 @@ pub fn query_history_with_config(
                     elapsed_ms = store_started.elapsed().as_millis(),
                     "wxdb store query completed"
                 );
-                if result.count > best.as_ref().map(|current| current.count).unwrap_or(0) {
-                    best = Some(result);
-                } else if result.count == 0 && best.is_none() {
+                if best
+                    .as_ref()
+                    .is_none_or(|current| result.count > current.count)
+                {
                     best = Some(result);
                 }
             }
@@ -190,6 +194,19 @@ pub fn query_history_with_config(
         }
     }
 
+    if !config.explicit_db_dir && !missing_key_store_errors.is_empty() {
+        anyhow::bail!(format_store_query_failure(
+            &errors,
+            &missing_key_store_errors
+        ));
+    }
+
+    if !config.explicit_db_dir && successful_stores > 1 {
+        anyhow::bail!(
+            "微信数据库查询存在多个可读账号目录，无法确认群聊所属账号；请在 Agent 配置的 [wxdb].db_dir 中显式选择账号目录"
+        );
+    }
+
     if let Some(mut result) = best {
         global_warnings.extend(errors);
         result.meta.warnings.extend(global_warnings);
@@ -214,7 +231,7 @@ pub fn query_history_with_config(
 }
 
 fn is_missing_db_key_error(error: &str) -> bool {
-    error.contains("没有可用数据库密钥")
+    error.contains("没有可用数据库密钥") || error.contains("消息分片缺少数据库密钥")
 }
 
 fn should_retry_store_query_error(error: &anyhow::Error) -> bool {
@@ -296,8 +313,8 @@ fn query_history_in_store(
         elapsed_ms = names_started.elapsed().as_millis(),
         "wxdb names loaded"
     );
-    let username = resolve_username(&query.chat_name, &names)
-        .with_context(|| format!("找不到联系人或群聊: {}", query.chat_name))?;
+    let username = resolve_username(&query.chat_name, &names)?
+        .ok_or_else(|| anyhow::anyhow!("找不到联系人或群聊: {}", query.chat_name))?;
     let display = names
         .map
         .get(&username)
@@ -305,7 +322,7 @@ fn query_history_in_store(
         .unwrap_or_else(|| query.chat_name.clone());
     let is_group = username.contains("@chatroom");
     let shard_started = Instant::now();
-    let (shards, scanned, mut warnings) = find_msg_shards(&mut cache, &names, &username)?;
+    let (shards, scanned, warnings) = find_msg_shards(&mut cache, &names, &username)?;
     let unknown_shards = unknown_message_shards(&cache, &names);
     tracing::debug!(
         db_dir = %db_dir.display(),
@@ -318,6 +335,15 @@ fn query_history_in_store(
         elapsed_ms = shard_started.elapsed().as_millis(),
         "wxdb message shards resolved"
     );
+    if !unknown_shards.is_empty() {
+        let mut details = unknown_shards.join(", ");
+        if details.chars().count() > 900 {
+            details = details.chars().take(900).chain("...".chars()).collect();
+        }
+        anyhow::bail!(
+            "微信数据库读取不完整：以下消息分片缺少数据库密钥，无法确认历史是否完整: {details}"
+        );
+    }
     if shards.is_empty() {
         return Ok(HistoryResult {
             chat: display,
@@ -373,6 +399,7 @@ fn query_history_in_store(
             &media_cache_dir,
             query.since.map(|dt| dt.timestamp()),
             query.until.map(|dt| dt.timestamp()),
+            query.before_local_id,
             query.text_only,
             &query.msg_types,
             query.limit,
@@ -394,7 +421,19 @@ fn query_history_in_store(
         );
     }
 
-    all_messages.sort_by_key(|message| std::cmp::Reverse(message.timestamp));
+    let mut seen_local_ids = HashSet::new();
+    all_messages.retain(|message| {
+        message
+            .local_id
+            .map(|local_id| seen_local_ids.insert(local_id))
+            .unwrap_or(true)
+    });
+    all_messages.sort_by(|left, right| {
+        right
+            .timestamp
+            .cmp(&left.timestamp)
+            .then_with(|| right.local_id.cmp(&left.local_id))
+    });
     all_messages.truncate(query.limit);
     all_messages.sort_by_key(|message| message.timestamp);
     let count = all_messages.len();
@@ -406,12 +445,6 @@ fn query_history_in_store(
         elapsed_ms = store_started.elapsed().as_millis(),
         "wxdb store result prepared"
     );
-    warnings.extend(
-        unknown_shards
-            .iter()
-            .map(|shard| format!("磁盘存在但没有密钥的消息分片: {shard}")),
-    );
-
     Ok(HistoryResult {
         chat: display,
         username,
@@ -478,12 +511,12 @@ fn load_names(cache: &mut DbCache) -> Result<Names> {
     Ok(Names { map, msg_db_keys })
 }
 
-fn resolve_username(chat_name: &str, names: &Names) -> Option<String> {
+fn resolve_username(chat_name: &str, names: &Names) -> Result<Option<String>> {
     if names.map.contains_key(chat_name)
         || chat_name.contains("@chatroom")
         || chat_name.starts_with("wxid_")
     {
-        return Some(chat_name.to_string());
+        return Ok(Some(chat_name.to_string()));
     }
     let low = chat_name.to_lowercase();
     let mut exact: Vec<&String> = names
@@ -493,8 +526,14 @@ fn resolve_username(chat_name: &str, names: &Names) -> Option<String> {
         .map(|(username, _)| username)
         .collect();
     exact.sort();
+    if exact.len() > 1 {
+        anyhow::bail!(
+            "微信账号目录中群聊名称 {:?} 存在多个精确匹配，无法安全选择；请改用 wxid/@chatroom 标识或在 [wxdb].db_dir 中选择正确账号",
+            chat_name
+        );
+    }
     if let Some(username) = exact.into_iter().next() {
-        return Some(username.clone());
+        return Ok(Some(username.clone()));
     }
     let mut candidates: Vec<(&String, &String)> = names
         .map
@@ -502,10 +541,16 @@ fn resolve_username(chat_name: &str, names: &Names) -> Option<String> {
         .filter(|(_, display)| display.to_lowercase().contains(&low))
         .collect();
     candidates.sort_by_key(|(username, display)| (display.len(), username.as_str()));
-    candidates
+    if candidates.len() > 1 {
+        anyhow::bail!(
+            "微信账号目录中群聊名称 {:?} 存在多个模糊匹配，无法安全选择；请改用完整群名或 wxid/@chatroom 标识",
+            chat_name
+        );
+    }
+    Ok(candidates
         .into_iter()
         .next()
-        .map(|(username, _)| username.clone())
+        .map(|(username, _)| username.clone()))
 }
 
 fn find_msg_shards(
@@ -559,6 +604,7 @@ fn find_msg_shards(
     Ok((shards, scanned, warnings))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_messages(
     shard_rel_key: &str,
     db_path: &Path,
@@ -571,6 +617,7 @@ fn query_messages(
     media_cache_dir: &Path,
     since: Option<i64>,
     until: Option<i64>,
+    before_local_id: Option<i64>,
     text_only: bool,
     msg_types: &[String],
     limit: usize,
@@ -599,14 +646,18 @@ fn query_messages(
         clauses.push("create_time >= ?".to_string());
         params.push(Box::new(since));
     }
-    if let Some(until) = until {
+    if let (Some(until), Some(before_local_id)) = (until, before_local_id) {
+        clauses.push("(create_time < ? OR (create_time = ? AND local_id < ?))".to_string());
+        params.push(Box::new(until));
+        params.push(Box::new(until));
+        params.push(Box::new(before_local_id));
+    } else if let Some(until) = until {
         clauses.push("create_time <= ?".to_string());
         params.push(Box::new(until));
     }
     let msg_type_values = msg_type_filter_values(text_only, msg_types);
     if !msg_type_values.is_empty() {
-        let placeholders = std::iter::repeat("?")
-            .take(msg_type_values.len())
+        let placeholders = std::iter::repeat_n("?", msg_type_values.len())
             .collect::<Vec<_>>()
             .join(", ");
         clauses.push(format!("(local_type & 4294967295) IN ({placeholders})"));
@@ -622,7 +673,7 @@ fn query_messages(
     let sql = format!(
         "SELECT local_id, local_type, create_time, real_sender_id,
                 message_content, WCDB_CT_message_content, packed_info_data
-         FROM [{}] {} ORDER BY create_time DESC LIMIT ?",
+         FROM [{}] {} ORDER BY create_time DESC, local_id DESC LIMIT ?",
         table, where_clause
     );
     params.push(Box::new(limit as i64));
@@ -1290,7 +1341,7 @@ fn decode_first_media_candidate(
         paths.push(path);
     }
     for path in candidates {
-        if !paths.iter().any(|known| *known == path) {
+        if !paths.contains(&path) {
             paths.push(path);
         }
     }
@@ -1330,7 +1381,7 @@ fn decode_first_video_candidate(
         paths.push(path);
     }
     for path in candidates {
-        if is_video_candidate(path) && !paths.iter().any(|known| *known == path) {
+        if is_video_candidate(path) && !paths.contains(&path) {
             paths.push(path);
         }
     }
@@ -1366,7 +1417,7 @@ fn decode_first_voice_candidate(
         paths.push(path);
     }
     for path in candidates {
-        if !paths.iter().any(|known| *known == path) {
+        if !paths.contains(&path) {
             paths.push(path);
         }
     }
@@ -1715,6 +1766,7 @@ fn sender_username(
         .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sender_label(
     sender_username: &str,
     is_group: bool,
@@ -2154,6 +2206,9 @@ mod tests {
     fn recognizes_missing_db_key_errors() {
         assert!(is_missing_db_key_error(
             r"\\?\D:\Temp\xwechat_files\wxid_a\db_storage: 没有可用数据库密钥；请确认微信正在运行"
+        ));
+        assert!(is_missing_db_key_error(
+            "微信数据库读取不完整：以下消息分片缺少数据库密钥"
         ));
         assert!(!is_missing_db_key_error("打开 contact.db 失败"));
     }

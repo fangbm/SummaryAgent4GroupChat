@@ -46,6 +46,7 @@ struct ConfigView {
     wx_python: String,
     wx_sidecar: String,
     wx_ready_timeout: u64,
+    wx_command_timeout: u64,
     wx_long_text_delivery: String,
     wx_long_text_file_min_chunks: u32,
     wx_long_text_file_dir: String,
@@ -72,6 +73,7 @@ struct ConfigView {
     wx_cli_history_timeout: u64,
     wx_cli_temp_dir: String,
     wxdb_cache_dir: String,
+    wxdb_db_dir: String,
     llm_provider: String,
     llm_api_key_env: String,
     llm_base_url_env: String,
@@ -654,9 +656,9 @@ impl eframe::App for GuiApp {
                     runtime_tab(
                         ui,
                         &mut self.view,
-                        &mut self.log_tail,
+                        &self.log_tail,
                         &self.log_path_label,
-                        &mut self.terminal_output,
+                        &self.terminal_output,
                         self.agent.is_some(),
                     )
                 });
@@ -824,6 +826,7 @@ fn platform_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             text_field(ui, "Python 路径", &mut view.wx_python);
             text_field(ui, "wx4py 脚本", &mut view.wx_sidecar);
             number_u64(ui, "就绪超时秒数", &mut view.wx_ready_timeout);
+            number_u64(ui, "发送 ACK 超时秒数", &mut view.wx_command_timeout);
             ui.horizontal(|ui| {
                 ui.label("长文本发送模式");
                 egui::ComboBox::from_id_salt("wx-long-text-delivery")
@@ -916,7 +919,11 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         text_field(ui, "模型名称", &mut view.llm_model);
         text_field(ui, "模型环境变量", &mut view.llm_model_env);
         number_u64(ui, "LLM 超时秒数", &mut view.llm_timeout);
-        number_u32(ui, "5xx 重试次数", &mut view.llm_retry_5xx_attempts);
+        number_u32(
+            ui,
+            "5xx/429 HTTP 重试次数",
+            &mut view.llm_retry_5xx_attempts,
+        );
         number_u32(ui, "最大输出 Token", &mut view.llm_max_tokens);
         number_u32(
             ui,
@@ -949,7 +956,11 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         text_field(ui, "图片尺寸", &mut view.image_size);
         text_field(ui, "图片分辨率", &mut view.image_resolution);
         number_u64(ui, "图片超时秒数", &mut view.image_timeout);
-        number_u32(ui, "5xx 重试次数", &mut view.image_retry_5xx_attempts);
+        number_u32(
+            ui,
+            "5xx/429 HTTP 重试次数",
+            &mut view.image_retry_5xx_attempts,
+        );
         ui.separator();
         ui.heading("语音转写");
         ui.checkbox(&mut view.voice_transcription_enabled, "启用语音转写");
@@ -973,7 +984,7 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         number_u64(ui, "语音超时秒数", &mut view.voice_transcription_timeout);
         number_u32(
             ui,
-            "5xx 重试次数",
+            "5xx/429 HTTP 重试次数",
             &mut view.voice_transcription_retry_5xx_attempts,
         );
         text_field(ui, "语音语言", &mut view.voice_transcription_language);
@@ -1029,7 +1040,7 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         number_u64(ui, "转述超时秒数", &mut view.image_caption_timeout);
         number_u32(
             ui,
-            "5xx 重试次数",
+            "5xx/429 HTTP 重试次数",
             &mut view.image_caption_retry_5xx_attempts,
         );
         number_u32(ui, "转述最大输出 Token", &mut view.image_caption_max_tokens);
@@ -1064,7 +1075,7 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         number_u64(ui, "视频超时秒数", &mut view.video_caption_timeout);
         number_u32(
             ui,
-            "5xx 重试次数",
+            "5xx/429 HTTP 重试次数",
             &mut view.video_caption_retry_5xx_attempts,
         );
         number_u32(ui, "视频最大输出 Token", &mut view.video_caption_max_tokens);
@@ -1091,9 +1102,9 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
 fn runtime_tab(
     ui: &mut egui::Ui,
     view: &mut ConfigView,
-    log_tail: &mut String,
+    log_tail: &str,
     log_path_label: &str,
-    terminal_output: &mut String,
+    terminal_output: &str,
     agent_running: bool,
 ) {
     ui.heading("运行信息");
@@ -1101,6 +1112,7 @@ fn runtime_tab(
         ui,
         |ui| {
             text_field(ui, "wxdb 命令", &mut view.wx_cli_executable);
+            text_field(ui, "wxdb 账号 db_dir（留空自动）", &mut view.wxdb_db_dir);
             number_u64(ui, "wxdb 命令超时秒数", &mut view.wx_cli_timeout);
             number_u64(ui, "历史查询总超时秒数", &mut view.wx_cli_history_timeout);
             text_field(ui, "外部 wxdb 导出临时目录", &mut view.wx_cli_temp_dir);
@@ -1635,6 +1647,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             wx_python: config.wx4py.python_executable,
             wx_sidecar: config.wx4py.sidecar_script,
             wx_ready_timeout: config.wx4py.ready_timeout_seconds,
+            wx_command_timeout: config.wx4py.command_timeout_seconds,
             wx_long_text_delivery: format!("{:?}", config.wx4py.long_text_delivery)
                 .to_ascii_lowercase(),
             wx_long_text_file_min_chunks: config
@@ -1665,6 +1678,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             wx_cli_history_timeout: config.wx_cli.history_query_timeout_seconds,
             wx_cli_temp_dir: config.wx_cli.temp_dir,
             wxdb_cache_dir: config.wx_cli.cache_dir,
+            wxdb_db_dir: config.wx_cli.db_dir.unwrap_or_default(),
             llm_provider: config.llm.provider,
             llm_api_key_env: config.llm.api_key_env,
             llm_base_url_env: config.llm.base_url_env,
@@ -1809,6 +1823,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             "..\\scripts\\wx4py_sidecar.py",
         ),
         wx_ready_timeout: get_u64(doc, "wx4py", "ready_timeout_seconds", 60),
+        wx_command_timeout: get_u64(doc, "wx4py", "command_timeout_seconds", 30),
         wx_long_text_delivery: get_str(doc, "wx4py", "long_text_delivery", "chunks"),
         wx_long_text_file_min_chunks: get_u64(doc, "wx4py", "long_text_file_min_chunks", 3)
             .min(u32::MAX as u64) as u32,
@@ -1847,6 +1862,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         ),
         wx_cli_temp_dir: get_str_alias(doc, "wxdb", "wx_cli", "temp_dir", ".\\runtime\\wx-exports"),
         wxdb_cache_dir: get_str_alias(doc, "wxdb", "wx_cli", "cache_dir", ""),
+        wxdb_db_dir: get_str_alias(doc, "wxdb", "wx_cli", "db_dir", ""),
         llm_provider: get_str(doc, "llm", "provider", "openai_compatible"),
         llm_api_key_env: get_str(doc, "llm", "api_key_env", "LLM_API_KEY"),
         llm_base_url_env: get_str(doc, "llm", "base_url_env", "LLM_BASE_URL"),
@@ -2015,7 +2031,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         runtime_log_level: get_str(doc, "runtime", "log_level", "info"),
         runtime_cleanup_days: get_u64(doc, "runtime", "cleanup_after_days", 7) as u32,
         runtime_max_log_mb: get_u64(doc, "runtime", "max_log_mb", 50) as u32,
-        runtime_ai_trace_enabled: get_bool(doc, "runtime", "ai_trace_enabled", true),
+        runtime_ai_trace_enabled: get_bool(doc, "runtime", "ai_trace_enabled", false),
         runtime_ai_trace_dir: get_str(doc, "runtime", "ai_trace_dir", ""),
     }
 }
@@ -2038,6 +2054,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         wx4py,
         "ready_timeout_seconds",
         update.wx_ready_timeout as i64,
+    );
+    set_int(
+        wx4py,
+        "command_timeout_seconds",
+        update.wx_command_timeout as i64,
     );
     let wx_long_text_delivery = if update.wx_long_text_delivery.eq_ignore_ascii_case("file") {
         "file"
@@ -2110,6 +2131,11 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     );
     set_str(wxdb, "temp_dir", &update.wx_cli_temp_dir);
     set_str(wxdb, "cache_dir", &update.wxdb_cache_dir);
+    if update.wxdb_db_dir.trim().is_empty() {
+        remove_key(wxdb, "db_dir");
+    } else {
+        set_str(wxdb, "db_dir", &update.wxdb_db_dir);
+    }
     remove_table(&mut doc, "wx_cli");
 
     let privacy = table_mut(&mut doc, "privacy");
@@ -2661,7 +2687,7 @@ fn join_lines(values: &[String]) -> String {
 
 fn split_lines(value: &str) -> Vec<String> {
     value
-        .split(|ch| ch == '\n' || ch == '\r' || ch == ',')
+        .split(['\n', '\r', ','])
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
@@ -2886,7 +2912,7 @@ fn start_agent_elevated(state: &AppState) -> Result<()> {
         command
             .spawn()
             .context("starting wechat-summary-app as administrator")?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(windows))]

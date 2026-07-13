@@ -1,11 +1,13 @@
 use std::{
+    collections::VecDeque,
     fs::{self, File},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio},
     sync::{
-        mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, Mutex, OnceLock, TryLockError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+        Arc, Mutex, MutexGuard, OnceLock, TryLockError,
     },
     thread,
     time::{Duration as StdDuration, Instant},
@@ -74,15 +76,30 @@ pub fn refresh_builtin_wxdb_keys_on_start(
 
 #[derive(Debug)]
 pub struct Wx4pyClient {
-    _child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    child: Option<Child>,
+    transport: Arc<Wx4pyTransport>,
     receiver: Receiver<SidecarMessage>,
+    pending_events: Mutex<VecDeque<Wx4pyEvent>>,
     wx_cli: WxCliConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct Wx4pySender {
-    stdin: Arc<Mutex<ChildStdin>>,
+    transport: Arc<Wx4pyTransport>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Wx4pyHistoryReader {
+    wx_cli: WxCliConfig,
+}
+
+#[derive(Debug)]
+struct Wx4pyTransport {
+    stdin: Mutex<Option<ChildStdin>>,
+    pending: Mutex<std::collections::HashMap<String, Sender<std::result::Result<(), String>>>>,
+    closed: AtomicBool,
+    next_request_id: AtomicU64,
+    command_timeout: StdDuration,
 }
 
 impl Wx4pyClient {
@@ -111,15 +128,29 @@ impl Wx4pyClient {
                 ))
             })?;
 
-        let stdin =
-            Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {
-                Wx4pyError::Sidecar("failed to open sidecar stdin".into())
-            })?));
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Wx4pyError::Sidecar("failed to open sidecar stdout".into()))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                terminate_and_reap_child(&mut child)?;
+                return Err(Wx4pyError::Sidecar("failed to open sidecar stdin".into()));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_and_reap_child(&mut child)?;
+                return Err(Wx4pyError::Sidecar("failed to open sidecar stdout".into()));
+            }
+        };
         let (sender, receiver) = mpsc::channel();
+        let transport = Arc::new(Wx4pyTransport {
+            stdin: Mutex::new(Some(stdin)),
+            pending: Mutex::new(std::collections::HashMap::new()),
+            closed: AtomicBool::new(false),
+            next_request_id: AtomicU64::new(1),
+            command_timeout: StdDuration::from_secs(config.command_timeout_seconds.max(1)),
+        });
+        let pending = Arc::clone(&transport);
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -127,7 +158,10 @@ impl Wx4pyClient {
             loop {
                 buffer.clear();
                 match reader.read_until(b'\n', &mut buffer) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        pending.close("wx4py sidecar stdout closed");
+                        break;
+                    }
                     Ok(_) => {
                         let line = String::from_utf8_lossy(&buffer);
                         let line = line.trim();
@@ -136,7 +170,7 @@ impl Wx4pyClient {
                         }
                         match serde_json::from_str::<SidecarMessage>(line) {
                             Ok(message) => {
-                                if sender.send(message).is_err() {
+                                if !dispatch_sidecar_message(message, &pending.pending, &sender) {
                                     break;
                                 }
                             }
@@ -146,6 +180,7 @@ impl Wx4pyClient {
                         }
                     }
                     Err(error) => {
+                        pending.close(format!("wx4py sidecar stdout error: {error}"));
                         let _ = sender.send(SidecarMessage::Error {
                             message: format!("sidecar stdout error: {error}"),
                         });
@@ -156,9 +191,10 @@ impl Wx4pyClient {
         });
 
         let client = Self {
-            _child: child,
-            stdin,
+            child: Some(child),
+            transport,
             receiver,
+            pending_events: Mutex::new(VecDeque::new()),
             wx_cli: wx_cli.clone(),
         };
         client.wait_ready(config.ready_timeout_seconds)?;
@@ -166,13 +202,25 @@ impl Wx4pyClient {
     }
 
     pub fn next_event(&self) -> Result<Wx4pyEvent> {
+        if let Some(event) = self.take_pending_event()? {
+            return Ok(event);
+        }
         loop {
             match self.receiver.recv() {
                 Ok(SidecarMessage::Event(event)) => return Ok(event),
                 Ok(SidecarMessage::Ready { .. }) => continue,
-                Ok(SidecarMessage::CommandError { message }) => {
-                    eprintln!("wx4py sidecar command error: {message}");
-                    continue;
+                Ok(SidecarMessage::CommandError {
+                    request_id,
+                    message,
+                }) => {
+                    return Err(Wx4pyError::Sidecar(format!(
+                        "wx4py sidecar command error request_id={request_id}: {message}"
+                    )));
+                }
+                Ok(SidecarMessage::CommandResult { request_id, ok }) => {
+                    return Err(Wx4pyError::Sidecar(format!(
+                        "unexpected wx4py command ACK request_id={request_id} ok={ok}"
+                    )));
                 }
                 Ok(SidecarMessage::Error { message }) => return Err(Wx4pyError::Sidecar(message)),
                 Err(error) => return Err(Wx4pyError::Sidecar(error.to_string())),
@@ -181,13 +229,27 @@ impl Wx4pyClient {
     }
 
     pub fn next_event_timeout(&self, timeout: StdDuration) -> Result<Option<Wx4pyEvent>> {
+        if let Some(event) = self.take_pending_event()? {
+            return Ok(Some(event));
+        }
+        let deadline = Instant::now() + timeout;
         loop {
-            match self.receiver.recv_timeout(timeout) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.receiver.recv_timeout(remaining) {
                 Ok(SidecarMessage::Event(event)) => return Ok(Some(event)),
                 Ok(SidecarMessage::Ready { .. }) => continue,
-                Ok(SidecarMessage::CommandError { message }) => {
-                    eprintln!("wx4py sidecar command error: {message}");
-                    continue;
+                Ok(SidecarMessage::CommandError {
+                    request_id,
+                    message,
+                }) => {
+                    return Err(Wx4pyError::Sidecar(format!(
+                        "wx4py sidecar command error request_id={request_id}: {message}"
+                    )));
+                }
+                Ok(SidecarMessage::CommandResult { request_id, ok }) => {
+                    return Err(Wx4pyError::Sidecar(format!(
+                        "unexpected wx4py command ACK request_id={request_id} ok={ok}"
+                    )));
                 }
                 Ok(SidecarMessage::Error { message }) => return Err(Wx4pyError::Sidecar(message)),
                 Err(RecvTimeoutError::Timeout) => return Ok(None),
@@ -208,6 +270,7 @@ impl Wx4pyClient {
         self.sender().send_image(room_id, image_path).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn query_text_messages(
         &self,
         room_id: &str,
@@ -217,11 +280,123 @@ impl Wx4pyClient {
         limit: u32,
         media_decode_limit: Option<usize>,
     ) -> Result<Vec<Wx4pyHistoryMessage>> {
+        self.history_reader()
+            .query_text_messages(
+                room_id,
+                room_name,
+                since,
+                until,
+                limit,
+                media_decode_limit,
+                None,
+            )
+            .await
+    }
+
+    pub fn history_reader(&self) -> Wx4pyHistoryReader {
+        Wx4pyHistoryReader {
+            wx_cli: self.wx_cli.clone(),
+        }
+    }
+
+    fn wait_ready(&self, timeout_seconds: u64) -> Result<()> {
+        wait_ready(&self.receiver, &self.pending_events, timeout_seconds)
+    }
+
+    fn take_pending_event(&self) -> Result<Option<Wx4pyEvent>> {
+        self.pending_events
+            .lock()
+            .map(|mut events| events.pop_front())
+            .map_err(|_| Wx4pyError::Sidecar("pending wx4py event mutex poisoned".into()))
+    }
+
+    pub fn sender(&self) -> Wx4pySender {
+        Wx4pySender {
+            transport: Arc::clone(&self.transport),
+        }
+    }
+
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.transport.shutdown();
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        terminate_and_reap_child(&mut child)?;
+        Ok(())
+    }
+}
+
+impl Drop for Wx4pyClient {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn wait_ready(
+    receiver: &Receiver<SidecarMessage>,
+    pending_events: &Mutex<VecDeque<Wx4pyEvent>>,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let deadline = Instant::now() + StdDuration::from_secs(timeout_seconds);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(SidecarMessage::Ready { ok: true }) => return Ok(()),
+            Ok(SidecarMessage::Ready { ok: false }) => {
+                return Err(Wx4pyError::Sidecar(
+                    "wx4py sidecar reported not ready".to_string(),
+                ));
+            }
+            Ok(SidecarMessage::CommandError {
+                request_id,
+                message,
+            }) => {
+                return Err(Wx4pyError::Sidecar(format!(
+                    "command error request_id={request_id}: {message}"
+                )));
+            }
+            Ok(SidecarMessage::CommandResult { request_id, ok }) => {
+                return Err(Wx4pyError::Sidecar(format!(
+                    "unexpected command result request_id={request_id} ok={ok}"
+                )));
+            }
+            Ok(SidecarMessage::Event(event)) => {
+                pending_events
+                    .lock()
+                    .map_err(|_| Wx4pyError::Sidecar("pending wx4py event mutex poisoned".into()))?
+                    .push_back(event);
+            }
+            Ok(SidecarMessage::Error { message }) => {
+                return Err(Wx4pyError::Sidecar(message));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(Wx4pyError::ReadyTimeout(timeout_seconds));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Wx4pyError::Sidecar(
+                    "wx4py sidecar exited before ready".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+impl Wx4pyHistoryReader {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_text_messages(
+        &self,
+        room_id: &str,
+        room_name: Option<&str>,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u32,
+        media_decode_limit: Option<usize>,
+        before_local_id: Option<i64>,
+    ) -> Result<Vec<Wx4pyHistoryMessage>> {
         let chat_name = self.chat_name(room_id, room_name);
         let output = self.temp_output_path(room_id);
         let wx_cli = self.wx_cli.clone();
         let total_timeout_seconds = history_query_timeout_seconds(&wx_cli);
-        let (sender, receiver) = mpsc::channel();
         let started = Instant::now();
         tracing::debug!(
             room_id,
@@ -231,107 +406,37 @@ impl Wx4pyClient {
             limit,
             media_decode_limit = ?media_decode_limit,
             timeout_seconds = total_timeout_seconds,
-            "wxdb history worker spawning"
+            "wxdb history query queued"
         );
-
-        thread::spawn(move || {
-            let result = if should_use_builtin_wxdb(&wx_cli) {
-                match WXDB_HISTORY_QUERY_LOCK
-                    .get_or_init(|| Mutex::new(()))
-                    .try_lock()
-                {
-                    Ok(_guard) => query_text_messages_inner(
-                        &wx_cli,
-                        &chat_name,
-                        since,
-                        until,
-                        limit,
-                        media_decode_limit,
-                        &output,
-                    ),
-                    Err(TryLockError::WouldBlock) => {
-                        tracing::warn!(
-                            chat_name,
-                            "builtin wxdb history worker rejected because another query is still running"
-                        );
-                        Err(Wx4pyError::WxCli(
-                            "previous builtin wxdb history query is still running; wait for it to finish or restart the agent before retrying".to_string(),
-                        ))
-                    }
-                    Err(TryLockError::Poisoned(_)) => Err(Wx4pyError::WxCli(
-                        "builtin wxdb history query lock poisoned".to_string(),
-                    )),
-                }
-            } else {
-                query_text_messages_inner(
-                    &wx_cli,
-                    &chat_name,
-                    since,
-                    until,
-                    limit,
-                    media_decode_limit,
-                    &output,
-                )
-            };
-            let _ = sender.send(result);
-        });
-
-        match receiver.recv_timeout(StdDuration::from_secs(total_timeout_seconds)) {
-            Ok(result) => {
-                match &result {
-                    Ok(messages) => tracing::debug!(
-                        room_id,
-                        count = messages.len(),
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "wxdb history worker completed"
-                    ),
-                    Err(error) => tracing::warn!(
-                        room_id,
-                        error = %error,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "wxdb history worker failed"
-                    ),
-                }
-                result
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                tracing::warn!(
-                    room_id,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    timeout_seconds = total_timeout_seconds,
-                    "wxdb history worker timed out"
-                );
-                Err(Wx4pyError::HistoryQueryTimeout(total_timeout_seconds))
-            }
-            Err(RecvTimeoutError::Disconnected) => Err(Wx4pyError::WxCli(
-                "wxdb history query worker exited before returning a result".to_string(),
-            )),
+        let result = tokio::task::spawn_blocking(move || {
+            query_text_messages_inner(
+                &wx_cli,
+                &chat_name,
+                since,
+                until,
+                limit,
+                media_decode_limit,
+                before_local_id,
+                &output,
+            )
+        })
+        .await
+        .map_err(|error| Wx4pyError::WxCli(format!("wxdb query task failed: {error}")))?;
+        match &result {
+            Ok(messages) => tracing::debug!(
+                room_id,
+                count = messages.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "wxdb history query completed"
+            ),
+            Err(error) => tracing::warn!(
+                room_id,
+                error = %error,
+                elapsed_ms = started.elapsed().as_millis(),
+                "wxdb history query failed"
+            ),
         }
-    }
-
-    fn wait_ready(&self, timeout_seconds: u64) -> Result<()> {
-        match self
-            .receiver
-            .recv_timeout(StdDuration::from_secs(timeout_seconds))
-        {
-            Ok(SidecarMessage::Ready { ok: true }) => Ok(()),
-            Ok(SidecarMessage::Ready { ok: false }) => Err(Wx4pyError::Sidecar(
-                "wx4py sidecar reported not ready".to_string(),
-            )),
-            Ok(SidecarMessage::CommandError { message }) => Err(Wx4pyError::Sidecar(message)),
-            Ok(SidecarMessage::Error { message }) => Err(Wx4pyError::Sidecar(message)),
-            Ok(SidecarMessage::Event(_)) => Ok(()),
-            Err(RecvTimeoutError::Timeout) => Err(Wx4pyError::ReadyTimeout(timeout_seconds)),
-            Err(RecvTimeoutError::Disconnected) => Err(Wx4pyError::Sidecar(
-                "wx4py sidecar exited before ready".to_string(),
-            )),
-        }
-    }
-
-    pub fn sender(&self) -> Wx4pySender {
-        Wx4pySender {
-            stdin: Arc::clone(&self.stdin),
-        }
+        result
     }
 
     fn chat_name(&self, room_id: &str, room_name: Option<&str>) -> String {
@@ -357,42 +462,48 @@ impl Wx4pyClient {
     }
 }
 
-static WXDB_HISTORY_QUERY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
 impl Wx4pySender {
     pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
         self.send_command(SidecarCommand::SendText {
+            request_id: String::new(),
             room: room_id.to_string(),
             text: text.to_string(),
         })
+        .await
     }
 
     pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
         self.send_command(SidecarCommand::SendImage {
+            request_id: String::new(),
             room: room_id.to_string(),
             path: image_path.to_string(),
         })
+        .await
     }
 
     pub async fn send_file(&self, room_id: &str, file_path: &str) -> Result<()> {
         self.send_command(SidecarCommand::SendFile {
+            request_id: String::new(),
             room: room_id.to_string(),
             path: file_path.to_string(),
         })
+        .await
     }
 
-    fn send_command(&self, command: SidecarCommand) -> Result<()> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| Wx4pyError::Sidecar("sidecar stdin mutex poisoned".into()))?;
-        serde_json::to_writer(&mut *stdin, &command)?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        Ok(())
+    async fn send_command(&self, mut command: SidecarCommand) -> Result<()> {
+        let transport = Arc::clone(&self.transport);
+        let request_id = format!(
+            "wx4py-{}",
+            transport.next_request_id.fetch_add(1, Ordering::Relaxed)
+        );
+        command.set_request_id(request_id);
+        tokio::task::spawn_blocking(move || transport.send_command_blocking(command))
+            .await
+            .map_err(|error| Wx4pyError::Sidecar(format!("send task failed: {error}")))?
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_text_messages_inner(
     wx_cli: &WxCliConfig,
     chat_name: &str,
@@ -400,6 +511,7 @@ fn query_text_messages_inner(
     until: DateTime<Utc>,
     limit: u32,
     media_decode_limit: Option<usize>,
+    before_local_id: Option<i64>,
     output: &Path,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     if should_use_builtin_wxdb(wx_cli) {
@@ -410,12 +522,14 @@ fn query_text_messages_inner(
             until,
             limit,
             media_decode_limit,
+            before_local_id,
         );
     }
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
+    let deadline = Instant::now() + StdDuration::from_secs(history_query_timeout_seconds(wx_cli));
     tracing::debug!(
         chat_name,
         %since,
@@ -423,7 +537,15 @@ fn query_text_messages_inner(
         limit,
         "querying wxdb history"
     );
-    match query_text_messages_via_history(wx_cli, chat_name, since, until, limit) {
+    match query_text_messages_via_history(
+        wx_cli,
+        chat_name,
+        since,
+        until,
+        limit,
+        before_local_id,
+        deadline,
+    ) {
         Ok(messages) if !messages.is_empty() => return Ok(messages),
         Ok(_) => {
             tracing::warn!(
@@ -445,7 +567,16 @@ fn query_text_messages_inner(
         }
     }
 
-    query_text_messages_via_export(wx_cli, chat_name, since, until, limit, output)
+    query_text_messages_via_export(
+        wx_cli,
+        chat_name,
+        since,
+        until,
+        limit,
+        before_local_id,
+        deadline,
+        output,
+    )
 }
 
 fn should_use_builtin_wxdb(wx_cli: &WxCliConfig) -> bool {
@@ -462,6 +593,7 @@ fn query_text_messages_via_builtin_wxdb(
     until: DateTime<Utc>,
     limit: u32,
     media_decode_limit: Option<usize>,
+    before_local_id: Option<i64>,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     tracing::debug!(
         chat_name,
@@ -478,6 +610,7 @@ fn query_text_messages_via_builtin_wxdb(
         until,
         limit,
         media_decode_limit,
+        before_local_id,
     ) {
         Ok(result) => result,
         Err(error) if should_retry_builtin_wxdb_history_error(&error) => {
@@ -487,7 +620,15 @@ fn query_text_messages_via_builtin_wxdb(
                 "builtin wxdb history failed with a transient cache/decrypt error; retrying once"
             );
             thread::sleep(StdDuration::from_millis(800));
-            query_builtin_wxdb_history(wx_cli, chat_name, since, until, limit, media_decode_limit)?
+            query_builtin_wxdb_history(
+                wx_cli,
+                chat_name,
+                since,
+                until,
+                limit,
+                media_decode_limit,
+                before_local_id,
+            )?
         }
         Err(error) => return Err(error),
     };
@@ -499,8 +640,15 @@ fn query_text_messages_via_builtin_wxdb(
             "builtin wxdb returned no messages; retrying once after a short delay"
         );
         thread::sleep(StdDuration::from_millis(800));
-        result =
-            query_builtin_wxdb_history(wx_cli, chat_name, since, until, limit, media_decode_limit)?;
+        result = query_builtin_wxdb_history(
+            wx_cli,
+            chat_name,
+            since,
+            until,
+            limit,
+            media_decode_limit,
+            before_local_id,
+        )?;
     }
 
     for warning in &result.meta.warnings {
@@ -535,6 +683,7 @@ fn query_text_messages_via_builtin_wxdb(
                     ))
                 })?;
             Ok(Wx4pyHistoryMessage {
+                local_id: message.local_id,
                 timestamp,
                 sender_id: message
                     .sender_username
@@ -611,25 +760,235 @@ fn query_builtin_wxdb_history(
     until: DateTime<Utc>,
     limit: u32,
     media_decode_limit: Option<usize>,
+    before_local_id: Option<i64>,
 ) -> Result<wechat_summary_wxdb::HistoryResult> {
-    let config = builtin_wxdb_runtime_config(wx_cli);
-    wechat_summary_wxdb::query_history_with_config(
-        &config,
+    query_builtin_wxdb_history_controlled(
+        wx_cli,
         wechat_summary_wxdb::HistoryQuery {
             chat_name: chat_name.to_string(),
             since: Some(since),
             until: Some(until),
+            before_local_id,
             limit: limit as usize,
             text_only: false,
             msg_types: vec!["text".to_string(), "image".to_string(), "voice".to_string()],
             media_decode_limit,
         },
     )
-    .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb failed: {error:#}")))
+}
+
+const BUILTIN_QUERY_QUEUE_CAPACITY: usize = 4;
+const BUILTIN_QUERY_WORKER_COUNT: usize = 4;
+
+struct BuiltinQueryRequest {
+    wx_cli: WxCliConfig,
+    query: wechat_summary_wxdb::HistoryQuery,
+    deadline: Instant,
+    response: Sender<Result<wechat_summary_wxdb::HistoryResult>>,
+}
+
+static BUILTIN_QUERY_SERVICE: OnceLock<SyncSender<BuiltinQueryRequest>> = OnceLock::new();
+
+type BuiltinQueryHandler = Arc<
+    dyn Fn(
+            &WxCliConfig,
+            &wechat_summary_wxdb::HistoryQuery,
+            Instant,
+        ) -> Result<wechat_summary_wxdb::HistoryResult>
+        + Send
+        + Sync,
+>;
+
+pub fn query_builtin_wxdb_history_controlled(
+    wx_cli: &WxCliConfig,
+    query: wechat_summary_wxdb::HistoryQuery,
+) -> Result<wechat_summary_wxdb::HistoryResult> {
+    let timeout_seconds = history_query_timeout_seconds(wx_cli);
+    let timeout = StdDuration::from_secs(timeout_seconds);
+    let deadline = Instant::now() + timeout;
+    let (response, receiver) = mpsc::channel();
+    let request = BuiltinQueryRequest {
+        wx_cli: wx_cli.clone(),
+        query,
+        deadline,
+        response,
+    };
+    match builtin_query_sender().try_send(request) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            return Err(Wx4pyError::WxCli(format!(
+                "builtin wxdb query queue is full (capacity {BUILTIN_QUERY_QUEUE_CAPACITY})"
+            )))
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            return Err(Wx4pyError::WxCli(
+                "builtin wxdb query service stopped".to_string(),
+            ))
+        }
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(Wx4pyError::HistoryQueryTimeout(timeout_seconds)),
+        Err(RecvTimeoutError::Disconnected) => Err(Wx4pyError::WxCli(
+            "builtin wxdb query service exited without a result".to_string(),
+        )),
+    }
+}
+
+fn builtin_query_sender() -> &'static SyncSender<BuiltinQueryRequest> {
+    BUILTIN_QUERY_SERVICE.get_or_init(|| {
+        spawn_builtin_query_service(
+            BUILTIN_QUERY_QUEUE_CAPACITY,
+            BUILTIN_QUERY_WORKER_COUNT,
+            Arc::new(run_builtin_query_subprocess),
+        )
+    })
+}
+
+fn spawn_builtin_query_service(
+    capacity: usize,
+    worker_count: usize,
+    handler: BuiltinQueryHandler,
+) -> SyncSender<BuiltinQueryRequest> {
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    let receiver = Arc::new(Mutex::new(receiver));
+    for _ in 0..worker_count.max(1) {
+        let receiver = Arc::clone(&receiver);
+        let handler = Arc::clone(&handler);
+        thread::spawn(move || run_builtin_query_service(receiver, handler));
+    }
+    sender
+}
+
+fn run_builtin_query_service(
+    receiver: Arc<Mutex<Receiver<BuiltinQueryRequest>>>,
+    handler: BuiltinQueryHandler,
+) {
+    loop {
+        let request = match receiver.lock() {
+            Ok(receiver) => receiver.recv(),
+            Err(_) => return,
+        };
+        let Ok(request) = request else {
+            return;
+        };
+        let result = if Instant::now() >= request.deadline {
+            Err(Wx4pyError::HistoryQueryTimeout(
+                history_query_timeout_seconds(&request.wx_cli),
+            ))
+        } else {
+            handler(&request.wx_cli, &request.query, request.deadline)
+        };
+        let _ = request.response.send(result);
+    }
+}
+
+fn run_builtin_query_subprocess(
+    wx_cli: &WxCliConfig,
+    query: &wechat_summary_wxdb::HistoryQuery,
+    deadline: Instant,
+) -> Result<wechat_summary_wxdb::HistoryResult> {
+    let mut cmd = vec![
+        builtin_wxdb_executable(),
+        "history".to_string(),
+        query.chat_name.clone(),
+        "--since".to_string(),
+        query
+            .since
+            .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().expect("unix epoch"))
+            .to_rfc3339(),
+        "--until".to_string(),
+        query.until.unwrap_or_else(Utc::now).to_rfc3339(),
+        "--json".to_string(),
+        "--limit".to_string(),
+        query.limit.to_string(),
+    ];
+    if query.text_only {
+        cmd.extend(["--type".to_string(), "text".to_string()]);
+    }
+    if let Some(local_id) = query.before_local_id {
+        cmd.extend(["--before-local-id".to_string(), local_id.to_string()]);
+    }
+    if let Some(limit) = query.media_decode_limit {
+        cmd.extend(["--media-decode-limit".to_string(), limit.to_string()]);
+    }
+    let mut envs = Vec::new();
+    if let Some(db_dir) = wx_cli
+        .db_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        envs.push(("WXDB_DB_DIR".to_string(), db_dir.to_string()));
+    }
+    if !wx_cli.cache_dir.trim().is_empty() {
+        envs.push((
+            "WXDB_CACHE_DIR".to_string(),
+            wx_cli.cache_dir.trim().to_string(),
+        ));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(Wx4pyError::HistoryQueryTimeout(
+            history_query_timeout_seconds(wx_cli),
+        ));
+    }
+    let output = run_command_with_timeout_env(&cmd, remaining, &envs).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            Wx4pyError::HistoryQueryTimeout(history_query_timeout_seconds(wx_cli))
+        } else {
+            Wx4pyError::WxCli(format!(
+                "failed to run builtin wxdb subprocess {}: {error}",
+                cmd[0]
+            ))
+        }
+    })?;
+    if !output.status.success() {
+        return Err(Wx4pyError::WxCli(format!(
+            "builtin wxdb subprocess failed: {}",
+            command_error_text(&output)
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| Wx4pyError::InvalidWxCli(format!("invalid builtin wxdb JSON: {error}")))
+}
+
+fn builtin_wxdb_executable() -> String {
+    if let Some(path) = std::env::var_os("SUMMARY_AGENT_WXDB_EXE") {
+        return path.to_string_lossy().into_owned();
+    }
+    let file_name = if cfg!(windows) { "wxdb.exe" } else { "wxdb" };
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent() {
+            let sibling = parent.join(file_name);
+            if sibling.is_file() {
+                return sibling.to_string_lossy().into_owned();
+            }
+            if parent.file_name().is_some_and(|name| name == "deps") {
+                if let Some(target_dir) = parent.parent() {
+                    let target_binary = target_dir.join(file_name);
+                    if target_binary.is_file() {
+                        return target_binary.to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+    }
+    file_name.to_string()
 }
 
 fn builtin_wxdb_runtime_config(wx_cli: &WxCliConfig) -> wechat_summary_wxdb::RuntimeConfig {
     let config = wechat_summary_wxdb::RuntimeConfig::load();
+    let config = if let Some(db_dir) = wx_cli
+        .db_dir
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        config.with_db_dir(db_dir.trim())
+    } else {
+        config
+    };
     let cache_dir = wx_cli.cache_dir.trim();
     if cache_dir.is_empty() {
         config
@@ -649,12 +1008,15 @@ fn query_text_messages_via_history(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    before_local_id: Option<i64>,
+    deadline: Instant,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     let mut last_error = None;
     let mut empty_messages = None;
     for candidate in wx_cli_chat_candidates(chat_name) {
-        let cmd = build_wx_cli_history_command(wx_cli, &candidate, since, until, limit);
-        let output_result = match run_wx_cli_command_with_timeout(&cmd, wx_cli.timeout_seconds) {
+        let cmd =
+            build_wx_cli_history_command(wx_cli, &candidate, since, until, limit, before_local_id);
+        let output_result = match run_wx_cli_command_until(&cmd, deadline) {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Wx4pyError::WxCli(format!(
@@ -663,10 +1025,9 @@ fn query_text_messages_via_history(
                     )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(Wx4pyError::WxCli(format!(
-                    "wxdb history timed out after {} seconds",
-                    wx_cli.timeout_seconds
-                )));
+                return Err(Wx4pyError::HistoryQueryTimeout(
+                    history_query_timeout_seconds(wx_cli),
+                ));
             }
             Err(error) => return Err(Wx4pyError::Io(error)),
         };
@@ -689,7 +1050,8 @@ fn query_text_messages_via_history(
                 continue;
             }
         };
-        messages.retain(|message| message.timestamp >= since && message.timestamp <= until);
+        messages
+            .retain(|message| message_in_history_window(message, since, until, before_local_id));
         if messages.is_empty() {
             empty_messages = Some(messages);
             continue;
@@ -706,20 +1068,28 @@ fn query_text_messages_via_history(
     })))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_text_messages_via_export(
     wx_cli: &WxCliConfig,
     chat_name: &str,
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    before_local_id: Option<i64>,
+    deadline: Instant,
     output: &Path,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
+    if before_local_id.is_some() {
+        return Err(Wx4pyError::WxCli(
+            "wxdb export does not support --before-local-id; refusing cursor pagination because the export fallback could omit messages".into(),
+        ));
+    }
     let mut last_error = None;
     let mut empty_messages = None;
     for candidate in wx_cli_chat_candidates(chat_name) {
         let _ = fs::remove_file(output);
         let cmd = build_wx_cli_export_command(wx_cli, &candidate, since, until, limit, output);
-        let output_result = match run_wx_cli_command_with_timeout(&cmd, wx_cli.timeout_seconds) {
+        let output_result = match run_wx_cli_command_until(&cmd, deadline) {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Wx4pyError::WxCli(format!(
@@ -728,10 +1098,9 @@ fn query_text_messages_via_export(
                     )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(Wx4pyError::WxCli(format!(
-                    "wxdb export timed out after {} seconds",
-                    wx_cli.timeout_seconds
-                )));
+                return Err(Wx4pyError::HistoryQueryTimeout(
+                    history_query_timeout_seconds(wx_cli),
+                ));
             }
             Err(error) => return Err(Wx4pyError::Io(error)),
         };
@@ -754,7 +1123,8 @@ fn query_text_messages_via_export(
                 continue;
             }
         };
-        messages.retain(|message| message.timestamp >= since && message.timestamp <= until);
+        messages
+            .retain(|message| message_in_history_window(message, since, until, before_local_id));
         if messages.is_empty() {
             empty_messages = Some(messages);
             continue;
@@ -775,6 +1145,26 @@ fn wx_cli_chat_candidates(chat_name: &str) -> Vec<String> {
     vec![chat_name.to_string()]
 }
 
+fn message_in_history_window(
+    message: &Wx4pyHistoryMessage,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    before_local_id: Option<i64>,
+) -> bool {
+    if message.timestamp < since || message.timestamp > until {
+        return false;
+    }
+    if message.timestamp == until {
+        return match before_local_id {
+            Some(before_local_id) => message
+                .local_id
+                .is_some_and(|local_id| local_id < before_local_id),
+            None => true,
+        };
+    }
+    true
+}
+
 fn history_query_timeout_seconds(config: &WxCliConfig) -> u64 {
     config
         .history_query_timeout_seconds
@@ -788,16 +1178,189 @@ fn history_query_timeout_seconds(config: &WxCliConfig) -> u64 {
 enum SidecarMessage {
     Ready { ok: bool },
     Event(Wx4pyEvent),
-    CommandError { message: String },
+    CommandResult { request_id: String, ok: bool },
+    CommandError { request_id: String, message: String },
     Error { message: String },
 }
 
+fn dispatch_sidecar_message(
+    message: SidecarMessage,
+    pending: &Mutex<std::collections::HashMap<String, Sender<std::result::Result<(), String>>>>,
+    events: &Sender<SidecarMessage>,
+) -> bool {
+    match message {
+        SidecarMessage::CommandResult { request_id, ok } => {
+            let result = if ok {
+                Ok(())
+            } else {
+                Err("sidecar reported command failure".to_string())
+            };
+            let waiter = pending
+                .lock()
+                .ok()
+                .and_then(|mut waiters| waiters.remove(&request_id));
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(result);
+            } else {
+                tracing::warn!(request_id, "ignored late or unknown wx4py command ACK");
+            }
+            true
+        }
+        SidecarMessage::CommandError {
+            request_id,
+            message,
+        } => {
+            let waiter = pending
+                .lock()
+                .ok()
+                .and_then(|mut waiters| waiters.remove(&request_id));
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(Err(message));
+            } else {
+                tracing::warn!(request_id, "ignored late or unknown wx4py command error");
+            }
+            true
+        }
+        event => events.send(event).is_ok(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::enum_variant_names)]
 #[serde(rename_all = "snake_case", tag = "cmd")]
 enum SidecarCommand {
-    SendText { room: String, text: String },
-    SendImage { room: String, path: String },
-    SendFile { room: String, path: String },
+    SendText {
+        request_id: String,
+        room: String,
+        text: String,
+    },
+    SendImage {
+        request_id: String,
+        room: String,
+        path: String,
+    },
+    SendFile {
+        request_id: String,
+        room: String,
+        path: String,
+    },
+}
+
+impl SidecarCommand {
+    fn set_request_id(&mut self, request_id: String) {
+        match self {
+            Self::SendText { request_id: id, .. }
+            | Self::SendImage { request_id: id, .. }
+            | Self::SendFile { request_id: id, .. } => *id = request_id,
+        }
+    }
+}
+
+impl Wx4pyTransport {
+    fn shutdown(&self) {
+        self.close("wx4py sidecar client is shut down");
+    }
+
+    fn close(&self, message: impl Into<String>) {
+        self.closed.store(true, Ordering::Release);
+        self.fail_pending(message);
+    }
+
+    fn fail_pending(&self, message: impl Into<String>) {
+        let waiters = self
+            .pending
+            .lock()
+            .map(|mut waiters| {
+                waiters
+                    .drain()
+                    .map(|(_, sender)| sender)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let message = message.into();
+        for waiter in waiters {
+            let _ = waiter.send(Err(message.clone()));
+        }
+    }
+
+    fn send_command_blocking(&self, command: SidecarCommand) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Wx4pyError::Sidecar(
+                "wx4py sidecar client is shut down".into(),
+            ));
+        }
+        let request_id = match &command {
+            SidecarCommand::SendText { request_id, .. }
+            | SidecarCommand::SendImage { request_id, .. }
+            | SidecarCommand::SendFile { request_id, .. } => request_id.clone(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| Wx4pyError::Sidecar("pending ACK mutex poisoned".into()))?;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Wx4pyError::Sidecar(
+                    "wx4py sidecar client is shut down".into(),
+                ));
+            }
+            pending.insert(request_id.clone(), sender);
+        }
+        let write_result = (|| -> Result<()> {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Wx4pyError::Sidecar(
+                    "wx4py sidecar client is shut down".into(),
+                ));
+            }
+            let mut stdin = self
+                .stdin
+                .lock()
+                .map_err(|_| Wx4pyError::Sidecar("sidecar stdin mutex poisoned".into()))?;
+            let stdin = stdin
+                .as_mut()
+                .ok_or_else(|| Wx4pyError::Sidecar("wx4py sidecar stdin is closed".into()))?;
+            serde_json::to_writer(&mut *stdin, &command)?;
+            stdin.write_all(b"\n")?;
+            stdin.flush()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = self
+                .pending
+                .lock()
+                .map(|mut waiters| waiters.remove(&request_id));
+            return Err(error);
+        }
+        receive_command_ack(receiver, &self.pending, &request_id, self.command_timeout)
+    }
+}
+
+fn receive_command_ack(
+    receiver: Receiver<std::result::Result<(), String>>,
+    pending: &Mutex<std::collections::HashMap<String, Sender<std::result::Result<(), String>>>>,
+    request_id: &str,
+    timeout: StdDuration,
+) -> Result<()> {
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(Wx4pyError::Sidecar(format!(
+            "command request_id={request_id} failed: {message}"
+        ))),
+        Err(RecvTimeoutError::Timeout) => {
+            let _ = pending.lock().map(|mut waiters| waiters.remove(request_id));
+            Err(Wx4pyError::Sidecar(format!(
+                    "command request_id={request_id} ACK timeout after {} seconds; delivery indeterminate (the sidecar may have completed it); do not automatically retry",
+                    timeout.as_secs()
+                )))
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = pending.lock().map(|mut waiters| waiters.remove(request_id));
+            Err(Wx4pyError::Sidecar(format!(
+                "command request_id={request_id} ACK dispatcher disconnected; delivery indeterminate (the sidecar may have completed it); do not automatically retry"
+            )))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -805,6 +1368,8 @@ pub struct Wx4pyEvent {
     pub room_id: String,
     #[serde(default)]
     pub room_name: Option<String>,
+    #[serde(default)]
+    pub stable_id: Option<String>,
     pub content: String,
     #[serde(default)]
     pub sender_id: Option<String>,
@@ -821,6 +1386,7 @@ impl Wx4pyEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Wx4pyHistoryMessage {
+    pub local_id: Option<i64>,
     pub timestamp: DateTime<Utc>,
     pub sender_id: String,
     pub sender_name: Option<String>,
@@ -864,8 +1430,9 @@ pub fn build_wx_cli_history_command(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    before_local_id: Option<i64>,
 ) -> Vec<String> {
-    vec![
+    let mut command = vec![
         config.executable.clone(),
         "history".to_string(),
         chat_name.to_string(),
@@ -878,7 +1445,11 @@ pub fn build_wx_cli_history_command(
         "--json".to_string(),
         "-n".to_string(),
         limit.to_string(),
-    ]
+    ];
+    if let Some(local_id) = before_local_id {
+        command.extend(["--before-local-id".to_string(), local_id.to_string()]);
+    }
+    command
 }
 
 pub fn build_wx_cli_daemon_stop_command(config: &WxCliConfig) -> Vec<String> {
@@ -927,20 +1498,72 @@ fn run_wx_cli_command_with_timeout(
     cmd: &[String],
     timeout_seconds: u64,
 ) -> std::io::Result<Output> {
-    let _guard = WX_CLI_COMMAND_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| std::io::Error::other("wxdb command lock poisoned"))?;
-    run_command_with_timeout(cmd, timeout_seconds)
+    run_wx_cli_command_until(
+        cmd,
+        Instant::now() + StdDuration::from_secs(timeout_seconds.max(1)),
+    )
 }
 
-fn run_command_with_timeout(cmd: &[String], timeout_seconds: u64) -> std::io::Result<Output> {
+fn run_wx_cli_command_until(cmd: &[String], deadline: Instant) -> std::io::Result<Output> {
+    let lock = WX_CLI_COMMAND_LOCK.get_or_init(|| Mutex::new(()));
+    run_command_with_deadline_on_lock(lock, cmd, deadline)
+}
+
+fn run_command_with_deadline_on_lock(
+    lock: &Mutex<()>,
+    cmd: &[String],
+    deadline: Instant,
+) -> std::io::Result<Output> {
+    let _guard = lock_with_deadline(lock, deadline)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "wxdb command deadline elapsed while waiting for the command lock",
+        ));
+    }
+    run_command_with_timeout_env(cmd, remaining, &[])
+}
+
+fn lock_with_deadline<'a>(
+    lock: &'a Mutex<()>,
+    deadline: Instant,
+) -> std::io::Result<MutexGuard<'a, ()>> {
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(std::io::Error::other("wxdb command lock poisoned"));
+            }
+            Err(TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "wxdb command deadline elapsed while waiting for the command lock",
+                    ));
+                }
+                thread::sleep(remaining.min(StdDuration::from_millis(10)));
+            }
+        }
+    }
+}
+
+fn run_command_with_timeout_env(
+    cmd: &[String],
+    timeout: StdDuration,
+    envs: &[(String, String)],
+) -> std::io::Result<Output> {
     let stdout_path = command_output_temp_path("stdout");
     let stderr_path = command_output_temp_path("stderr");
     let stdout_file = File::create(&stdout_path)?;
     let stderr_file = File::create(&stderr_path)?;
-    let mut child = Command::new(&cmd[0])
-        .args(&cmd[1..])
+    let mut command = Command::new(&cmd[0]);
+    command.args(&cmd[1..]);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let mut child = command
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()?;
@@ -948,10 +1571,9 @@ fn run_command_with_timeout(cmd: &[String], timeout_seconds: u64) -> std::io::Re
     tracing::debug!(
         pid = child_id,
         command = %command_for_log(cmd),
-        timeout_seconds,
+        timeout_ms = timeout.as_millis(),
         "wxdb command started"
     );
-    let timeout = StdDuration::from_secs(timeout_seconds.max(1));
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -961,7 +1583,7 @@ fn run_command_with_timeout(cmd: &[String], timeout_seconds: u64) -> std::io::Re
             tracing::warn!(
                 pid = child_id,
                 command = %command_for_log(cmd),
-                timeout_seconds = timeout.as_secs(),
+                timeout_ms = timeout.as_millis(),
                 "wxdb command timed out; terminating process tree"
             );
             terminate_process_tree(&mut child);
@@ -970,8 +1592,8 @@ fn run_command_with_timeout(cmd: &[String], timeout_seconds: u64) -> std::io::Re
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
-                    "command timed out after {} seconds: {}",
-                    timeout.as_secs(),
+                    "command timed out after {} ms: {}",
+                    timeout.as_millis(),
                     cmd[0]
                 ),
             ));
@@ -1050,6 +1672,11 @@ fn terminate_process_tree(child: &mut Child) {
     }
 }
 
+fn terminate_and_reap_child(child: &mut Child) -> std::io::Result<()> {
+    terminate_process_tree(child);
+    child.wait().map(|_| ())
+}
+
 fn command_for_log(cmd: &[String]) -> String {
     cmd.join(" ")
 }
@@ -1085,7 +1712,11 @@ pub fn normalize_wx_cli_messages(text: &str) -> Result<Vec<Wx4pyHistoryMessage>>
         .into_iter()
         .filter_map(|item| normalize_wx_cli_message(item).transpose())
         .collect::<Result<Vec<_>>>()?;
-    normalized.sort_by_key(|message| message.timestamp);
+    normalized.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.local_id.cmp(&right.local_id))
+    });
     Ok(normalized)
 }
 
@@ -1105,6 +1736,7 @@ fn normalize_wx_cli_message(value: Value) -> Result<Option<Wx4pyHistoryMessage>>
     let normalized_type = normalize_history_msg_type(&msg_type);
 
     Ok(Some(Wx4pyHistoryMessage {
+        local_id: object.get("local_id").and_then(Value::as_i64),
         timestamp: parse_timestamp(object)?,
         sender_id: string_field(object, &["sender_id", "sender_username", "sender"])
             .unwrap_or_else(|| "unknown".into()),
@@ -1225,6 +1857,7 @@ mod tests {
             history_query_timeout_seconds: 45,
             temp_dir: ".\\runtime\\wx-exports".into(),
             cache_dir: String::new(),
+            db_dir: None,
             group_name_map: HashMap::new(),
         }
     }
@@ -1237,6 +1870,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 24, 1, 0, 0).unwrap(),
             Utc.with_ymd_and_hms(2026, 5, 24, 2, 0, 0).unwrap(),
             100,
+            Some(9001),
         );
 
         assert_eq!(cmd[0], "wx");
@@ -1246,6 +1880,32 @@ mod tests {
         assert!(cmd.contains(&"--json".to_string()));
         assert!(cmd.contains(&"--type".to_string()));
         assert!(cmd.contains(&"text".to_string()));
+        let cursor_index = cmd
+            .iter()
+            .position(|value| value == "--before-local-id")
+            .expect("history cursor flag");
+        assert_eq!(cmd[cursor_index + 1], "9001");
+    }
+
+    #[test]
+    fn wait_ready_buffers_events_until_ready() {
+        let (sender, receiver) = mpsc::channel();
+        let pending_events = Mutex::new(VecDeque::new());
+        let event = Wx4pyEvent {
+            room_id: "room".into(),
+            room_name: Some("Room".into()),
+            stable_id: Some("stable-1".into()),
+            content: "hello during startup".into(),
+            sender_id: Some("sender".into()),
+            sender_name: Some("Sender".into()),
+            timestamp: 1,
+        };
+        sender.send(SidecarMessage::Event(event.clone())).unwrap();
+        sender.send(SidecarMessage::Ready { ok: true }).unwrap();
+
+        wait_ready(&receiver, &pending_events, 1).unwrap();
+
+        assert_eq!(pending_events.lock().unwrap().pop_front(), Some(event));
     }
 
     #[test]
@@ -1289,6 +1949,26 @@ mod tests {
     }
 
     #[test]
+    fn export_fails_explicitly_when_cursor_pagination_is_requested() {
+        let error = query_text_messages_via_export(
+            &wx_cli_config(),
+            "测试群",
+            Utc.with_ymd_and_hms(2026, 5, 24, 1, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 5, 24, 2, 0, 0).unwrap(),
+            100,
+            Some(9001),
+            Instant::now() + StdDuration::from_secs(1),
+            Path::new("out.json"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not support --before-local-id"));
+        assert!(error.to_string().contains("could omit messages"));
+    }
+
+    #[test]
     fn normalizes_wx_cli_messages_from_object_payload() {
         let payload = r#"{
             "messages": [
@@ -1306,6 +1986,44 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].sender_id, "Alice");
         assert_eq!(messages[0].content, "hello");
+    }
+
+    #[test]
+    fn external_history_cursor_keeps_same_second_messages_stable() {
+        let since = Utc.timestamp_opt(100, 0).unwrap();
+        let until = Utc.timestamp_opt(200, 0).unwrap();
+        let message = |local_id| Wx4pyHistoryMessage {
+            local_id: Some(local_id),
+            timestamp: until,
+            sender_id: "sender".into(),
+            sender_name: None,
+            content: format!("message-{local_id}"),
+            msg_type: "text".into(),
+            media_path: None,
+            thumbnail_path: None,
+            decoded_media_path: None,
+            media_decode_error: None,
+            is_self: false,
+        };
+
+        assert!(message_in_history_window(
+            &message(10),
+            since,
+            until,
+            Some(20)
+        ));
+        assert!(!message_in_history_window(
+            &message(20),
+            since,
+            until,
+            Some(20)
+        ));
+        assert!(!message_in_history_window(
+            &message(21),
+            since,
+            until,
+            Some(20)
+        ));
     }
 
     #[test]
@@ -1401,5 +2119,230 @@ mod tests {
     #[test]
     fn wx_cli_chat_candidates_use_requested_chat_name_only() {
         assert_eq!(wx_cli_chat_candidates("脑机2galgame"), vec!["脑机2galgame"]);
+    }
+
+    #[test]
+    fn command_ack_dispatch_matches_concurrent_request_ids() {
+        let pending = Mutex::new(std::collections::HashMap::new());
+        let (sender_a, receiver_a) = mpsc::channel();
+        let (sender_b, receiver_b) = mpsc::channel();
+        pending.lock().unwrap().insert("a".to_string(), sender_a);
+        pending.lock().unwrap().insert("b".to_string(), sender_b);
+        let events = mpsc::channel().0;
+
+        assert!(dispatch_sidecar_message(
+            SidecarMessage::CommandResult {
+                request_id: "b".to_string(),
+                ok: true,
+            },
+            &pending,
+            &events,
+        ));
+        assert!(dispatch_sidecar_message(
+            SidecarMessage::CommandResult {
+                request_id: "a".to_string(),
+                ok: true,
+            },
+            &pending,
+            &events,
+        ));
+        assert_eq!(receiver_a.recv().unwrap(), Ok(()));
+        assert_eq!(receiver_b.recv().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn command_ack_failure_is_delivered_to_matching_waiter() {
+        let pending = Mutex::new(std::collections::HashMap::new());
+        let (sender, receiver) = mpsc::channel();
+        pending.lock().unwrap().insert("failed".to_string(), sender);
+        let events = mpsc::channel().0;
+
+        assert!(dispatch_sidecar_message(
+            SidecarMessage::CommandError {
+                request_id: "failed".to_string(),
+                message: "send_message returned false".to_string(),
+            },
+            &pending,
+            &events,
+        ));
+        assert_eq!(
+            receiver.recv().unwrap(),
+            Err("send_message returned false".to_string())
+        );
+    }
+
+    #[test]
+    fn command_ack_timeout_removes_waiter_and_marks_delivery_indeterminate() {
+        let pending = Mutex::new(std::collections::HashMap::new());
+        let (sender, receiver) = mpsc::channel();
+        pending
+            .lock()
+            .unwrap()
+            .insert("timed-out".to_string(), sender);
+
+        let error =
+            receive_command_ack(receiver, &pending, "timed-out", StdDuration::from_millis(5))
+                .unwrap_err();
+        assert!(error.to_string().contains("delivery indeterminate"));
+        assert!(pending.lock().unwrap().is_empty());
+
+        let events = mpsc::channel().0;
+        assert!(dispatch_sidecar_message(
+            SidecarMessage::CommandResult {
+                request_id: "timed-out".to_string(),
+                ok: true,
+            },
+            &pending,
+            &events,
+        ));
+    }
+
+    #[test]
+    fn command_ack_disconnect_removes_waiter_and_marks_delivery_indeterminate() {
+        let pending = Mutex::new(std::collections::HashMap::new());
+        let (sender, receiver) = mpsc::channel();
+        pending.lock().unwrap().insert("closed".to_string(), sender);
+        drop(receiver);
+
+        let error = receive_command_ack(
+            mpsc::channel().1,
+            &pending,
+            "closed",
+            StdDuration::from_millis(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("delivery indeterminate"));
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn transport_shutdown_fails_pending_sender_and_rejects_new_commands() {
+        let transport = Wx4pyTransport {
+            stdin: Mutex::new(None),
+            pending: Mutex::new(std::collections::HashMap::new()),
+            closed: AtomicBool::new(false),
+            next_request_id: AtomicU64::new(1),
+            command_timeout: StdDuration::from_millis(5),
+        };
+        let (sender, receiver) = mpsc::channel();
+        transport
+            .pending
+            .lock()
+            .unwrap()
+            .insert("old-request".into(), sender);
+
+        transport.shutdown();
+
+        assert_eq!(
+            receiver.recv_timeout(StdDuration::from_millis(50)).unwrap(),
+            Err("wx4py sidecar client is shut down".into())
+        );
+        let error = transport
+            .send_command_blocking(SidecarCommand::SendText {
+                request_id: "new-request".into(),
+                room: "room".into(),
+                text: "text".into(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("client is shut down"));
+    }
+
+    #[test]
+    fn terminate_and_reap_child_kills_test_child() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::termination_test_child", "--nocapture"])
+            .env("WX4PY_CLIENT_TERMINATION_TEST_CHILD", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        thread::sleep(StdDuration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none());
+
+        terminate_and_reap_child(&mut child).unwrap();
+
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn termination_test_child() {
+        if std::env::var_os("WX4PY_CLIENT_TERMINATION_TEST_CHILD").is_some() {
+            loop {
+                thread::sleep(StdDuration::from_secs(60));
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_query_workers_do_not_serialize_a_slow_request() {
+        let handler: BuiltinQueryHandler = Arc::new(|_config, query, _deadline| {
+            if query.chat_name == "slow" {
+                thread::sleep(StdDuration::from_millis(200));
+            }
+            Ok(wechat_summary_wxdb::HistoryResult {
+                chat: query.chat_name.clone(),
+                username: query.chat_name.clone(),
+                is_group: true,
+                count: 0,
+                messages: Vec::new(),
+                meta: Default::default(),
+            })
+        });
+        let sender = spawn_builtin_query_service(2, 2, handler);
+        let make_request = |chat_name: &str| {
+            let (response, receiver) = mpsc::channel();
+            let request = BuiltinQueryRequest {
+                wx_cli: wx_cli_config(),
+                query: wechat_summary_wxdb::HistoryQuery {
+                    chat_name: chat_name.to_string(),
+                    since: None,
+                    until: None,
+                    before_local_id: None,
+                    limit: 1,
+                    text_only: true,
+                    msg_types: vec!["text".to_string()],
+                    media_decode_limit: Some(0),
+                },
+                deadline: Instant::now() + StdDuration::from_secs(1),
+                response,
+            };
+            (request, receiver)
+        };
+        let (slow_request, _slow_receiver) = make_request("slow");
+        let (fast_request, fast_receiver) = make_request("fast");
+        sender.send(slow_request).unwrap();
+        sender.send(fast_request).unwrap();
+
+        let result = fast_receiver
+            .recv_timeout(StdDuration::from_millis(100))
+            .expect("fast query should use another bounded worker")
+            .unwrap();
+        assert_eq!(result.chat, "fast");
+    }
+
+    #[test]
+    fn command_lock_wait_uses_the_same_deadline_as_command_execution() {
+        let lock = Arc::new(Mutex::new(()));
+        let slow_lock = Arc::clone(&lock);
+        let (locked_sender, locked_receiver) = mpsc::channel();
+        let slow_request = thread::spawn(move || {
+            let _guard = slow_lock.lock().unwrap();
+            locked_sender.send(()).unwrap();
+            thread::sleep(StdDuration::from_millis(150));
+        });
+        locked_receiver.recv().unwrap();
+
+        let started = Instant::now();
+        let error = run_command_with_deadline_on_lock(
+            &lock,
+            &["this-command-must-not-start".to_string()],
+            started + StdDuration::from_millis(40),
+        )
+        .unwrap_err();
+        let lock_wait_elapsed = started.elapsed();
+
+        slow_request.join().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(lock_wait_elapsed < StdDuration::from_millis(120));
     }
 }

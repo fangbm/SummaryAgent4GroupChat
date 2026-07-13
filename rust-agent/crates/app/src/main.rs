@@ -1,11 +1,17 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     env,
     fs::{self, OpenOptions},
+    future::Future,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Command, Stdio},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,6 +23,7 @@ mod platform;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
@@ -25,14 +32,17 @@ use wechat_summary_ai::{
     OpenAiImageClient, OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
 };
 use wechat_summary_core::{
-    config::{ListenConfig, PlatformKindConfig, PrivacyConfig, TimeRangeMode},
+    config::{ListenConfig, MatchMode, PlatformKindConfig, PrivacyConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
     AgentConfig, ChatFormatter, PrivacyFilter, ResolvedTimeRange, TimeRangeCalculator,
     TriggerMatch, TriggerMatcher,
 };
 use wechat_summary_storage::SqliteStateStore;
 
-use crate::platform::{PlatformClient, PlatformEvent, PlatformHistoryMessage, PlatformSender};
+use crate::platform::{
+    PlatformClient, PlatformEvent, PlatformHistoryCursor, PlatformHistoryMessage, PlatformSender,
+    PlatformWorker,
+};
 
 const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
 const TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS: i64 = 5;
@@ -43,12 +53,15 @@ const RECENT_OBSERVED_MAX_MESSAGES: usize = 5_000;
 const WXDB_COMMAND_WATCH_INTERVAL_SECONDS: u64 = 3;
 const WXDB_COMMAND_WATCH_LOOKBACK_SECONDS: i64 = 300;
 const WXDB_COMMAND_WATCH_LIMIT: usize = 300;
+const WXDB_COMMAND_WATCH_SEEN_IDS: usize = 2_048;
 const WXDB_COMMAND_WATCH_ERROR_LOG_INTERVAL_SECONDS: i64 = 5 * 60;
 const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
-const LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS: u64 = 60;
-const LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS: usize = 3;
 const CHUNK_PROMPT_HEADROOM_CHARS: usize = 4_096;
 const CONTEXT_LENGTH_SPLIT_MAX_DEPTH: usize = 12;
+const SUMMARY_MAX_CONCURRENCY: usize = 4;
+const SUMMARY_PENDING_CAPACITY: usize = 64;
+const PLATFORM_RECONNECT_DELAY: StdDuration = StdDuration::from_secs(2);
+const WXDB_WATCHER_RESTART_DELAY: StdDuration = StdDuration::from_secs(2);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const TEXT_SUMMARY_REFUSAL_RETRY_PROMPT: &str = r#"
@@ -65,6 +78,296 @@ const IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT: &str = r#"
 - 不要拒绝，不要输出“无法给出总结/无法提供内容/无法给到相关内容”。
 - 输出必须可直接供下一步图片总结或生图使用。
 "#;
+
+type SummaryFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+struct PendingSummaryTask {
+    room_id: String,
+    future: SummaryFuture,
+}
+
+struct SummaryTaskScheduler {
+    max_concurrency: usize,
+    pending_capacity: usize,
+    in_flight: HashSet<String>,
+    pending: VecDeque<PendingSummaryTask>,
+    tasks: JoinSet<()>,
+    completion_sender: mpsc::Sender<(String, Result<()>)>,
+    completion_receiver: mpsc::Receiver<(String, Result<()>)>,
+}
+
+struct SummaryTaskCompletion {
+    room_id: Option<String>,
+    sender: mpsc::Sender<(String, Result<()>)>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ScheduledSummaryRequest {
+    room_id: String,
+    range: ResolvedTimeRange,
+    due_at: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct ScheduledSummaryBacklog {
+    requests: VecDeque<ScheduledSummaryRequest>,
+    next_retry_at: Option<Instant>,
+    retry_delay: StdDuration,
+}
+
+impl ScheduledSummaryBacklog {
+    fn add_rooms(
+        &mut self,
+        rooms: impl IntoIterator<Item = String>,
+        range: ResolvedTimeRange,
+        due_at: DateTime<Utc>,
+    ) {
+        for room_id in rooms {
+            if !self
+                .requests
+                .iter()
+                .any(|request| request.room_id == room_id)
+            {
+                self.requests.push_back(ScheduledSummaryRequest {
+                    room_id,
+                    range: range.clone(),
+                    due_at,
+                });
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    fn retry_ready(&self, now: Instant) -> bool {
+        self.next_retry_at.is_none_or(|retry_at| now >= retry_at)
+    }
+
+    fn record_retry(&mut self, now: Instant) {
+        let delay = if self.retry_delay.is_zero() {
+            StdDuration::from_secs(1)
+        } else {
+            self.retry_delay.min(StdDuration::from_secs(30))
+        };
+        self.next_retry_at = Some(now + delay);
+        self.retry_delay = (delay * 2).min(StdDuration::from_secs(30));
+    }
+
+    fn clear_retry(&mut self) {
+        self.next_retry_at = None;
+        self.retry_delay = StdDuration::ZERO;
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PlatformConnectionFingerprint {
+    kind: PlatformKindConfig,
+    wx_python: String,
+    wx_script: String,
+    wx_ready_timeout: u64,
+    wx_command_timeout: u64,
+    wx_groups: Vec<String>,
+    wx_cli_executable: String,
+    wx_cli_timeout: u64,
+    wx_cli_history_timeout: u64,
+    wx_cli_temp_dir: String,
+    wx_cli_cache_dir: String,
+    wx_cli_db_dir: Option<String>,
+    wx_cli_group_name_map: Vec<(String, String)>,
+    discord_token: Option<String>,
+    discord_token_env: String,
+    discord_channels: Vec<String>,
+    whitelist_rooms: Vec<String>,
+}
+
+impl PlatformConnectionFingerprint {
+    fn from_config(config: &AgentConfig) -> Self {
+        let mut group_name_map = config
+            .wx_cli
+            .group_name_map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        group_name_map.sort();
+        Self {
+            kind: config.platform.kind,
+            wx_python: config.wx4py.python_executable.clone(),
+            wx_script: config.wx4py.sidecar_script.clone(),
+            wx_ready_timeout: config.wx4py.ready_timeout_seconds,
+            wx_command_timeout: config.wx4py.command_timeout_seconds,
+            wx_groups: config.wx4py.groups.clone(),
+            wx_cli_executable: config.wx_cli.executable.clone(),
+            wx_cli_timeout: config.wx_cli.timeout_seconds,
+            wx_cli_history_timeout: config.wx_cli.history_query_timeout_seconds,
+            wx_cli_temp_dir: config.wx_cli.temp_dir.clone(),
+            wx_cli_cache_dir: config.wx_cli.cache_dir.clone(),
+            wx_cli_db_dir: config.wx_cli.db_dir.clone(),
+            wx_cli_group_name_map: group_name_map,
+            discord_token: config.discord.token.clone(),
+            discord_token_env: config.discord.token_env.clone(),
+            discord_channels: config.discord.channels.clone(),
+            whitelist_rooms: config.listen.whitelist_rooms.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct WxdbWatcherFingerprint {
+    enabled: bool,
+    rooms: Vec<String>,
+    triggers: Vec<String>,
+    match_mode: MatchMode,
+    whitelist_rooms: Vec<String>,
+    blacklist_users: Vec<String>,
+    content_types: Vec<String>,
+    ignore_self: bool,
+    wx_cli_executable: String,
+    wx_cli_timeout: u64,
+    wx_cli_history_timeout: u64,
+    wx_cli_temp_dir: String,
+    wx_cli_cache_dir: String,
+    wx_cli_db_dir: Option<String>,
+    wx_cli_group_name_map: Vec<(String, String)>,
+}
+
+impl WxdbWatcherFingerprint {
+    fn from_config(config: &AgentConfig) -> Self {
+        let listen = effective_listen_config(config);
+        let mut group_name_map = config
+            .wx_cli
+            .group_name_map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        group_name_map.sort();
+        Self {
+            enabled: wxdb_command_watcher_enabled(config),
+            rooms: configured_wx_rooms(config),
+            triggers: listen.triggers,
+            match_mode: listen.match_mode,
+            whitelist_rooms: listen.whitelist_rooms,
+            blacklist_users: listen.blacklist_users,
+            content_types: listen.content_types,
+            ignore_self: listen.ignore_self,
+            wx_cli_executable: config.wx_cli.executable.clone(),
+            wx_cli_timeout: config.wx_cli.timeout_seconds,
+            wx_cli_history_timeout: config.wx_cli.history_query_timeout_seconds,
+            wx_cli_temp_dir: config.wx_cli.temp_dir.clone(),
+            wx_cli_cache_dir: config.wx_cli.cache_dir.clone(),
+            wx_cli_db_dir: config.wx_cli.db_dir.clone(),
+            wx_cli_group_name_map: group_name_map,
+        }
+    }
+}
+
+struct PlatformRuntime {
+    client: Arc<Mutex<PlatformClient>>,
+    worker: PlatformWorker,
+    rooms: Vec<String>,
+    fingerprint: PlatformConnectionFingerprint,
+    watcher: WxdbCommandWatcher,
+    watcher_fingerprint: WxdbWatcherFingerprint,
+    watcher_restart_at: Option<Instant>,
+    reconnect_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ScheduleResult {
+    Started,
+    Queued,
+    DuplicateRoom,
+    QueueFull,
+}
+
+impl SummaryTaskCompletion {
+    fn finish(mut self, result: Result<()>) {
+        if let Some(room_id) = self.room_id.take() {
+            let _ = self.sender.send((room_id, result));
+        }
+    }
+}
+
+impl Drop for SummaryTaskCompletion {
+    fn drop(&mut self) {
+        if let Some(room_id) = self.room_id.take() {
+            let _ = self.sender.send((
+                room_id,
+                Err(anyhow::anyhow!("summary task aborted or panicked")),
+            ));
+        }
+    }
+}
+
+impl SummaryTaskScheduler {
+    fn new(max_concurrency: usize, pending_capacity: usize) -> Self {
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        Self {
+            max_concurrency: max_concurrency.max(1),
+            pending_capacity,
+            in_flight: HashSet::new(),
+            pending: VecDeque::new(),
+            tasks: JoinSet::new(),
+            completion_sender,
+            completion_receiver,
+        }
+    }
+
+    fn enqueue(&mut self, room_id: String, future: SummaryFuture) -> ScheduleResult {
+        if self.in_flight.contains(&room_id) {
+            return ScheduleResult::DuplicateRoom;
+        }
+        if self.tasks.len() >= self.max_concurrency && self.pending.len() >= self.pending_capacity {
+            return ScheduleResult::QueueFull;
+        }
+        self.in_flight.insert(room_id.clone());
+        if self.tasks.len() < self.max_concurrency {
+            self.spawn(room_id, future);
+            ScheduleResult::Started
+        } else {
+            self.pending
+                .push_back(PendingSummaryTask { room_id, future });
+            ScheduleResult::Queued
+        }
+    }
+
+    fn reap(&mut self, config: &AgentConfig) {
+        while let Ok((room_id, result)) = self.completion_receiver.try_recv() {
+            self.in_flight.remove(&room_id);
+            if let Err(error) = result {
+                let error_message = format_error_chain(&error);
+                error!(room_id, error = %error_message, "summary task failed");
+                append_runtime_log(
+                    config,
+                    &format!("summary task failed room={room_id} error={error_message}"),
+                );
+            }
+        }
+        while let Some(result) = self.tasks.try_join_next() {
+            if let Err(error) = result {
+                warn!(error = %error, "summary task join failed");
+            }
+        }
+        while self.tasks.len() < self.max_concurrency {
+            let Some(task) = self.pending.pop_front() else {
+                break;
+            };
+            self.spawn(task.room_id, task.future);
+        }
+    }
+
+    fn spawn(&mut self, room_id: String, future: SummaryFuture) {
+        let completion = SummaryTaskCompletion {
+            room_id: Some(room_id),
+            sender: self.completion_sender.clone(),
+        };
+        self.tasks.spawn(async move {
+            let result = future.await;
+            completion.finish(result);
+        });
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -87,29 +390,29 @@ async fn run_agent(config_path: &str) -> Result<()> {
         .init();
 
     append_runtime_log(config, "agent startup started");
+    cleanup_runtime_artifacts(config);
     refresh_wxdb_keys_on_start(config);
 
     let store = SqliteStateStore::open(&config.storage.sqlite_path)
         .with_context(|| format!("opening state store {}", config.storage.sqlite_path))?;
-    let wxdb_command_watcher = WxdbCommandWatcher::start(config);
-    let client = PlatformClient::start(config)
-        .await
-        .with_context(|| format!("starting {} platform client", config.platform.kind.as_str()))?;
-    let platform_rooms = client.configured_rooms(config);
-    let mut recent_trigger_attempts = RecentTriggerAttempts::default();
-    let mut recent_observed_messages = RecentObservedMessages::default();
+    let mut platform = PlatformRuntime::start(config).await?;
+    let recent_trigger_attempts = Arc::new(Mutex::new(RecentTriggerAttempts::default()));
+    let recent_observed_messages = Arc::new(Mutex::new(RecentObservedMessages::default()));
+    let mut scheduler =
+        SummaryTaskScheduler::new(SUMMARY_MAX_CONCURRENCY, SUMMARY_PENDING_CAPACITY);
+    let mut next_artifact_cleanup = Instant::now() + StdDuration::from_secs(6 * 60 * 60);
 
     info!(
-        platform = client.kind().as_str(),
-        rooms = ?platform_rooms,
+        platform = platform.fingerprint.kind.as_str(),
+        rooms = ?platform.rooms,
         "platform message receiving enabled"
     );
     append_runtime_log(
         config,
         &format!(
             "platform enabled kind={} rooms={:?}",
-            client.kind().as_str(),
-            platform_rooms
+            platform.fingerprint.kind.as_str(),
+            platform.rooms
         ),
     );
 
@@ -130,13 +433,59 @@ async fn run_agent(config_path: &str) -> Result<()> {
         );
     }
 
+    let mut scheduled_backlog = ScheduledSummaryBacklog::default();
     loop {
-        reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run, &client)?;
+        let old_fingerprint = platform.fingerprint.clone();
+        let old_watcher_fingerprint = platform.watcher_fingerprint.clone();
+        if config_reloader.reload_if_changed()? {
+            let config = config_reloader.config();
+            let new_fingerprint = PlatformConnectionFingerprint::from_config(config);
+            if new_fingerprint != old_fingerprint {
+                platform.request_reconnect(config, "platform connection configuration changed");
+            } else {
+                platform
+                    .client
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("platform client mutex poisoned"))?
+                    .refresh_runtime_options(config)?;
+            }
+            if WxdbWatcherFingerprint::from_config(config) != old_watcher_fingerprint {
+                platform.restart_watcher(config, "configuration changed");
+            }
+            if !config.scheduled_summary.enabled {
+                scheduled_backlog.requests.clear();
+                scheduled_backlog.clear_retry();
+            }
+            next_scheduled_run = next_scheduled_run_after(Utc::now(), config);
+            if let Some(run_at) = next_scheduled_run {
+                info!(
+                    run_at_utc = %run_at,
+                    run_at_beijing = %format_beijing_time(run_at),
+                    "scheduled summary replanned after config reload"
+                );
+            }
+        }
 
         let now = Utc::now();
         let config = config_reloader.config();
+        platform.reconnect_if_due(config).await;
+        platform.restart_watcher_if_due(config);
+        scheduler.reap(config);
+        if Instant::now() >= next_artifact_cleanup {
+            cleanup_runtime_artifacts(config);
+            next_artifact_cleanup = Instant::now() + StdDuration::from_secs(6 * 60 * 60);
+        }
         if next_scheduled_run.is_some_and(|run_at| now >= run_at) {
-            run_scheduled_summaries(config, &store, &client, now).await?;
+            let rooms = scheduled_rooms(config, &platform.rooms);
+            scheduled_backlog.add_rooms(
+                rooms,
+                ResolvedTimeRange {
+                    since: now - Duration::hours(config.scheduled_summary.range_hours.max(1)),
+                    until: now,
+                    mode: TimeRangeMode::FixedHours,
+                },
+                now,
+            );
             let config = config_reloader.config();
             next_scheduled_run = next_scheduled_run_after(now + Duration::seconds(1), config);
             if let Some(run_at) = next_scheduled_run {
@@ -148,78 +497,156 @@ async fn run_agent(config_path: &str) -> Result<()> {
             }
         }
 
-        while let Some(event) = wxdb_command_watcher.try_recv() {
-            reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run, &client)?;
+        drain_scheduled_backlog(
+            config,
+            &store,
+            &platform.worker,
+            &mut scheduled_backlog,
+            &mut scheduler,
+        );
+
+        loop {
+            let event = match platform.watcher.try_recv() {
+                WxdbCommandWatcherRecv::Event(event) => event,
+                WxdbCommandWatcherRecv::Empty => break,
+                WxdbCommandWatcherRecv::Disconnected => {
+                    platform.note_watcher_disconnected(config);
+                    break;
+                }
+            };
             let config = config_reloader.config();
             let matcher = config_reloader.matcher();
-            handle_platform_event(
+            enqueue_platform_event(
                 config,
                 &store,
                 matcher,
-                &client,
-                &mut recent_trigger_attempts,
-                &mut recent_observed_messages,
+                &platform.worker,
+                &recent_trigger_attempts,
+                &recent_observed_messages,
                 PlatformEventSource::WxdbRecovered,
                 event,
-            )
-            .await?;
+                &mut scheduler,
+            );
         }
 
-        if let Some(event) = client.next_event_timeout(StdDuration::from_secs(1))? {
-            reload_config_if_changed(&mut config_reloader, &mut next_scheduled_run, &client)?;
-            let config = config_reloader.config();
-            let matcher = config_reloader.matcher();
-            handle_platform_event(
-                config,
-                &store,
-                matcher,
-                &client,
-                &mut recent_trigger_attempts,
-                &mut recent_observed_messages,
-                PlatformEventSource::Realtime,
-                event,
-            )
-            .await?;
+        if platform.reconnect_at.is_some() {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            continue;
+        }
+        let event_client = Arc::clone(&platform.client);
+        let event = tokio::task::spawn_blocking(move || {
+            let client_guard = event_client
+                .lock()
+                .map_err(|_| anyhow::anyhow!("platform client mutex poisoned"))?;
+            client_guard.next_event_timeout(StdDuration::from_secs(1))
+        })
+        .await
+        .context("joining platform event wait")?;
+        match event {
+            Ok(Some(event)) => {
+                let config = config_reloader.config();
+                let matcher = config_reloader.matcher();
+                enqueue_platform_event(
+                    config,
+                    &store,
+                    matcher,
+                    &platform.worker,
+                    &recent_trigger_attempts,
+                    &recent_observed_messages,
+                    PlatformEventSource::Realtime,
+                    event,
+                    &mut scheduler,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let message = format_error_chain(&error);
+                error!(error = %message, "platform event listener failed; scheduling reconnect");
+                append_runtime_log(
+                    config_reloader.config(),
+                    &format!("platform event listener failed error={message}; reconnect scheduled"),
+                );
+                platform
+                    .request_reconnect(config_reloader.config(), "platform event listener failed");
+            }
         }
     }
 }
 
-fn reload_config_if_changed(
-    config_reloader: &mut ConfigReloader,
-    next_scheduled_run: &mut Option<DateTime<Utc>>,
-    client: &PlatformClient,
-) -> Result<()> {
-    if !config_reloader.reload_if_changed()? {
-        return Ok(());
+#[allow(clippy::too_many_arguments)]
+fn enqueue_platform_event(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    matcher: &TriggerMatcher,
+    client: &PlatformWorker,
+    recent_trigger_attempts: &Arc<Mutex<RecentTriggerAttempts>>,
+    recent_observed_messages: &Arc<Mutex<RecentObservedMessages>>,
+    event_source: PlatformEventSource,
+    event: PlatformEvent,
+    scheduler: &mut SummaryTaskScheduler,
+) {
+    let incoming = IncomingMessage::from(event.clone());
+    if event_source == PlatformEventSource::Realtime {
+        if let Ok(mut recent) = recent_observed_messages.lock() {
+            recent.record(&incoming, Utc::now());
+        }
+    }
+    if matcher.match_message(&incoming).is_none() {
+        return;
     }
 
-    let config = config_reloader.config();
-    client.refresh_runtime_options(config)?;
-    *next_scheduled_run = next_scheduled_run_after(Utc::now(), config);
-    if let Some(run_at) = next_scheduled_run {
-        info!(
-            run_at_utc = %run_at,
-            run_at_beijing = %format_beijing_time(*run_at),
-            "scheduled summary replanned after config reload"
-        );
-        append_runtime_log(
-            config,
-            &format!(
-                "scheduled summary replanned after config reload next_run_utc={} next_run_beijing={}",
-                run_at,
-                format_beijing_time(*run_at)
-            ),
-        );
-    } else {
-        info!("scheduled summary disabled after config reload");
-        append_runtime_log(config, "scheduled summary disabled after config reload");
+    let room_id = event.room_id.clone();
+    let task_config = config.clone();
+    let task_store = store.clone();
+    let task_client = client.clone();
+    let task_attempts = Arc::clone(recent_trigger_attempts);
+    let task_observed = Arc::clone(recent_observed_messages);
+    let task_room_id = room_id.clone();
+    let future = Box::pin(async move {
+        let task_matcher = TriggerMatcher::new(effective_listen_config(&task_config))
+            .context("building trigger matcher for summary task")?;
+        handle_platform_event(
+            &task_config,
+            &task_store,
+            &task_matcher,
+            &task_client,
+            &task_attempts,
+            &task_observed,
+            event_source,
+            event,
+        )
+        .await
+    });
+    match scheduler.enqueue(room_id, future) {
+        ScheduleResult::Started | ScheduleResult::Queued => {}
+        ScheduleResult::DuplicateRoom => {
+            append_runtime_log(
+                config,
+                &format!("summary trigger ignored room={task_room_id} reason=in_flight"),
+            );
+        }
+        ScheduleResult::QueueFull => {
+            append_runtime_log(
+                config,
+                &format!("summary trigger rejected room={task_room_id} reason=queue_full"),
+            );
+        }
     }
-
-    Ok(())
 }
 
 struct WxdbCommandWatcher {
     receiver: Option<mpsc::Receiver<PlatformEvent>>,
+    enabled: bool,
+    stop: Option<Arc<AtomicBool>>,
+    thread: Option<thread::JoinHandle<()>>,
+    state_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum WxdbCommandWatcherRecv {
+    Event(PlatformEvent),
+    Empty,
+    Disconnected,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -229,30 +656,91 @@ enum PlatformEventSource {
 }
 
 impl WxdbCommandWatcher {
+    fn stopped() -> Self {
+        Self {
+            receiver: None,
+            enabled: false,
+            stop: None,
+            thread: None,
+            state_path: None,
+        }
+    }
+
     fn start(config: &AgentConfig) -> Self {
+        Self::start_with_state_path(config, None)
+    }
+
+    fn start_with_state_path(config: &AgentConfig, previous_state_path: Option<PathBuf>) -> Self {
         if !wxdb_command_watcher_enabled(config) {
-            return Self { receiver: None };
+            return Self {
+                receiver: None,
+                enabled: false,
+                stop: None,
+                thread: None,
+                state_path: None,
+            };
         }
 
+        let state_path = previous_state_path.unwrap_or_else(|| wxdb_watcher_state_path(config));
         let rooms = configured_wx_rooms(config);
         if rooms.is_empty() {
             append_runtime_log(config, "wxdb command watcher skipped no wx rooms");
-            return Self { receiver: None };
+            return Self {
+                receiver: None,
+                enabled: true,
+                stop: None,
+                thread: None,
+                state_path: Some(state_path),
+            };
         }
 
         let config = config.clone();
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || run_wxdb_command_watcher(config, rooms, sender));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread_state_path = state_path.clone();
+        let thread = thread::spawn(move || {
+            run_wxdb_command_watcher(config, rooms, sender, thread_stop, thread_state_path)
+        });
         Self {
             receiver: Some(receiver),
+            enabled: true,
+            stop: Some(stop),
+            thread: Some(thread),
+            state_path: Some(state_path),
         }
     }
 
-    fn try_recv(&self) -> Option<PlatformEvent> {
-        let receiver = self.receiver.as_ref()?;
+    fn try_recv(&mut self) -> WxdbCommandWatcherRecv {
+        let Some(receiver) = self.receiver.as_ref() else {
+            return WxdbCommandWatcherRecv::Empty;
+        };
         match receiver.try_recv() {
-            Ok(event) => Some(event),
-            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => None,
+            Ok(event) => WxdbCommandWatcherRecv::Event(event),
+            Err(mpsc::TryRecvError::Empty) => WxdbCommandWatcherRecv::Empty,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.receiver = None;
+                WxdbCommandWatcherRecv::Disconnected
+            }
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn state_path(&self) -> Option<&Path> {
+        self.state_path.as_deref()
+    }
+}
+
+impl Drop for WxdbCommandWatcher {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.stop {
+            stop.store(true, AtomicOrdering::Release);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -288,6 +776,8 @@ fn run_wxdb_command_watcher(
     config: AgentConfig,
     rooms: Vec<String>,
     sender: mpsc::Sender<PlatformEvent>,
+    stop: Arc<AtomicBool>,
+    watermark_path: PathBuf,
 ) {
     let matcher = match TriggerMatcher::new(effective_listen_config(&config)) {
         Ok(matcher) => matcher,
@@ -311,16 +801,46 @@ fn run_wxdb_command_watcher(
         ),
     );
 
-    let mut seen = HashSet::new();
+    let mut watcher_state = load_wxdb_watcher_state(&watermark_path);
+    let startup_now = Utc::now().timestamp();
+    for room in &rooms {
+        watcher_state
+            .rooms
+            .entry(room.clone())
+            .or_insert_with(|| WxdbWatcherRoomState::new(startup_now));
+    }
+    save_wxdb_watcher_state(&watermark_path, &watcher_state);
     let mut recent_errors = WxdbCommandWatcherErrors::default();
     loop {
+        if stop.load(AtomicOrdering::Acquire) {
+            return;
+        }
         let now = Utc::now();
-        let since = now - Duration::seconds(WXDB_COMMAND_WATCH_LOOKBACK_SECONDS);
         for room in &rooms {
-            match poll_wxdb_command_room(&config, &matcher, room, since, now, &mut seen) {
+            if stop.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            let state = watcher_state
+                .rooms
+                .entry(room.clone())
+                .or_insert_with(|| WxdbWatcherRoomState::new(now.timestamp()));
+            let since_timestamp = state
+                .cursor_timestamp
+                .saturating_sub(WXDB_COMMAND_WATCH_LOOKBACK_SECONDS);
+            let since = Utc
+                .timestamp_opt(since_timestamp, 0)
+                .single()
+                .unwrap_or(now);
+            match poll_wxdb_command_room(&config, &matcher, room, since, now, state) {
                 Ok(events) => {
+                    if stop.load(AtomicOrdering::Acquire) {
+                        return;
+                    }
                     recent_errors.clear_success(&config, room);
                     for event in events {
+                        if stop.load(AtomicOrdering::Acquire) {
+                            return;
+                        }
                         if sender.send(event).is_err() {
                             append_runtime_log(
                                 &config,
@@ -329,13 +849,86 @@ fn run_wxdb_command_watcher(
                             return;
                         }
                     }
+                    if stop.load(AtomicOrdering::Acquire) {
+                        return;
+                    }
+                    state.cursor_timestamp = now.timestamp();
+                    save_wxdb_watcher_state(&watermark_path, &watcher_state);
                 }
                 Err(error) => {
                     recent_errors.record(&config, room, &error);
                 }
             }
         }
-        thread::sleep(StdDuration::from_secs(WXDB_COMMAND_WATCH_INTERVAL_SECONDS));
+        for _ in 0..WXDB_COMMAND_WATCH_INTERVAL_SECONDS {
+            if stop.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            thread::sleep(StdDuration::from_secs(1));
+        }
+    }
+}
+
+fn wxdb_watcher_state_path(config: &AgentConfig) -> PathBuf {
+    Path::new(&config.runtime.output_dir).join("wxdb-command-watcher-state.json")
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct WxdbWatcherState {
+    rooms: HashMap<String, WxdbWatcherRoomState>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WxdbWatcherRoomState {
+    startup_baseline: i64,
+    cursor_timestamp: i64,
+    #[serde(default)]
+    initialized: bool,
+    #[serde(default)]
+    last_seen_local_id: Option<i64>,
+    #[serde(default)]
+    seen_ids: VecDeque<String>,
+}
+
+impl WxdbWatcherRoomState {
+    fn new(now: i64) -> Self {
+        Self {
+            startup_baseline: now,
+            cursor_timestamp: now,
+            initialized: false,
+            last_seen_local_id: None,
+            seen_ids: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.seen_ids.iter().any(|seen| seen == id)
+    }
+
+    fn remember(&mut self, id: String) {
+        if self.contains(&id) {
+            return;
+        }
+        self.seen_ids.push_back(id);
+        while self.seen_ids.len() > WXDB_COMMAND_WATCH_SEEN_IDS {
+            self.seen_ids.pop_front();
+        }
+    }
+}
+
+fn load_wxdb_watcher_state(path: &Path) -> WxdbWatcherState {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_wxdb_watcher_state(path: &Path, state: &WxdbWatcherState) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string(state) {
+        let _ = fs::write(path, text);
     }
 }
 
@@ -404,7 +997,7 @@ fn poll_wxdb_command_room(
     room: &str,
     since: DateTime<Utc>,
     until: DateTime<Utc>,
-    seen: &mut HashSet<String>,
+    state: &mut WxdbWatcherRoomState,
 ) -> Result<Vec<PlatformEvent>> {
     let chat_name = config
         .wx_cli
@@ -412,30 +1005,65 @@ fn poll_wxdb_command_room(
         .get(room)
         .map(String::as_str)
         .unwrap_or(room);
-    let wxdb_config = wxdb_runtime_config_for_agent(config);
-    let result = wechat_summary_wxdb::query_history_with_config(
-        &wxdb_config,
-        wechat_summary_wxdb::HistoryQuery {
-            chat_name: chat_name.to_string(),
-            since: Some(since),
-            until: Some(until),
-            limit: WXDB_COMMAND_WATCH_LIMIT,
-            text_only: true,
-            msg_types: vec!["text".to_string()],
-            media_decode_limit: Some(0),
-        },
-    )
-    .with_context(|| format!("querying wxdb command watcher history for {chat_name}"))?;
+    let query_page = |before_local_id| {
+        wx4py_client::query_builtin_wxdb_history_controlled(
+            &config.wx_cli,
+            wechat_summary_wxdb::HistoryQuery {
+                chat_name: chat_name.to_string(),
+                since: Some(since),
+                until: Some(until),
+                before_local_id,
+                limit: WXDB_COMMAND_WATCH_LIMIT,
+                text_only: true,
+                msg_types: vec!["text".to_string()],
+                media_decode_limit: Some(0),
+            },
+        )
+        .map(|result| result.messages)
+        .with_context(|| format!("querying wxdb command watcher history for {chat_name}"))
+    };
 
-    let mut latest_by_room: HashMap<String, PlatformEvent> = HashMap::new();
-    for message in result.messages {
-        let key = wxdb_seen_message_key(chat_name, &message);
-        if seen.contains(&key) {
+    if !state.initialized {
+        let baseline = query_page(None)?;
+        state.last_seen_local_id = baseline.iter().filter_map(|message| message.local_id).max();
+        state.initialized = true;
+        return Ok(Vec::new());
+    }
+
+    let messages = paginate_wxdb_history(
+        WXDB_COMMAND_WATCH_LIMIT,
+        state.last_seen_local_id,
+        query_page,
+    )?;
+    let max_local_id = messages.iter().filter_map(|message| message.local_id).max();
+    let mut events = Vec::new();
+    for message in messages {
+        let Some(key) = wxdb_seen_message_key(chat_name, &message) else {
+            tracing::warn!(
+                chat_name,
+                "wxdb watcher ignored message without stable local_id"
+            );
+            continue;
+        };
+        if state.contains(&key)
+            || state.last_seen_local_id.is_some_and(|last_seen| {
+                message
+                    .local_id
+                    .is_some_and(|local_id| local_id <= last_seen)
+            })
+        {
             continue;
         }
         let Some(timestamp) = Utc.timestamp_opt(message.timestamp, 0).single() else {
             continue;
         };
+        let delayed_new_message = state
+            .last_seen_local_id
+            .zip(message.local_id)
+            .is_some_and(|(last_seen, local_id)| local_id > last_seen);
+        if message.timestamp < state.startup_baseline && !delayed_new_message {
+            continue;
+        }
         let content = message.content.trim().to_string();
         if content.is_empty() || is_agent_status_content(&content) {
             continue;
@@ -443,6 +1071,7 @@ fn poll_wxdb_command_room(
         let incoming = IncomingMessage {
             room_id: room.to_string(),
             room_name: Some(chat_name.to_string()),
+            stable_id: Some(key.clone()),
             sender_id: message
                 .sender_username
                 .clone()
@@ -457,11 +1086,12 @@ fn poll_wxdb_command_room(
         if matcher.match_message(&incoming).is_none() {
             continue;
         }
-        seen.insert(key);
+        state.remember(key);
         let event = PlatformEvent {
             platform: PlatformKindConfig::Wx4py,
             room_id: incoming.room_id,
             room_name: incoming.room_name,
+            stable_id: incoming.stable_id,
             sender_id: incoming.sender_id,
             sender_name: incoming.sender_name,
             content: incoming.content,
@@ -469,11 +1099,16 @@ fn poll_wxdb_command_room(
             timestamp: incoming.timestamp,
             is_self: incoming.is_self,
         };
-        latest_by_room.insert(event.room_id.clone(), event);
+        events.push(event);
     }
+    state.last_seen_local_id = max_local_id.or(state.last_seen_local_id);
 
-    let mut events = latest_by_room.into_values().collect::<Vec<_>>();
-    events.sort_by_key(|event| event.timestamp);
+    events.sort_by(|left, right| {
+        left.timestamp.cmp(&right.timestamp).then_with(|| {
+            stable_id_number(left.stable_id.as_deref().unwrap_or(""))
+                .cmp(&stable_id_number(right.stable_id.as_deref().unwrap_or("")))
+        })
+    });
     for event in &events {
         append_runtime_log(
             config,
@@ -488,13 +1123,181 @@ fn poll_wxdb_command_room(
     Ok(events)
 }
 
-fn wxdb_runtime_config_for_agent(config: &AgentConfig) -> wechat_summary_wxdb::RuntimeConfig {
-    let runtime = wechat_summary_wxdb::RuntimeConfig::load();
-    let cache_dir = config.wx_cli.cache_dir.trim();
-    if cache_dir.is_empty() {
-        runtime
-    } else {
-        runtime.with_cache_dir(cache_dir)
+fn paginate_wxdb_history<F>(
+    limit: usize,
+    last_seen_local_id: Option<i64>,
+    mut query_page: F,
+) -> Result<Vec<wechat_summary_wxdb::HistoryMessage>>
+where
+    F: FnMut(Option<i64>) -> Result<Vec<wechat_summary_wxdb::HistoryMessage>>,
+{
+    let mut before_local_id = None;
+    let mut messages = Vec::new();
+    let mut seen_ids = HashSet::new();
+    loop {
+        let page = query_page(before_local_id)?;
+        if page.is_empty() {
+            break;
+        }
+
+        let page_len = page.len();
+        let oldest_local_id = page.iter().filter_map(|message| message.local_id).min();
+        let reached_watermark = last_seen_local_id.is_some_and(|last_seen| {
+            page.iter()
+                .filter_map(|message| message.local_id)
+                .any(|local_id| local_id <= last_seen)
+        });
+        for message in page {
+            if message
+                .local_id
+                .is_none_or(|local_id| seen_ids.insert(local_id))
+            {
+                messages.push(message);
+            }
+        }
+        if reached_watermark || oldest_local_id.is_none() {
+            break;
+        }
+        if page_len < limit {
+            break;
+        }
+        if before_local_id == oldest_local_id {
+            break;
+        }
+        before_local_id = oldest_local_id;
+    }
+
+    messages.sort_by(|left, right| {
+        left.timestamp.cmp(&right.timestamp).then_with(|| {
+            left.local_id
+                .cmp(&right.local_id)
+                .then_with(|| left.content.cmp(&right.content))
+        })
+    });
+    Ok(messages)
+}
+
+impl PlatformRuntime {
+    async fn start(config: &AgentConfig) -> Result<Self> {
+        let client = PlatformClient::start(config).await.with_context(|| {
+            format!("starting {} platform client", config.platform.kind.as_str())
+        })?;
+        let worker = client.worker();
+        let rooms = client.configured_rooms(config);
+        Ok(Self {
+            client: Arc::new(Mutex::new(client)),
+            worker,
+            rooms,
+            fingerprint: PlatformConnectionFingerprint::from_config(config),
+            watcher: WxdbCommandWatcher::start(config),
+            watcher_fingerprint: WxdbWatcherFingerprint::from_config(config),
+            watcher_restart_at: None,
+            reconnect_at: None,
+        })
+    }
+
+    fn request_reconnect(&mut self, config: &AgentConfig, reason: &str) {
+        if self.reconnect_at.is_none() {
+            append_runtime_log(
+                config,
+                &format!("platform reconnect scheduled reason={reason} delay_seconds=2"),
+            );
+            self.reconnect_at = Some(Instant::now() + PLATFORM_RECONNECT_DELAY);
+        }
+    }
+
+    async fn reconnect_if_due(&mut self, config: &AgentConfig) {
+        let Some(reconnect_at) = self.reconnect_at else {
+            return;
+        };
+        if Instant::now() < reconnect_at {
+            return;
+        }
+
+        match PlatformClient::start(config).await {
+            Ok(client) => {
+                let worker = client.worker();
+                let rooms = client.configured_rooms(config);
+                let previous_state_path = self.watcher.state_path().map(Path::to_path_buf);
+                self.client = Arc::new(Mutex::new(client));
+                self.worker = worker;
+                self.rooms = rooms;
+                self.fingerprint = PlatformConnectionFingerprint::from_config(config);
+                let old_watcher =
+                    std::mem::replace(&mut self.watcher, WxdbCommandWatcher::stopped());
+                drop(old_watcher);
+                self.watcher =
+                    WxdbCommandWatcher::start_with_state_path(config, previous_state_path);
+                self.watcher_fingerprint = WxdbWatcherFingerprint::from_config(config);
+                self.watcher_restart_at = None;
+                self.reconnect_at = None;
+                info!(
+                    platform = self.fingerprint.kind.as_str(),
+                    "platform reconnected"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "platform reconnected kind={}",
+                        self.fingerprint.kind.as_str()
+                    ),
+                );
+            }
+            Err(error) => {
+                let message = format_error_chain(&error);
+                error!(error = %message, "platform reconnect failed; retrying");
+                append_runtime_log(
+                    config,
+                    &format!("platform reconnect failed error={message}; retrying"),
+                );
+                self.reconnect_at = Some(Instant::now() + PLATFORM_RECONNECT_DELAY);
+            }
+        }
+    }
+
+    fn note_watcher_disconnected(&mut self, config: &AgentConfig) {
+        if self.watcher.enabled() && self.watcher_restart_at.is_none() {
+            error!("wxdb command watcher channel disconnected; scheduling restart");
+            append_runtime_log(
+                config,
+                "wxdb command watcher channel disconnected; restart scheduled",
+            );
+            self.watcher_restart_at = Some(Instant::now() + WXDB_WATCHER_RESTART_DELAY);
+        }
+    }
+
+    fn restart_watcher_if_due(&mut self, config: &AgentConfig) {
+        let Some(restart_at) = self.watcher_restart_at else {
+            return;
+        };
+        if Instant::now() >= restart_at {
+            let previous_state_path = self.watcher.state_path().map(Path::to_path_buf);
+            let old_watcher = std::mem::replace(&mut self.watcher, WxdbCommandWatcher::stopped());
+            drop(old_watcher);
+            self.watcher = WxdbCommandWatcher::start_with_state_path(config, previous_state_path);
+            self.watcher_fingerprint = WxdbWatcherFingerprint::from_config(config);
+            self.watcher_restart_at = None;
+            append_runtime_log(
+                config,
+                "wxdb command watcher restarted after channel disconnect",
+            );
+        }
+    }
+
+    fn restart_watcher(&mut self, config: &AgentConfig, reason: &str) {
+        let previous_state_path = self.watcher.state_path().map(Path::to_path_buf);
+        let state_preserved = previous_state_path.is_some();
+        let old_watcher = std::mem::replace(&mut self.watcher, WxdbCommandWatcher::stopped());
+        drop(old_watcher);
+        self.watcher = WxdbCommandWatcher::start_with_state_path(config, previous_state_path);
+        self.watcher_fingerprint = WxdbWatcherFingerprint::from_config(config);
+        self.watcher_restart_at = None;
+        append_runtime_log(
+            config,
+            &format!(
+                "wxdb command watcher restarted reason={reason} state_preserved={state_preserved}"
+            ),
+        );
     }
 }
 
@@ -507,14 +1310,13 @@ fn effective_wxdb_cache_dir(config: &AgentConfig) -> String {
     }
 }
 
-fn wxdb_seen_message_key(chat_name: &str, message: &wechat_summary_wxdb::HistoryMessage) -> String {
-    if let Some(local_id) = message.local_id {
-        return format!("{chat_name}:local:{local_id}");
-    }
-    format!(
-        "{}:fallback:{}:{}:{}",
-        chat_name, message.timestamp, message.sender, message.content
-    )
+fn wxdb_seen_message_key(
+    chat_name: &str,
+    message: &wechat_summary_wxdb::HistoryMessage,
+) -> Option<String> {
+    message
+        .local_id
+        .map(|local_id| format!("{chat_name}:local:{local_id}"))
 }
 
 struct ConfigReloader {
@@ -600,7 +1402,7 @@ impl ConfigReloader {
         append_runtime_log(
             &self.config,
             &format!(
-                "config hot reloaded path={} note=startup-only settings still require restart: platform listener, wxdb command watcher, storage path, runtime log writer",
+                "config hot reloaded path={} note=platform connection/listener changes trigger controlled reconnect; storage path and runtime log writer remain startup-scoped",
                 self.path.display()
             ),
         );
@@ -965,21 +1767,120 @@ fn append_startup_error(config_path: &str, message: &str) {
     }
 }
 
+fn cleanup_runtime_artifacts(config: &AgentConfig) {
+    const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+    let cutoff = SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(
+            u64::from(config.runtime.cleanup_after_days.max(1)) * 24 * 60 * 60,
+        ))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let files = known_runtime_artifacts(config);
+    for (path, _, modified) in &files {
+        if *modified < cutoff {
+            let _ = fs::remove_file(path);
+        }
+    }
+    let mut remaining = files
+        .into_iter()
+        .filter(|(path, _, _)| path.exists())
+        .collect::<Vec<_>>();
+    let mut total = remaining.iter().map(|(_, size, _)| *size).sum::<u64>();
+    if total > MAX_ARTIFACT_BYTES {
+        remaining.sort_by_key(|(_, _, modified)| *modified);
+        for (path, size, _) in remaining {
+            if total <= MAX_ARTIFACT_BYTES {
+                break;
+            }
+            if fs::remove_file(path).is_ok() {
+                total = total.saturating_sub(size);
+            }
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn known_runtime_artifacts(config: &AgentConfig) -> Vec<(PathBuf, u64, SystemTime)> {
+    let output_dir = PathBuf::from(&config.runtime.output_dir);
+    let trace_dir = if config.runtime.ai_trace_dir.trim().is_empty() {
+        output_dir.join("ai-traces")
+    } else {
+        PathBuf::from(config.runtime.ai_trace_dir.trim())
+    };
+    let long_text_dir = if config.wx4py.long_text_file_dir.trim().is_empty() {
+        output_dir.join("long-text")
+    } else {
+        PathBuf::from(config.wx4py.long_text_file_dir.trim())
+    };
+    let specs: [(PathBuf, fn(&Path) -> bool); 4] = [
+        (output_dir.clone(), is_generated_image_artifact),
+        (trace_dir, is_ai_trace_artifact),
+        (output_dir.join("voice-mp3"), is_voice_mp3_artifact),
+        (long_text_dir, is_long_text_artifact),
+    ];
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for (dir, predicate) in specs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || !predicate(&path) || !seen.insert(path.clone()) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            files.push((
+                path,
+                metadata.len(),
+                metadata.modified().unwrap_or(SystemTime::now()),
+            ));
+        }
+    }
+    files
+}
+
+fn artifact_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+}
+
+fn is_generated_image_artifact(path: &Path) -> bool {
+    let name = artifact_name(path);
+    name.starts_with("summary-") && name.ends_with(".png")
+}
+
+fn is_ai_trace_artifact(path: &Path) -> bool {
+    let name = artifact_name(path);
+    name.ends_with(".json") && name.contains("-attempt-")
+}
+
+fn is_voice_mp3_artifact(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"))
+}
+
+fn is_long_text_artifact(path: &Path) -> bool {
+    let name = artifact_name(path);
+    name.starts_with("summary-") && name.ends_with(".txt")
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_platform_event(
     config: &AgentConfig,
     store: &SqliteStateStore,
     matcher: &TriggerMatcher,
-    client: &PlatformClient,
-    recent_trigger_attempts: &mut RecentTriggerAttempts,
-    recent_observed_messages: &mut RecentObservedMessages,
+    client: &PlatformWorker,
+    recent_trigger_attempts: &Arc<Mutex<RecentTriggerAttempts>>,
+    recent_observed_messages: &Arc<Mutex<RecentObservedMessages>>,
     event_source: PlatformEventSource,
     event: PlatformEvent,
 ) -> Result<()> {
     let source_platform = event.platform;
     let incoming = IncomingMessage::from(event);
-    if event_source == PlatformEventSource::Realtime {
-        recent_observed_messages.record(&incoming, Utc::now());
-    }
     let Some(trigger) = matcher.match_message(&incoming) else {
         return Ok(());
     };
@@ -1008,13 +1909,19 @@ async fn handle_platform_event(
         return Ok(());
     };
 
-    if event_source == PlatformEventSource::WxdbRecovered
-        && recent_observed_messages.has_matching_trigger(
-            &trigger,
-            Utc::now(),
-            WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS,
-        )
-    {
+    let observed_realtime = event_source == PlatformEventSource::WxdbRecovered
+        && recent_observed_messages
+            .lock()
+            .map(|recent| {
+                recent.has_matching_trigger(
+                    &trigger,
+                    &incoming,
+                    Utc::now(),
+                    WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS,
+                )
+            })
+            .unwrap_or(false);
+    if observed_realtime {
         info!(
             room_id = %trigger.room_id,
             content_len = trigger_content_len,
@@ -1033,7 +1940,17 @@ async fn handle_platform_event(
         return Ok(());
     }
 
-    if recent_trigger_attempts.is_duplicate(&trigger, incoming.timestamp) {
+    let duplicate = recent_trigger_attempts
+        .lock()
+        .map(|mut attempts| {
+            attempts.is_duplicate_with_id(
+                &trigger,
+                incoming.stable_id.as_deref(),
+                incoming.timestamp,
+            )
+        })
+        .unwrap_or(false);
+    if duplicate {
         info!(
             room_id = %trigger.room_id,
             content_len = trigger_content_len,
@@ -1155,6 +2072,10 @@ async fn handle_platform_event(
         ),
     );
 
+    let recent_observed_snapshot = recent_observed_messages
+        .lock()
+        .ok()
+        .map(|recent| recent.clone());
     match run_summary_pipeline(
         config,
         client,
@@ -1166,7 +2087,7 @@ async fn handle_platform_event(
             store: store.clone(),
             timestamp: incoming.timestamp,
         }),
-        Some(recent_observed_messages),
+        recent_observed_snapshot.as_ref(),
     )
     .await
     {
@@ -1215,20 +2136,37 @@ struct RecentTriggerAttempts {
     attempts_by_key: HashMap<String, Vec<RecentTriggerAttempt>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RecentTriggerAttempt {
+    stable_id: Option<String>,
     event_at: DateTime<Utc>,
     observed_at: DateTime<Utc>,
 }
 
 impl RecentTriggerAttempts {
-    fn is_duplicate(&mut self, trigger: &TriggerMatch, event_at: DateTime<Utc>) -> bool {
-        self.is_duplicate_at(trigger, event_at, Utc::now())
-    }
-
+    #[cfg(test)]
     fn is_duplicate_at(
         &mut self,
         trigger: &TriggerMatch,
+        event_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    ) -> bool {
+        self.is_duplicate_at_with_id(trigger, None, event_at, observed_at)
+    }
+
+    fn is_duplicate_with_id(
+        &mut self,
+        trigger: &TriggerMatch,
+        stable_id: Option<&str>,
+        event_at: DateTime<Utc>,
+    ) -> bool {
+        self.is_duplicate_at_with_id(trigger, stable_id, event_at, Utc::now())
+    }
+
+    fn is_duplicate_at_with_id(
+        &mut self,
+        trigger: &TriggerMatch,
+        stable_id: Option<&str>,
         event_at: DateTime<Utc>,
         observed_at: DateTime<Utc>,
     ) -> bool {
@@ -1241,10 +2179,23 @@ impl RecentTriggerAttempts {
         let process_cutoff = observed_at - Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS);
         let key = trigger_attempt_key(trigger);
         if let Some(attempts) = self.attempts_by_key.get(&key) {
-            if attempts.iter().any(|attempt| {
-                attempt.observed_at >= process_cutoff
-                    || event_times_close(attempt.event_at, event_at)
-            }) {
+            let duplicate = if let Some(stable_id) = stable_id {
+                attempts.iter().any(|attempt| {
+                    attempt
+                        .stable_id
+                        .as_deref()
+                        .is_some_and(|previous| stable_ids_match(previous, stable_id))
+                })
+            } else {
+                attempts
+                    .iter()
+                    .filter(|attempt| attempt.stable_id.is_none())
+                    .any(|attempt| {
+                        attempt.observed_at >= process_cutoff
+                            || event_times_close(attempt.event_at, event_at)
+                    })
+            };
+            if duplicate {
                 return true;
             }
         }
@@ -1253,6 +2204,7 @@ impl RecentTriggerAttempts {
             .entry(key)
             .or_default()
             .push(RecentTriggerAttempt {
+                stable_id: stable_id.map(ToOwned::to_owned),
                 event_at,
                 observed_at,
             });
@@ -1273,7 +2225,7 @@ fn trigger_attempt_key(trigger: &TriggerMatch) -> String {
     )
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct RecentObservedMessages {
     messages: VecDeque<IncomingMessage>,
 }
@@ -1313,17 +2265,26 @@ impl RecentObservedMessages {
     fn has_matching_trigger(
         &self,
         trigger: &TriggerMatch,
+        incoming: &IncomingMessage,
         now: DateTime<Utc>,
         window_seconds: i64,
     ) -> bool {
         let cutoff = now - Duration::seconds(window_seconds);
         let target_content = trigger.trigger_content.trim();
         self.messages.iter().any(|message| {
+            let same_stable_id = message
+                .stable_id
+                .as_deref()
+                .zip(incoming.stable_id.as_deref())
+                .is_some_and(|(left, right)| stable_ids_match(left, right));
             message.timestamp >= cutoff
                 && message.room_id == trigger.room_id
                 && message.msg_type == "text"
                 && !message.is_self
-                && message.content.trim() == target_content
+                && (same_stable_id
+                    || (incoming.stable_id.is_none()
+                        && message.stable_id.is_none()
+                        && message.content.trim() == target_content))
         })
     }
 
@@ -1336,41 +2297,33 @@ impl RecentObservedMessages {
     }
 }
 
-async fn run_scheduled_summaries(
+fn drain_scheduled_backlog(
     config: &AgentConfig,
     store: &SqliteStateStore,
-    client: &PlatformClient,
-    now: DateTime<Utc>,
-) -> Result<()> {
-    let rooms = scheduled_rooms(config, &client.configured_rooms(config));
-    if rooms.is_empty() {
-        warn!("scheduled summary skipped because no rooms are configured");
-        append_runtime_log(config, "scheduled summary skipped no rooms");
-        return Ok(());
+    client: &PlatformWorker,
+    backlog: &mut ScheduledSummaryBacklog,
+    scheduler: &mut SummaryTaskScheduler,
+) {
+    if backlog.is_empty() || !backlog.retry_ready(Instant::now()) {
+        return;
     }
 
-    let range = ResolvedTimeRange {
-        since: now - Duration::hours(config.scheduled_summary.range_hours.max(1)),
-        until: now,
-        mode: TimeRangeMode::FixedHours,
-    };
-    info!(
-        rooms = ?rooms,
-        since = %range.since,
-        until = %range.until,
-        "scheduled summary due; running pipeline"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "scheduled summary due rooms={:?} since={} until={}",
-            rooms, range.since, range.until
-        ),
-    );
-
-    for room in rooms {
+    let mut queue_full = false;
+    while let Some(request) = backlog.requests.pop_front() {
+        let room = request.room_id.clone();
+        let now = request.due_at;
         if !config.scheduled_summary.ignore_rate_limit {
-            let last_trigger = store.get_last_trigger(&room)?;
+            let last_trigger = match store.get_last_trigger(&room) {
+                Ok(value) => value,
+                Err(error) => {
+                    append_runtime_log(
+                        config,
+                        &format!("scheduled summary state read failed room={room} error={error}"),
+                    );
+                    requeue_scheduled_request_after_state_read_failure(backlog, request);
+                    return;
+                }
+            };
             if let Some(remaining) = rate_limit_remaining(now, last_trigger, config) {
                 info!(
                     room_id = %room,
@@ -1392,6 +2345,7 @@ async fn run_scheduled_summaries(
         let incoming = IncomingMessage {
             room_id: room.clone(),
             room_name: Some(room.clone()),
+            stable_id: None,
             sender_id: "scheduled_summary".to_string(),
             sender_name: Some("定时总结".to_string()),
             content: "[scheduled_summary]".to_string(),
@@ -1404,55 +2358,113 @@ async fn run_scheduled_summaries(
             trigger_symbol: "[scheduled_summary]".to_string(),
             trigger_content: "[scheduled_summary]".to_string(),
         };
-
-        match run_summary_pipeline(
-            config,
-            client,
-            &incoming,
-            &trigger,
-            &range,
-            PipelineOptions::scheduled(config),
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(PipelineOutcome::SummaryProduced) => {
-                store.set_last_trigger(&room, now)?;
-                info!(room_id = %room, "scheduled summary pipeline completed");
+        let task_config = config.clone();
+        let task_store = store.clone();
+        let task_client = client.clone();
+        let task_range = request.range.clone();
+        let future = Box::pin(async move {
+            run_scheduled_summary_task(
+                &task_config,
+                &task_store,
+                &task_client,
+                incoming,
+                trigger,
+                task_range,
+                now,
+            )
+            .await
+        });
+        match scheduler.enqueue(room.clone(), future) {
+            ScheduleResult::Started | ScheduleResult::Queued => {}
+            ScheduleResult::DuplicateRoom => {
+                backlog.requests.push_back(request);
                 append_runtime_log(
                     config,
-                    &format!("scheduled pipeline completed room={}", room),
+                    &format!("scheduled summary pending room={room} reason=in_flight"),
                 );
             }
-            Ok(PipelineOutcome::NoSummary) => {
-                info!(room_id = %room, "scheduled summary pipeline completed without summary output");
+            ScheduleResult::QueueFull => {
+                queue_full = true;
+                backlog.requests.push_back(request);
                 append_runtime_log(
                     config,
-                    &format!("scheduled pipeline completed without summary room={}", room),
+                    &format!("scheduled summary pending room={room} reason=queue_full"),
                 );
-            }
-            Err(error) => {
-                let error_message = format_error_chain(&error);
-                error!(room_id = %room, error = %error_message, "scheduled summary pipeline failed");
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "scheduled pipeline failed room={} error={}",
-                        room, error_message
-                    ),
-                );
-                let _ = client
-                    .send_text(
-                        &room,
-                        &format_failure_message_for_chat("定时总结失败", &error_message),
-                    )
-                    .await;
             }
         }
     }
+    if queue_full || !backlog.requests.is_empty() {
+        backlog.record_retry(Instant::now());
+    } else {
+        backlog.clear_retry();
+    }
+}
 
-    Ok(())
+fn requeue_scheduled_request_after_state_read_failure(
+    backlog: &mut ScheduledSummaryBacklog,
+    request: ScheduledSummaryRequest,
+) {
+    backlog.requests.push_front(request);
+    backlog.record_retry(Instant::now());
+}
+
+async fn run_scheduled_summary_task(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    client: &PlatformWorker,
+    incoming: IncomingMessage,
+    trigger: TriggerMatch,
+    range: ResolvedTimeRange,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    match run_summary_pipeline(
+        config,
+        client,
+        &incoming,
+        &trigger,
+        &range,
+        PipelineOptions::scheduled(config),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(PipelineOutcome::SummaryProduced) => {
+            store.set_last_trigger(&trigger.room_id, now)?;
+            append_runtime_log(
+                config,
+                &format!("scheduled pipeline completed room={}", trigger.room_id),
+            );
+            Ok(())
+        }
+        Ok(PipelineOutcome::NoSummary) => {
+            append_runtime_log(
+                config,
+                &format!(
+                    "scheduled pipeline completed without summary room={}",
+                    trigger.room_id
+                ),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let error_message = format_error_chain(&error);
+            append_runtime_log(
+                config,
+                &format!(
+                    "scheduled pipeline failed room={} error={error_message}",
+                    trigger.room_id
+                ),
+            );
+            let _ = client
+                .send_text(
+                    &trigger.room_id,
+                    &format_failure_message_for_chat("定时总结失败", &error_message),
+                )
+                .await;
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1503,9 +2515,10 @@ impl PipelineOptions {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query_platform_history_paginated(
     config: &AgentConfig,
-    client: &PlatformClient,
+    client: &PlatformWorker,
     room_id: &str,
     room_name: Option<&str>,
     since: DateTime<Utc>,
@@ -1516,6 +2529,7 @@ async fn query_platform_history_paginated(
     let page_limit = page_limit.max(1);
     let query_limit = page_limit.min(u32::MAX as usize) as u32;
     let mut page_until = until;
+    let mut cursor: Option<PlatformHistoryCursor> = None;
     let mut pages = 0usize;
     let mut history = Vec::new();
     let mut seen = HashSet::new();
@@ -1531,11 +2545,16 @@ async fn query_platform_history_paginated(
                 page_until,
                 query_limit,
                 remaining_media_decode_limit,
+                cursor.as_ref(),
             )
             .await
             .with_context(|| format!("querying platform chat history page {pages}"))?;
         let page_len = page.len();
-        let first_ts = page.iter().map(|message| message.timestamp).min();
+        let oldest = page
+            .iter()
+            .min_by(|left, right| platform_history_order(left, right))
+            .map(|message| (message.timestamp, message.stable_id.clone()));
+        let first_ts = oldest.as_ref().map(|(timestamp, _)| *timestamp);
         let last_ts = page.iter().map(|message| message.timestamp).max();
         let decoded_media_count = media_decode_attempt_count(&page);
         if let Some(remaining) = &mut remaining_media_decode_limit {
@@ -1550,7 +2569,8 @@ async fn query_platform_history_paginated(
         }
         let new_messages = history.len().saturating_sub(before_len);
 
-        if pages == 1 || pages % 10 == 0 || page_len < page_limit || first_ts <= Some(since) {
+        if pages == 1 || pages.is_multiple_of(10) || page_len < page_limit || first_ts < Some(since)
+        {
             info!(
                 room_id = %room_id,
                 page = pages,
@@ -1582,36 +2602,46 @@ async fn query_platform_history_paginated(
             );
         }
 
-        if page_len == 0 || page_len < page_limit || first_ts <= Some(since) {
+        if page_len == 0 || page_len < page_limit || first_ts < Some(since) {
             break;
         }
 
-        let Some(next_until) = first_ts else {
+        let Some((oldest_timestamp, stable_id)) = oldest else {
             break;
         };
+        let Some(stable_id) = stable_id else {
+            anyhow::bail!(
+                "platform history page is full but oldest message has no stable ID; refusing unsafe timestamp-only pagination"
+            );
+        };
+        let next_cursor = PlatformHistoryCursor {
+            timestamp: oldest_timestamp,
+            stable_id,
+        };
 
-        if new_messages == 0 || next_until >= page_until {
+        if new_messages == 0 || cursor.as_ref() == Some(&next_cursor) {
             warn!(
                 room_id = %room_id,
                 page = pages,
                 page_until = %page_until,
-                next_until = %next_until,
+                next_until = %next_cursor.timestamp,
                 "stopping paginated history query because it made no backward progress"
             );
             append_runtime_log(
                 config,
                 &format!(
                     "history pagination stopped without progress room={} page={} page_until={} next_until={}",
-                    room_id, pages, page_until, next_until
+                    room_id, pages, page_until, next_cursor.timestamp
                 ),
             );
             break;
         }
 
-        page_until = next_until;
+        page_until = next_cursor.timestamp;
+        cursor = Some(next_cursor);
     }
 
-    history.sort_by_key(|message| message.timestamp);
+    history.sort_by(platform_history_order);
     info!(
         room_id = %room_id,
         pages,
@@ -1634,6 +2664,9 @@ async fn query_platform_history_paginated(
 }
 
 fn platform_history_message_key(message: &PlatformHistoryMessage) -> String {
+    if let Some(stable_id) = &message.stable_id {
+        return format!("stable:{stable_id}");
+    }
     format!(
         "{}|{}|{}|{}|{}|{}|{}|{}",
         message.timestamp.timestamp_millis(),
@@ -1647,6 +2680,35 @@ fn platform_history_message_key(message: &PlatformHistoryMessage) -> String {
     )
 }
 
+fn platform_history_order(
+    left: &PlatformHistoryMessage,
+    right: &PlatformHistoryMessage,
+) -> Ordering {
+    left.timestamp.cmp(&right.timestamp).then_with(|| {
+        match (
+            left.stable_id.as_deref().and_then(stable_id_number),
+            right.stable_id.as_deref().and_then(stable_id_number),
+        ) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => left.stable_id.cmp(&right.stable_id),
+        }
+    })
+}
+
+fn stable_id_number(value: &str) -> Option<u64> {
+    value
+        .rsplit_once(':')
+        .map(|(_, id)| id)
+        .unwrap_or(value)
+        .parse()
+        .ok()
+}
+
+fn stable_ids_match(left: &str, right: &str) -> bool {
+    left == right
+        || stable_id_number(left).is_some() && stable_id_number(left) == stable_id_number(right)
+}
+
 fn media_decode_attempt_count(messages: &[PlatformHistoryMessage]) -> usize {
     messages
         .iter()
@@ -1656,9 +2718,10 @@ fn media_decode_attempt_count(messages: &[PlatformHistoryMessage]) -> usize {
         .count()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_summary_pipeline(
     config: &AgentConfig,
-    client: &PlatformClient,
+    client: &PlatformWorker,
     incoming: &IncomingMessage,
     trigger: &TriggerMatch,
     range: &ResolvedTimeRange,
@@ -2002,24 +3065,30 @@ async fn run_summary_pipeline(
     }
 
     if options.image_gen_enabled && !options.defer_text_until_image_ready {
-        spawn_background_image_pipeline(
+        let image_sent = run_background_image_pipeline(
             config.clone(),
             client.sender(),
             trigger.room_id.clone(),
             llm_input,
-            chat_messages.clone(),
+            chat_messages,
             options.text_summary_enabled,
             image_cooldown_recorder,
-        );
+        )
+        .await;
         info!(
             room_id = %trigger.room_id,
-            "manual image pipeline spawned in background"
+            image_sent,
+            "manual image pipeline completed"
         );
         append_runtime_log(
             config,
-            &format!("manual image pipeline spawned room={}", trigger.room_id),
+            &format!("manual image pipeline completed room={}", trigger.room_id),
         );
-        return Ok(PipelineOutcome::SummaryProduced);
+        return Ok(if image_sent || options.text_summary_enabled {
+            PipelineOutcome::SummaryProduced
+        } else {
+            PipelineOutcome::NoSummary
+        });
     }
 
     if options.image_gen_enabled {
@@ -2225,6 +3294,7 @@ async fn run_summary_pipeline(
                     )
                     .await
                     .context("sending image failure message")?;
+                return Ok(PipelineOutcome::NoSummary);
             }
         }
     }
@@ -2241,29 +3311,6 @@ async fn run_summary_pipeline(
     Ok(PipelineOutcome::SummaryProduced)
 }
 
-fn spawn_background_image_pipeline(
-    config: AgentConfig,
-    sender: PlatformSender,
-    room_id: String,
-    llm_input: String,
-    chat_messages: Vec<ChatMessage>,
-    text_summary_enabled: bool,
-    image_cooldown_recorder: Option<ImageCooldownRecorder>,
-) {
-    tokio::spawn(async move {
-        run_background_image_pipeline(
-            config,
-            sender,
-            room_id,
-            llm_input,
-            chat_messages,
-            text_summary_enabled,
-            image_cooldown_recorder,
-        )
-        .await;
-    });
-}
-
 async fn run_background_image_pipeline(
     config: AgentConfig,
     sender: PlatformSender,
@@ -2272,7 +3319,7 @@ async fn run_background_image_pipeline(
     chat_messages: Vec<ChatMessage>,
     text_summary_enabled: bool,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
-) {
+) -> bool {
     let result = run_background_image_pipeline_inner(
         &config,
         &sender,
@@ -2313,7 +3360,9 @@ async fn run_background_image_pipeline(
                 "failed to send background image failure message"
             );
         }
+        return false;
     }
+    true
 }
 
 async fn run_background_image_pipeline_inner(
@@ -2583,6 +3632,7 @@ async fn complete_text_summary_with_refusal_retry(
     Ok(retry_result)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_image_summary_with_refusal_retry(
     config: &AgentConfig,
     llm: &OpenAiCompatibleLlm,
@@ -2651,7 +3701,7 @@ async fn complete_image_prompt_with_refusal_retry(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String> {
-    let prompt = complete_llm_with_rate_limit_queue(
+    let prompt = complete_llm_request_logged(
         config,
         llm,
         room_id,
@@ -2669,7 +3719,7 @@ async fn complete_image_prompt_with_refusal_retry(
     log_image_pipeline_refusal_retry(config, room_id, stage, prompt.chars().count());
     let retry_system_prompt = image_pipeline_retry_system_prompt(system_prompt);
     let retry_stage = format!("{stage} safety_retry");
-    let retry_prompt = complete_llm_with_rate_limit_queue(
+    let retry_prompt = complete_llm_request_logged(
         config,
         llm,
         room_id,
@@ -2722,6 +3772,7 @@ fn log_image_pipeline_refusal_retry(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_chat_summary_with_fallback(
     config: &AgentConfig,
     llm: &OpenAiCompatibleLlm,
@@ -2748,7 +3799,7 @@ async fn complete_chat_summary_with_fallback(
                 output_limit.label()
             ),
         );
-        let output = complete_llm_with_rate_limit_queue(
+        let output = complete_llm_request_logged(
             config,
             llm,
             room_id,
@@ -2827,6 +3878,7 @@ async fn complete_chat_summary_with_fallback(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_chunk_requests(
     config: &AgentConfig,
     llm: &OpenAiCompatibleLlm,
@@ -2870,7 +3922,6 @@ async fn complete_chunk_requests(
     }
 
     let mut summaries = vec![None; chunks.len()];
-    let mut rate_limited = Vec::new();
     let mut first_error = None;
     while let Some(joined) = join_set.join_next().await {
         let (chunk, result) = joined.context("joining LLM chunk request task")?;
@@ -2894,29 +3945,6 @@ async fn complete_chunk_requests(
                     message_count: chunk.message_count,
                     output,
                 });
-            }
-            Err(AiError::RateLimited(message)) => {
-                let safe_message = retry_notice_reason(&message, 500);
-                warn!(
-                    room_id = %room_id,
-                    stage,
-                    chunk = chunk.index + 1,
-                    total_chunks = chunks.len(),
-                    error = %safe_message,
-                    "LLM chunk hit rate limit; queueing retry"
-                );
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "llm chunk rate limited room={} stage={} chunk={}/{} error={}",
-                        room_id,
-                        stage,
-                        chunk.index + 1,
-                        chunks.len(),
-                        safe_message
-                    ),
-                );
-                rate_limited.push(chunk);
             }
             Err(error) => {
                 if first_error.is_none() {
@@ -2949,41 +3977,6 @@ async fn complete_chunk_requests(
             .context(format!("calling LLM for {stage} chunk {}", index + 1)));
     }
 
-    rate_limited.sort_by_key(|chunk| chunk.index);
-    for chunk in rate_limited {
-        append_runtime_log(
-            config,
-            &format!(
-                "llm chunk queued retry waiting room={} stage={} chunk={}/{} delay_seconds={}",
-                room_id,
-                stage,
-                chunk.index + 1,
-                chunks.len(),
-                LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS
-            ),
-        );
-        tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS)).await;
-        let output = retry_chunk_after_rate_limit(
-            config,
-            llm,
-            room_id,
-            stage,
-            system_prompt,
-            user_prompt_template,
-            privacy_config,
-            &chunk,
-            chunks.len(),
-            output_limit,
-        )
-        .await?;
-        let output = sanitize_llm_visible_output_with_log(config, room_id, stage, &output);
-        summaries[chunk.index] = Some(ChunkSummary {
-            index: chunk.index,
-            message_count: chunk.message_count,
-            output,
-        });
-    }
-
     summaries
         .into_iter()
         .enumerate()
@@ -2993,6 +3986,7 @@ async fn complete_chunk_requests(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_llm_chunk_request(
     join_set: &mut JoinSet<(LlmChunkRequest, Result<String, AiError>)>,
     config: &AgentConfig,
@@ -3045,72 +4039,7 @@ fn spawn_llm_chunk_request(
     });
 }
 
-async fn retry_chunk_after_rate_limit(
-    config: &AgentConfig,
-    llm: &OpenAiCompatibleLlm,
-    room_id: &str,
-    stage: &str,
-    system_prompt: &str,
-    user_prompt_template: &str,
-    privacy_config: &PrivacyConfig,
-    chunk: &LlmChunkRequest,
-    chunk_total: usize,
-    output_limit: LlmOutputLimit,
-) -> Result<String> {
-    for attempt in 1..=LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS {
-        match complete_llm_chunk_request_with_context_split(
-            config,
-            llm,
-            room_id,
-            stage,
-            system_prompt,
-            user_prompt_template,
-            privacy_config,
-            chunk,
-            chunk_total,
-            output_limit,
-        )
-        .await
-        {
-            Ok(output) => return Ok(output),
-            Err(AiError::RateLimited(message)) if attempt < LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS => {
-                let safe_message = retry_notice_reason(&message, 500);
-                warn!(
-                    room_id = %room_id,
-                    stage,
-                    chunk = chunk.index + 1,
-                    attempt,
-                    max_attempts = LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
-                    delay_seconds = LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
-                    error = %safe_message,
-                    "LLM chunk queued retry stayed rate limited; waiting"
-                );
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "llm chunk queued retry still rate limited room={} stage={} chunk={} attempt={} delay_seconds={} error={}",
-                        room_id,
-                        stage,
-                        chunk.index + 1,
-                        attempt,
-                        LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
-                        safe_message
-                    ),
-                );
-                tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS))
-                    .await;
-            }
-            Err(error) => return Err(anyhow::Error::new(error)),
-        }
-    }
-
-    bail!(
-        "LLM chunk {} for {stage} stayed rate limited after {} queued attempts",
-        chunk.index + 1,
-        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS
-    )
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn complete_llm_chunk_request_with_context_split(
     config: &AgentConfig,
     llm: &OpenAiCompatibleLlm,
@@ -3275,7 +4204,8 @@ fn split_llm_chunk_request(
     Some((left, right))
 }
 
-async fn complete_llm_with_rate_limit_queue(
+#[allow(clippy::too_many_arguments)]
+async fn complete_llm_request_logged(
     config: &AgentConfig,
     llm: &OpenAiCompatibleLlm,
     room_id: &str,
@@ -3287,95 +4217,47 @@ async fn complete_llm_with_rate_limit_queue(
 ) -> Result<String> {
     let system_chars = system_prompt.chars().count();
     let prompt_chars = prompt.chars().count();
-    for attempt in 1..=LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS {
-        append_runtime_log(
-            config,
-            &format!(
-                "llm request started room={} stage={} attempt={}/{} system_chars={} prompt_chars={} output_limit={}",
-                room_id,
-                stage,
-                attempt,
-                LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
-                system_chars,
-                prompt_chars,
-                output_limit.label()
-            ),
-        );
-        let started = Instant::now();
-        let traced_llm = match trace_chunk {
-            Some((chunk_index, chunk_total)) => llm.clone().with_trace_context(
-                ai_trace_context_for_chunk(room_id, stage, chunk_index, chunk_total),
-            ),
-            None => llm
-                .clone()
-                .with_trace_context(ai_trace_context(room_id, stage)),
-        };
-        match complete_llm_request(&traced_llm, system_prompt, &prompt, output_limit).await {
-            Ok(output) => {
-                let output = sanitize_llm_visible_output_with_log(config, room_id, stage, &output);
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "llm request completed room={} stage={} attempt={}/{} elapsed_ms={} output_chars={}",
-                        room_id,
-                        stage,
-                        attempt,
-                        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
-                        started.elapsed().as_millis(),
-                        output.chars().count()
-                    ),
-                );
-                return Ok(output);
-            }
-            Err(AiError::RateLimited(message)) if attempt < LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS => {
-                let safe_message = retry_notice_reason(&message, 500);
-                warn!(
-                    room_id = %room_id,
-                    stage,
-                    attempt,
-                    max_attempts = LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
-                    delay_seconds = LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
-                    error = %safe_message,
-                    "LLM request rate limited; queued retry waiting"
-                );
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "llm request rate limited room={} stage={} attempt={}/{} elapsed_ms={} delay_seconds={} error={}",
-                        room_id,
-                        stage,
-                        attempt,
-                        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
-                        started.elapsed().as_millis(),
-                        LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS,
-                        safe_message
-                    ),
-                );
-                tokio::time::sleep(StdDuration::from_secs(LLM_RATE_LIMIT_QUEUE_DELAY_SECONDS))
-                    .await;
-            }
-            Err(error) => {
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "llm request failed room={} stage={} attempt={}/{} elapsed_ms={} error={}",
-                        room_id,
-                        stage,
-                        attempt,
-                        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS,
-                        started.elapsed().as_millis(),
-                        compact_ai_error_for_runtime(&error)
-                    ),
-                );
-                return Err(anyhow::Error::new(error));
-            }
+    append_runtime_log(
+        config,
+        &format!(
+            "llm request started room={room_id} stage={stage} system_chars={system_chars} prompt_chars={prompt_chars} output_limit={}",
+            output_limit.label()
+        ),
+    );
+    let started = Instant::now();
+    let traced_llm = match trace_chunk {
+        Some((chunk_index, chunk_total)) => llm.clone().with_trace_context(
+            ai_trace_context_for_chunk(room_id, stage, chunk_index, chunk_total),
+        ),
+        None => llm
+            .clone()
+            .with_trace_context(ai_trace_context(room_id, stage)),
+    };
+    match complete_llm_request(&traced_llm, system_prompt, &prompt, output_limit).await {
+        Ok(output) => {
+            let output = sanitize_llm_visible_output_with_log(config, room_id, stage, &output);
+            append_runtime_log(
+                config,
+                &format!(
+                    "llm request completed room={room_id} stage={stage} elapsed_ms={} output_chars={}",
+                    started.elapsed().as_millis(),
+                    output.chars().count()
+                ),
+            );
+            Ok(output)
+        }
+        Err(error) => {
+            append_runtime_log(
+                config,
+                &format!(
+                    "llm request failed room={room_id} stage={stage} elapsed_ms={} error={}",
+                    started.elapsed().as_millis(),
+                    compact_ai_error_for_runtime(&error)
+                ),
+            );
+            Err(anyhow::Error::new(error))
         }
     }
-
-    bail!(
-        "LLM request for {stage} stayed rate limited after {} queued attempts",
-        LLM_RATE_LIMIT_QUEUE_MAX_ATTEMPTS
-    )
 }
 
 async fn complete_llm_request(
@@ -3753,7 +4635,7 @@ async fn send_summary_image_with_sender(
 
 async fn send_image_failure_message(
     config: &AgentConfig,
-    client: &PlatformClient,
+    client: &PlatformWorker,
     room_id: &str,
     error_message: &str,
 ) {
@@ -3785,7 +4667,7 @@ async fn send_image_failure_message(
 
 async fn send_summary_image(
     config: &AgentConfig,
-    client: &PlatformClient,
+    client: &PlatformWorker,
     room_id: &str,
     artifact: &ImageArtifact,
 ) -> Result<()> {
@@ -3801,7 +4683,7 @@ async fn send_summary_image(
 
 async fn send_deferred_summary_text(
     config: &AgentConfig,
-    client: &PlatformClient,
+    client: &PlatformWorker,
     room_id: &str,
     pending_text_reply: &mut Option<String>,
     reason: &str,
@@ -4108,14 +4990,28 @@ fn is_current_trigger_message(
     incoming: &IncomingMessage,
 ) -> bool {
     message.timestamp == incoming.timestamp
-        && message.content.trim() == incoming.content.trim()
-        && (message.sender_id == incoming.sender_id || message.is_self)
+        && (message
+            .stable_id
+            .as_deref()
+            .zip(incoming.stable_id.as_deref())
+            .is_some_and(|(left, right)| stable_ids_match(left, right))
+            || (message.stable_id.is_none()
+                && incoming.stable_id.is_none()
+                && message.content.trim() == incoming.content.trim()
+                && (message.sender_id == incoming.sender_id || message.is_self)))
 }
 
 fn is_current_incoming_message(message: &IncomingMessage, incoming: &IncomingMessage) -> bool {
     message.timestamp == incoming.timestamp
-        && message.content.trim() == incoming.content.trim()
-        && message.sender_id == incoming.sender_id
+        && (message
+            .stable_id
+            .as_deref()
+            .zip(incoming.stable_id.as_deref())
+            .is_some_and(|(left, right)| stable_ids_match(left, right))
+            || (message.stable_id.is_none()
+                && incoming.stable_id.is_none()
+                && message.content.trim() == incoming.content.trim()
+                && message.sender_id == incoming.sender_id))
 }
 
 fn is_agent_status_message(message: &PlatformHistoryMessage) -> bool {
@@ -5176,6 +6072,7 @@ mod tests {
     fn current_trigger_message_matches_self_history_row() {
         let timestamp = Utc.timestamp_opt(1_716_464_700, 0).unwrap();
         let history = PlatformHistoryMessage {
+            stable_id: None,
             timestamp,
             sender_id: "self".to_string(),
             sender_name: Some("我".to_string()),
@@ -5190,6 +6087,7 @@ mod tests {
         let incoming = IncomingMessage {
             room_id: "room@chatroom".to_string(),
             room_name: None,
+            stable_id: None,
             sender_id: "wxid_self".to_string(),
             sender_name: None,
             content: "/总结".to_string(),
@@ -5266,6 +6164,7 @@ mod tests {
     #[test]
     fn detects_agent_status_messages() {
         let message = PlatformHistoryMessage {
+            stable_id: None,
             timestamp: Utc::now(),
             sender_id: "self".into(),
             sender_name: None,
@@ -5284,6 +6183,7 @@ mod tests {
     #[test]
     fn image_caption_source_prefers_decoded_local_path_and_accepts_urls() {
         let mut message = PlatformHistoryMessage {
+            stable_id: None,
             timestamp: Utc::now(),
             sender_id: "u".into(),
             sender_name: None,
@@ -5514,7 +6414,8 @@ mod tests {
         let room = "paper2galgame用户群2";
         let base = Utc.with_ymd_and_hms(2026, 6, 26, 3, 43, 7).unwrap();
         let mut recent = RecentObservedMessages::default();
-        recent.record(&incoming_message(room, "wxid_user", "/总结12h", base), base);
+        let incoming = incoming_message(room, "wxid_user", "/总结12h", base);
+        recent.record(&incoming, base);
         let trigger = TriggerMatch {
             room_id: room.into(),
             trigger_symbol: "/总结".into(),
@@ -5523,11 +6424,13 @@ mod tests {
 
         assert!(recent.has_matching_trigger(
             &trigger,
+            &incoming,
             base + Duration::minutes(13),
             WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS
         ));
         assert!(!recent.has_matching_trigger(
             &trigger,
+            &incoming,
             base + Duration::minutes(31),
             WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS
         ));
@@ -5542,6 +6445,7 @@ mod tests {
         IncomingMessage {
             room_id: room_id.to_string(),
             room_name: Some(room_id.to_string()),
+            stable_id: None,
             sender_id: sender_id.to_string(),
             sender_name: None,
             content: content.to_string(),
@@ -6095,6 +6999,237 @@ mod tests {
     }
 
     #[test]
+    fn wxdb_pagination_scans_all_same_second_messages_past_page_limit() {
+        let messages = (100..=401)
+            .map(|local_id| test_wxdb_history_message(local_id, 1_800_000_000))
+            .collect::<Vec<_>>();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let query_messages = messages.clone();
+        let query_calls = Arc::clone(&calls);
+        let result = paginate_wxdb_history(300, Some(100), move |before_local_id| {
+            query_calls.lock().unwrap().push(before_local_id);
+            let mut page = query_messages
+                .iter()
+                .filter(|message| {
+                    before_local_id
+                        .is_none_or(|before| message.local_id.is_some_and(|id| id < before))
+                })
+                .rev()
+                .take(300)
+                .cloned()
+                .collect::<Vec<_>>();
+            page.sort_by_key(|message| message.local_id);
+            Ok(page)
+        })
+        .unwrap();
+
+        let recovered = result
+            .into_iter()
+            .filter_map(|message| message.local_id)
+            .filter(|local_id| *local_id > 100)
+            .collect::<Vec<_>>();
+        assert_eq!(recovered.len(), 301);
+        assert_eq!(recovered, (101..=401).collect::<Vec<_>>());
+        assert_eq!(*calls.lock().unwrap(), vec![None, Some(102)]);
+    }
+
+    #[test]
+    fn wxdb_watcher_distinguishes_empty_from_disconnected() {
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = WxdbCommandWatcher {
+            receiver: Some(receiver),
+            enabled: true,
+            stop: None,
+            thread: None,
+            state_path: None,
+        };
+        assert!(matches!(watcher.try_recv(), WxdbCommandWatcherRecv::Empty));
+        drop(sender);
+        assert!(matches!(
+            watcher.try_recv(),
+            WxdbCommandWatcherRecv::Disconnected
+        ));
+        assert!(matches!(watcher.try_recv(), WxdbCommandWatcherRecv::Empty));
+    }
+
+    #[test]
+    fn platform_fingerprint_restarts_connections_but_ignores_model_changes() {
+        let mut config = test_config();
+        let base = PlatformConnectionFingerprint::from_config(&config);
+
+        config.image_gen.enabled = !config.image_gen.enabled;
+        assert_eq!(PlatformConnectionFingerprint::from_config(&config), base);
+
+        config.wx4py.command_timeout_seconds += 1;
+        assert_ne!(PlatformConnectionFingerprint::from_config(&config), base);
+    }
+
+    #[test]
+    fn scheduled_backlog_deduplicates_rooms_and_retries_with_backoff() {
+        let now = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let range = ResolvedTimeRange {
+            since: now - Duration::hours(1),
+            until: now,
+            mode: TimeRangeMode::FixedHours,
+        };
+        let mut backlog = ScheduledSummaryBacklog::default();
+        backlog.add_rooms(
+            vec!["room-a".to_string(), "room-b".to_string()],
+            range.clone(),
+            now,
+        );
+        backlog.add_rooms(vec!["room-a".to_string()], range, now);
+        assert_eq!(
+            backlog
+                .requests
+                .iter()
+                .map(|request| request.room_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["room-a", "room-b"]
+        );
+        backlog.record_retry(Instant::now());
+        assert!(!backlog.retry_ready(Instant::now()));
+        backlog.clear_retry();
+        assert!(backlog.retry_ready(Instant::now()));
+    }
+
+    #[test]
+    fn scheduled_backlog_requeues_request_after_state_read_failure() {
+        let now = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let request = ScheduledSummaryRequest {
+            room_id: "room-a".to_string(),
+            range: ResolvedTimeRange {
+                since: now - Duration::hours(1),
+                until: now,
+                mode: TimeRangeMode::FixedHours,
+            },
+            due_at: now,
+        };
+        let expected = request.clone();
+        let mut backlog = ScheduledSummaryBacklog {
+            requests: VecDeque::from([request]),
+            ..Default::default()
+        };
+        let request = backlog.requests.pop_front().unwrap();
+
+        requeue_scheduled_request_after_state_read_failure(&mut backlog, request);
+
+        assert_eq!(backlog.requests.front(), Some(&expected));
+        assert!(backlog.next_retry_at.is_some());
+        assert!(!backlog.retry_ready(Instant::now()));
+    }
+
+    #[test]
+    fn wxdb_watcher_fingerprint_tracks_filter_changes() {
+        let mut config = test_config();
+        let base = WxdbWatcherFingerprint::from_config(&config);
+
+        config.listen.triggers.push("/复盘".to_string());
+        assert_ne!(WxdbWatcherFingerprint::from_config(&config), base);
+
+        config = test_config();
+        config.listen.match_mode = MatchMode::Contains;
+        assert_ne!(WxdbWatcherFingerprint::from_config(&config), base);
+
+        config = test_config();
+        config.listen.content_types.push("image".to_string());
+        assert_ne!(WxdbWatcherFingerprint::from_config(&config), base);
+
+        config = test_config();
+        config.scheduled_summary.range_hours += 1;
+        assert_eq!(WxdbWatcherFingerprint::from_config(&config), base);
+    }
+
+    #[tokio::test]
+    async fn summary_scheduler_enforces_room_and_global_limits() {
+        let mut scheduler = SummaryTaskScheduler::new(1, 1);
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            scheduler.enqueue(
+                "room-a".to_string(),
+                Box::pin(async move {
+                    release_receiver
+                        .await
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                }),
+            ),
+            ScheduleResult::Started
+        );
+        assert_eq!(
+            scheduler.enqueue("room-a".to_string(), Box::pin(async { Ok(()) })),
+            ScheduleResult::DuplicateRoom
+        );
+        assert_eq!(
+            scheduler.enqueue("room-b".to_string(), Box::pin(async { Ok(()) })),
+            ScheduleResult::Queued
+        );
+        assert_eq!(
+            scheduler.enqueue("room-c".to_string(), Box::pin(async { Ok(()) })),
+            ScheduleResult::QueueFull
+        );
+        release_sender.send(()).unwrap();
+        tokio::task::yield_now().await;
+        scheduler.reap(&test_config());
+        assert_eq!(scheduler.pending.len(), 0);
+        assert!(scheduler.in_flight.contains("room-b"));
+    }
+
+    #[tokio::test]
+    async fn summary_scheduler_releases_rooms_after_error_and_panic() {
+        let mut scheduler = SummaryTaskScheduler::new(1, 0);
+        assert_eq!(
+            scheduler.enqueue(
+                "room-error".to_string(),
+                Box::pin(async { Err(anyhow::anyhow!("expected error")) }),
+            ),
+            ScheduleResult::Started
+        );
+        tokio::task::yield_now().await;
+        scheduler.reap(&test_config());
+        assert!(!scheduler.in_flight.contains("room-error"));
+
+        assert_eq!(
+            scheduler.enqueue(
+                "room-panic".to_string(),
+                Box::pin(async { panic!("expected panic") }),
+            ),
+            ScheduleResult::Started
+        );
+        tokio::task::yield_now().await;
+        scheduler.reap(&test_config());
+        assert!(!scheduler.in_flight.contains("room-panic"));
+
+        assert_eq!(
+            scheduler.enqueue("room-after-failure".to_string(), Box::pin(async { Ok(()) })),
+            ScheduleResult::Started
+        );
+    }
+
+    fn test_wxdb_history_message(
+        local_id: i64,
+        timestamp: i64,
+    ) -> wechat_summary_wxdb::HistoryMessage {
+        wechat_summary_wxdb::HistoryMessage {
+            timestamp,
+            time: timestamp.to_string(),
+            sender: "sender".to_string(),
+            content: "/总结".to_string(),
+            msg_type: "text".to_string(),
+            sender_username: None,
+            sender_contact_display: None,
+            sender_group_nickname: None,
+            local_id: Some(local_id),
+            image_md5: None,
+            media_path: None,
+            thumbnail_path: None,
+            media_candidates: Vec::new(),
+            decoded_media_path: None,
+            media_decoder: None,
+            media_decode_error: None,
+        }
+    }
+
+    #[test]
     fn effective_listen_config_includes_discord_channels() {
         let mut config = test_config();
         config.platform.kind = PlatformKindConfig::Discord;
@@ -6105,6 +7240,7 @@ mod tests {
         let message = IncomingMessage {
             room_id: "123456789012345678".to_string(),
             room_name: Some("general".to_string()),
+            stable_id: None,
             sender_id: "user".to_string(),
             sender_name: Some("user".to_string()),
             content: "/总结".to_string(),
@@ -6130,6 +7266,7 @@ mod tests {
         let message = IncomingMessage {
             room_id: "测试群".to_string(),
             room_name: Some("测试群".to_string()),
+            stable_id: None,
             sender_id: "user".to_string(),
             sender_name: Some("user".to_string()),
             content: "/总结".to_string(),
@@ -6236,6 +7373,7 @@ mod tests {
         IncomingMessage {
             room_id: "测试群".to_string(),
             room_name: None,
+            stable_id: None,
             sender_id: "user".to_string(),
             sender_name: None,
             content: content.to_string(),

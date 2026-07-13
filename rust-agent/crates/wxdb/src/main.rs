@@ -31,6 +31,10 @@ enum Command {
         msg_type: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        media_decode_limit: Option<usize>,
+        #[arg(long)]
+        before_local_id: Option<i64>,
     },
     Export {
         chat: String,
@@ -80,18 +84,21 @@ fn main() -> Result<()> {
             until,
             msg_type,
             json,
+            media_decode_limit,
+            before_local_id,
         } => {
             let result = query_history(HistoryQuery {
                 chat_name: chat,
                 since: since.as_deref().map(parse_time).transpose()?,
                 until: until.as_deref().map(parse_time_end).transpose()?,
+                before_local_id,
                 limit,
                 text_only: msg_type.as_deref().map(is_text_type).unwrap_or(false),
                 msg_types: msg_type
                     .as_deref()
                     .map(history_type_filter)
                     .unwrap_or_default(),
-                media_decode_limit: None,
+                media_decode_limit,
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -125,6 +132,7 @@ fn main() -> Result<()> {
                 chat_name: chat,
                 since: since.as_deref().map(parse_time).transpose()?,
                 until: until.as_deref().map(parse_time_end).transpose()?,
+                before_local_id: None,
                 limit,
                 text_only: false,
                 msg_types: Vec::new(),
@@ -140,6 +148,9 @@ fn main() -> Result<()> {
 }
 
 fn parse_time(s: &str) -> Result<chrono::DateTime<Utc>> {
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(value.with_timezone(&Utc));
+    }
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
             return local_to_utc(dt, s);

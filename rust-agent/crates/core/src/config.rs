@@ -128,6 +128,8 @@ pub struct Wx4pyConfig {
     pub sidecar_script: String,
     #[serde(default = "default_wx4py_ready_timeout")]
     pub ready_timeout_seconds: u64,
+    #[serde(default = "default_wx4py_command_timeout")]
+    pub command_timeout_seconds: u64,
     #[serde(default)]
     pub groups: Vec<String>,
     #[serde(default)]
@@ -144,6 +146,7 @@ impl Default for Wx4pyConfig {
             python_executable: default_python_executable(),
             sidecar_script: default_wx4py_sidecar_script(),
             ready_timeout_seconds: default_wx4py_ready_timeout(),
+            command_timeout_seconds: default_wx4py_command_timeout(),
             groups: Vec::new(),
             long_text_delivery: Wx4pyLongTextDelivery::default(),
             long_text_file_min_chunks: default_wx4py_long_text_file_min_chunks(),
@@ -152,17 +155,12 @@ impl Default for Wx4pyConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Wx4pyLongTextDelivery {
+    #[default]
     Chunks,
     File,
-}
-
-impl Default for Wx4pyLongTextDelivery {
-    fn default() -> Self {
-        Self::Chunks
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,6 +318,8 @@ pub struct WxCliConfig {
     #[serde(default)]
     pub cache_dir: String,
     #[serde(default)]
+    pub db_dir: Option<String>,
+    #[serde(default)]
     pub group_name_map: HashMap<String, String>,
 }
 
@@ -333,6 +333,7 @@ impl Default for WxCliConfig {
             history_query_timeout_seconds: default_wx_cli_history_query_timeout_seconds(),
             temp_dir: default_wx_cli_temp_dir(),
             cache_dir: String::new(),
+            db_dir: None,
             group_name_map: HashMap::new(),
         }
     }
@@ -723,6 +724,10 @@ fn default_wx4py_ready_timeout() -> u64 {
     60
 }
 
+fn default_wx4py_command_timeout() -> u64 {
+    30
+}
+
 fn default_wx4py_long_text_file_min_chunks() -> usize {
     3
 }
@@ -1017,7 +1022,7 @@ fn default_max_log_mb() -> u64 {
 }
 
 fn default_ai_trace_enabled() -> bool {
-    true
+    false
 }
 
 #[cfg(test)]
@@ -1155,7 +1160,7 @@ api_key_env = "LLM_API_KEY""#,
         assert_eq!(cfg.wx_cli.executable, "builtin");
         assert_eq!(cfg.history_message_limit(), 10_000);
         assert_eq!(cfg.runtime.max_log_mb, 50);
-        assert!(cfg.runtime.ai_trace_enabled);
+        assert!(!cfg.runtime.ai_trace_enabled);
     }
 
     #[test]

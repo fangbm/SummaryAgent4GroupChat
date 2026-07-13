@@ -25,13 +25,14 @@ use wechat_summary_core::{
     models::IncomingMessage,
     AgentConfig,
 };
-use wx4py_client::{Wx4pyClient, Wx4pyEvent, Wx4pyHistoryMessage, Wx4pySender};
+use wx4py_client::{Wx4pyClient, Wx4pyEvent, Wx4pyHistoryMessage, Wx4pyHistoryReader, Wx4pySender};
 
 const DISCORD_TEXT_LIMIT: usize = 1_900;
 const WX4PY_TEXT_LIMIT: usize = 1_800;
 const WX4PY_TEXT_CHUNK_HEADER_RESERVE: usize = 40;
 const WX4PY_TEXT_CHUNK_BODY_LIMIT: usize = WX4PY_TEXT_LIMIT - WX4PY_TEXT_CHUNK_HEADER_RESERVE;
 
+#[allow(clippy::large_enum_variant)]
 pub enum PlatformClient {
     Wx4py(Wx4pyPlatform),
     Discord(DiscordPlatform),
@@ -44,6 +45,22 @@ pub enum PlatformSender {
         options: Arc<RwLock<Wx4pySendOptions>>,
     },
     Discord(DiscordSender),
+}
+
+#[derive(Clone)]
+pub struct PlatformWorker {
+    kind: PlatformKindConfig,
+    sender: PlatformSender,
+    history: PlatformHistoryWorker,
+}
+
+#[derive(Clone)]
+enum PlatformHistoryWorker {
+    Wx4py(Wx4pyHistoryReader),
+    Discord {
+        http: Arc<Http>,
+        bot_user_id: UserId,
+    },
 }
 
 #[derive(Clone)]
@@ -70,6 +87,12 @@ pub struct DiscordPlatform {
     _gateway_task: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for DiscordPlatform {
+    fn drop(&mut self) {
+        self._gateway_task.abort();
+    }
+}
+
 enum DiscordInbound {
     Event(PlatformEvent),
     Error(String),
@@ -86,17 +109,6 @@ impl PlatformClient {
         }
     }
 
-    pub fn kind(&self) -> PlatformKindConfig {
-        match self {
-            Self::Wx4py(_) => PlatformKindConfig::Wx4py,
-            Self::Discord(_) => PlatformKindConfig::Discord,
-        }
-    }
-
-    pub fn supports(&self, kind: PlatformKindConfig) -> bool {
-        self.kind() == kind
-    }
-
     pub fn configured_rooms(&self, config: &AgentConfig) -> Vec<String> {
         match self {
             Self::Wx4py(_) => wx4py_rooms(config),
@@ -111,14 +123,6 @@ impl PlatformClient {
         }
     }
 
-    pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
-        self.sender().send_text(room_id, text).await
-    }
-
-    pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
-        self.sender().send_image(room_id, image_path).await
-    }
-
     pub fn sender(&self) -> PlatformSender {
         match self {
             Self::Wx4py(platform) => PlatformSender::Wx4py {
@@ -128,6 +132,24 @@ impl PlatformClient {
             Self::Discord(platform) => PlatformSender::Discord(DiscordSender {
                 http: Arc::clone(&platform.http),
             }),
+        }
+    }
+
+    pub fn worker(&self) -> PlatformWorker {
+        match self {
+            Self::Wx4py(platform) => PlatformWorker {
+                kind: PlatformKindConfig::Wx4py,
+                sender: self.sender(),
+                history: PlatformHistoryWorker::Wx4py(platform.client.history_reader()),
+            },
+            Self::Discord(platform) => PlatformWorker {
+                kind: PlatformKindConfig::Discord,
+                sender: self.sender(),
+                history: PlatformHistoryWorker::Discord {
+                    http: Arc::clone(&platform.http),
+                    bot_user_id: platform.bot_user_id,
+                },
+            },
         }
     }
 
@@ -141,30 +163,6 @@ impl PlatformClient {
         }
         Ok(())
     }
-
-    pub async fn query_text_messages(
-        &self,
-        room_id: &str,
-        room_name: Option<&str>,
-        since: DateTime<Utc>,
-        until: DateTime<Utc>,
-        limit: u32,
-        media_decode_limit: Option<usize>,
-    ) -> Result<Vec<PlatformHistoryMessage>> {
-        match self {
-            Self::Wx4py(platform) => platform
-                .client
-                .query_text_messages(room_id, room_name, since, until, limit, media_decode_limit)
-                .await
-                .map(|messages| messages.into_iter().map(Into::into).collect())
-                .map_err(Into::into),
-            Self::Discord(platform) => {
-                platform
-                    .query_text_messages(room_id, since, until, limit)
-                    .await
-            }
-        }
-    }
 }
 
 impl Wx4pyPlatform {
@@ -173,6 +171,60 @@ impl Wx4pyPlatform {
             .client
             .next_event_timeout(timeout)?
             .and_then(PlatformEvent::from_wx4py))
+    }
+}
+
+impl PlatformWorker {
+    pub fn kind(&self) -> PlatformKindConfig {
+        self.kind
+    }
+
+    pub fn supports(&self, kind: PlatformKindConfig) -> bool {
+        self.kind == kind
+    }
+
+    pub fn sender(&self) -> PlatformSender {
+        self.sender.clone()
+    }
+
+    pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
+        self.sender.send_text(room_id, text).await
+    }
+
+    pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
+        self.sender.send_image(room_id, image_path).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_text_messages(
+        &self,
+        room_id: &str,
+        room_name: Option<&str>,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u32,
+        media_decode_limit: Option<usize>,
+        before: Option<&PlatformHistoryCursor>,
+    ) -> Result<Vec<PlatformHistoryMessage>> {
+        match &self.history {
+            PlatformHistoryWorker::Wx4py(reader) => reader
+                .query_text_messages(
+                    room_id,
+                    room_name,
+                    since,
+                    until,
+                    limit,
+                    media_decode_limit,
+                    before.and_then(PlatformHistoryCursor::wxdb_local_id),
+                )
+                .await
+                .map(|messages| messages.into_iter().map(Into::into).collect())
+                .map_err(Into::into),
+            PlatformHistoryWorker::Discord { http, bot_user_id } => {
+                query_discord_history(http, *bot_user_id, room_id, since, until, limit, before)
+                    .await
+            }
+        }
     }
 }
 
@@ -226,79 +278,82 @@ impl DiscordPlatform {
             Err(RecvTimeoutError::Disconnected) => bail!("Discord gateway event channel closed"),
         }
     }
+}
 
-    async fn query_text_messages(
-        &self,
-        room_id: &str,
-        since: DateTime<Utc>,
-        until: DateTime<Utc>,
-        limit: u32,
-    ) -> Result<Vec<PlatformHistoryMessage>> {
-        let channel_id = parse_discord_channel_id(room_id)?;
-        let mut before: Option<MessageId> = None;
-        let mut collected = Vec::new();
-        let max_messages = limit as usize;
+async fn query_discord_history(
+    http: &Http,
+    bot_user_id: UserId,
+    room_id: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    limit: u32,
+    cursor: Option<&PlatformHistoryCursor>,
+) -> Result<Vec<PlatformHistoryMessage>> {
+    let channel_id = parse_discord_channel_id(room_id)?;
+    let mut before = cursor.and_then(PlatformHistoryCursor::discord_message_id);
+    let mut collected = Vec::new();
+    let max_messages = limit as usize;
 
-        while collected.len() < max_messages {
-            let remaining = max_messages.saturating_sub(collected.len());
-            if remaining == 0 {
-                break;
-            }
-
-            let batch_limit = remaining.min(100) as u8;
-            let mut request = GetMessages::new().limit(batch_limit);
-            if let Some(before_id) = before {
-                request = request.before(before_id);
-            }
-
-            let messages = channel_id
-                .messages(&self.http, request)
-                .await
-                .with_context(|| format!("fetching Discord messages from channel {room_id}"))?;
-            if messages.is_empty() {
-                break;
-            }
-
-            let mut reached_before_range = false;
-            for message in &messages {
-                let timestamp = message.timestamp.to_utc();
-                if timestamp > until {
-                    continue;
-                }
-                if timestamp < since {
-                    reached_before_range = true;
-                    continue;
-                }
-
-                let content = discord_message_content(message);
-                if content.trim().is_empty() {
-                    continue;
-                }
-                let media_url = discord_media_attachment_url(message);
-
-                collected.push(PlatformHistoryMessage {
-                    timestamp,
-                    sender_id: message.author.id.to_string(),
-                    sender_name: Some(message.author.name.clone()),
-                    content,
-                    msg_type: discord_message_msg_type(message).to_string(),
-                    media_path: media_url,
-                    decoded_media_path: None,
-                    media_decode_error: None,
-                    thumbnail_path: None,
-                    is_self: message.author.id == self.bot_user_id,
-                });
-            }
-
-            before = messages.last().map(|message| message.id);
-            if reached_before_range || messages.len() < batch_limit as usize {
-                break;
-            }
+    while collected.len() < max_messages {
+        let remaining = max_messages.saturating_sub(collected.len());
+        if remaining == 0 {
+            break;
         }
 
-        collected.sort_by_key(|message| message.timestamp);
-        Ok(collected)
+        let batch_limit = remaining.min(100) as u8;
+        let mut request = GetMessages::new().limit(batch_limit);
+        if let Some(before_id) = before {
+            request = request.before(before_id);
+        }
+
+        let messages = channel_id
+            .messages(http, request)
+            .await
+            .with_context(|| format!("fetching Discord messages from channel {room_id}"))?;
+        if messages.is_empty() {
+            break;
+        }
+
+        let mut reached_before_range = false;
+        for message in &messages {
+            let timestamp = message.timestamp.to_utc();
+            if timestamp > until {
+                continue;
+            }
+            if timestamp < since {
+                reached_before_range = true;
+                continue;
+            }
+
+            let content = discord_message_content(message);
+            if content.trim().is_empty() {
+                continue;
+            }
+            let media_url = discord_media_attachment_url(message);
+
+            collected.push(PlatformHistoryMessage {
+                stable_id: Some(message.id.to_string()),
+                timestamp,
+                sender_id: message.author.id.to_string(),
+                sender_name: Some(message.author.name.clone()),
+                content,
+                msg_type: discord_message_msg_type(message).to_string(),
+                media_path: media_url,
+                decoded_media_path: None,
+                media_decode_error: None,
+                thumbnail_path: None,
+                is_self: message.author.id == bot_user_id,
+            });
+        }
+
+        before = messages.last().map(|message| message.id);
+        if reached_before_range || messages.len() < batch_limit as usize {
+            break;
+        }
     }
+
+    collected.sort_by_key(|message| message.timestamp);
+    Ok(collected)
 }
 
 impl PlatformSender {
@@ -440,6 +495,7 @@ impl EventHandler for DiscordHandler {
             platform: PlatformKindConfig::Discord,
             room_id: message.channel_id.to_string(),
             room_name,
+            stable_id: Some(format!("discord:{}", message.id)),
             sender_id: message.author.id.to_string(),
             sender_name: Some(message.author.name),
             content,
@@ -456,6 +512,7 @@ pub struct PlatformEvent {
     pub platform: PlatformKindConfig,
     pub room_id: String,
     pub room_name: Option<String>,
+    pub stable_id: Option<String>,
     pub sender_id: String,
     pub sender_name: Option<String>,
     pub content: String,
@@ -471,6 +528,7 @@ impl PlatformEvent {
             platform: PlatformKindConfig::Wx4py,
             room_id: event.room_id,
             room_name: event.room_name,
+            stable_id: event.stable_id,
             sender_id: event.sender_id.unwrap_or_else(|| "unknown".to_string()),
             sender_name: event.sender_name,
             content: event.content,
@@ -486,6 +544,7 @@ impl From<PlatformEvent> for IncomingMessage {
         Self {
             room_id: event.room_id,
             room_name: event.room_name,
+            stable_id: event.stable_id,
             sender_id: event.sender_id,
             sender_name: event.sender_name,
             content: event.content,
@@ -498,6 +557,7 @@ impl From<PlatformEvent> for IncomingMessage {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PlatformHistoryMessage {
+    pub stable_id: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub sender_id: String,
     pub sender_name: Option<String>,
@@ -510,9 +570,31 @@ pub struct PlatformHistoryMessage {
     pub is_self: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PlatformHistoryCursor {
+    pub timestamp: DateTime<Utc>,
+    pub stable_id: String,
+}
+
+impl PlatformHistoryCursor {
+    fn wxdb_local_id(&self) -> Option<i64> {
+        self.stable_id.strip_prefix("wxdb:")?.parse().ok()
+    }
+
+    fn discord_message_id(&self) -> Option<MessageId> {
+        self.stable_id
+            .strip_prefix("discord:")
+            .unwrap_or(&self.stable_id)
+            .parse::<u64>()
+            .ok()
+            .map(MessageId::new)
+    }
+}
+
 impl From<Wx4pyHistoryMessage> for PlatformHistoryMessage {
     fn from(message: Wx4pyHistoryMessage) -> Self {
         Self {
+            stable_id: message.local_id.map(|id| format!("wxdb:{id}")),
             timestamp: message.timestamp,
             sender_id: message.sender_id,
             sender_name: message.sender_name,

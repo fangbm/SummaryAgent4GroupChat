@@ -148,7 +148,7 @@ Name: "{group}\Uninstall SummaryAgent4GroupChat"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\SummaryAgent4GroupChat"; Filename: "{app}\SummaryAgent4GroupChat.exe"; Parameters: "--config ""{app}\config\agent.toml"""; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\SummaryAgent4GroupChat.exe"; Parameters: "--config ""{app}\config\agent.toml"""; Description: "Launch SummaryAgent4GroupChat"; Flags: nowait postinstall skipifsilent runascurrentuser
+Filename: "{app}\SummaryAgent4GroupChat.exe"; Parameters: "--config ""{app}\config\agent.toml"""; Description: "Launch SummaryAgent4GroupChat"; Flags: nowait postinstall skipifsilent
 
 [Code]
 procedure StopExistingProcess(ImageName: String);

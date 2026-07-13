@@ -63,10 +63,15 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "README.md") -Destination (Join-Path
 Copy-Item -LiteralPath (Join-Path $RustRoot "README.md") -Destination (Join-Path $PackageDir "README-rust-agent.md")
 Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\deploy-guide.md") -Destination (Join-Path $PackageDir "docs\deploy-guide.md")
 
-$ConfigText = Get-Content -LiteralPath (Join-Path $RustRoot "config\agent.toml") -Raw
+$SourceConfig = Join-Path $RustRoot "config\agent.toml"
+$PackageConfig = Join-Path $PackageDir "config\agent.toml"
+& (Join-Path $PSScriptRoot "sanitize-agent-config.ps1") `
+    -Source $SourceConfig `
+    -Destination $PackageConfig
+$ConfigText = Get-Content -LiteralPath $PackageConfig -Raw
 $ConfigText = $ConfigText -replace 'python_executable\s*=\s*".*"', 'python_executable = ".\\.venv\\Scripts\\python.exe"'
 $ConfigText = $ConfigText -replace 'sidecar_script\s*=\s*".*"', 'sidecar_script = ".\\scripts\\wx4py_sidecar.py"'
-$ConfigText | Set-Content -LiteralPath (Join-Path $PackageDir "config\agent.toml") -Encoding UTF8
+$ConfigText | Set-Content -LiteralPath $PackageConfig -Encoding UTF8
 
 @'
 param(

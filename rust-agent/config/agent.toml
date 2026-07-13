@@ -6,6 +6,7 @@ kind = "wx"
 python_executable = "..\\.venv\\Scripts\\python.exe"
 sidecar_script = "..\\scripts\\wx4py_sidecar.py"
 ready_timeout_seconds = 60
+command_timeout_seconds = 30
 # chunks: send long text as numbered messages.
 # file: when chunk count reaches long_text_file_min_chunks, send one UTF-8 .txt file.
 long_text_delivery = "chunks"
@@ -126,6 +127,7 @@ api_key_env = "LLM_API_KEY"
 base_url_env = "LLM_BASE_URL"
 model_env = "LLM_MODEL"
 timeout_seconds = 120
+# Extra attempts shared by transient 5xx and 429 responses; Retry-After is honored for 429.
 retry_5xx_attempts = 5
 max_output_tokens = 2000
 # Maximum concurrent requests when long chat input is split into multiple LLM chunks.
@@ -493,6 +495,6 @@ log_level = "info"
 cleanup_after_days = 7
 max_log_mb = 50
 # Persist redacted AI HTTP request/response bodies for debugging provider issues.
-ai_trace_enabled = true
+ai_trace_enabled = false
 # Empty means "<output_dir>\\ai-traces".
 ai_trace_dir = ""

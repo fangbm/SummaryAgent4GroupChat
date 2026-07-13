@@ -258,7 +258,7 @@ fn decode_packed_audio_aes_xor(
 fn aes128_ecb_decrypt_pkcs7(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
     use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 
-    if cipher.is_empty() || cipher.len() % 16 != 0 {
+    if cipher.is_empty() || !cipher.len().is_multiple_of(16) {
         bail!("AES 输入长度不是 16 的倍数: {}", cipher.len());
     }
     let aes = aes::Aes128::new(key.into());
@@ -723,8 +723,7 @@ fn find_wechat_pid() -> Option<u32> {
             return None;
         }
         loop {
-            let name =
-                std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8).to_string_lossy();
+            let name = std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr()).to_string_lossy();
             if name.eq_ignore_ascii_case("Weixin.exe") || name.eq_ignore_ascii_case("WeChat.exe") {
                 let pid = entry.th32ProcessID;
                 let _ = CloseHandle(snapshot);
