@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::config;
@@ -53,6 +54,16 @@ static CACHE_FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = Onc
 const CACHE_SNAPSHOTS_PER_DB: usize = 4;
 const STALE_TEMP_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 const CACHE_DISK_SAFETY_BYTES: u64 = 512 * 1024 * 1024;
+const SOURCE_SNAPSHOT_ATTEMPTS: usize = 4;
+const SOURCE_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(150);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceStamp {
+    db_mtime: u64,
+    db_size: u64,
+    wal_mtime: u64,
+    wal_size: u64,
+}
 
 impl DbCache {
     pub fn new(
@@ -95,26 +106,17 @@ impl DbCache {
             return Ok(None);
         }
 
-        let wal_path = wal_path_for(&db_path);
-        let db_mtime = mtime_nanos(&db_path);
-        let wal_mtime = if wal_path.exists() {
-            mtime_nanos(&wal_path)
-        } else {
-            0
-        };
-        let db_size = file_len(&db_path);
-        let wal_size = if wal_path.exists() {
-            file_len(&wal_path)
-        } else {
-            0
-        };
         let enc_key = crypto::hex_to_32bytes(&enc_key_hex)
             .with_context(|| format!("密钥格式错误: {rel_key}"))?;
-        let out_path = self.cache_file_path(rel_key, db_mtime, wal_mtime);
         let cache_lock = cache_file_lock(&db_path);
         let _cache_guard = cache_lock.lock().unwrap();
         cleanup_stale_temp_artifacts(&self.cache_dir);
         self.load_persistent();
+        let wal_path = wal_path_for(&db_path);
+        let source_stamp = source_stamp(&db_path, &wal_path);
+        let db_mtime = source_stamp.db_mtime;
+        let wal_mtime = source_stamp.wal_mtime;
+        let out_path = self.cache_file_path(rel_key, db_mtime, wal_mtime);
         if out_path.exists() {
             if let Err(error) = validate_sqlite_cache(&out_path) {
                 tracing::warn!(
@@ -190,60 +192,33 @@ impl DbCache {
             }
         }
 
-        let tmp_path = out_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-        let decrypt_result = (|| -> Result<()> {
-            ensure_cache_space(
-                &self.cache_dir,
-                db_size
-                    .saturating_add(wal_size)
-                    .saturating_add(CACHE_DISK_SAFETY_BYTES),
-            )?;
-            crypto::full_decrypt(&db_path, &tmp_path, &enc_key)?;
-            apply_wal_to_cached(&wal_path, &tmp_path, &enc_key)?;
-            let latest_db_mtime = mtime_nanos(&db_path);
-            let latest_wal_mtime = if wal_path.exists() {
-                mtime_nanos(&wal_path)
-            } else {
-                0
-            };
-            if let Err(error) = validate_sqlite_cache(&tmp_path) {
-                if latest_db_mtime != db_mtime || latest_wal_mtime != wal_mtime {
-                    bail!(
-                        "源数据库在解密期间发生变化且临时快照不可读，丢弃本次快照并等待下一次重试: {rel_key}: {error:#}"
-                    );
-                }
-                return Err(error).with_context(|| {
-                    format!(
-                        "解密结果不是可读 SQLite 数据库，可能数据库密钥已过期或不匹配: {rel_key}"
-                    )
-                });
-            }
-            publish_temp_cache(&tmp_path, &out_path)?;
-            Ok(())
-        })();
+        let refreshed = self.refresh_from_stable_source(rel_key, &db_path, &wal_path, &enc_key);
 
-        if let Err(error) = decrypt_result {
-            remove_cache_snapshot(&tmp_path);
-            if let Some(entry) = cached {
-                if entry.decrypted_path.exists()
-                    && validate_sqlite_cache(&entry.decrypted_path).is_ok()
-                {
-                    let warning = format!("全量解密失败，降级使用上一份缓存 {rel_key}: {error}");
-                    return Ok(Some(CacheResolve {
-                        path: entry.decrypted_path,
-                        mode: CacheMode::StaleCache,
-                        warning: Some(warning),
-                    }));
+        let (out_path, refreshed_stamp) = match refreshed {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                if let Some(entry) = cached {
+                    if entry.decrypted_path.exists()
+                        && validate_sqlite_cache(&entry.decrypted_path).is_ok()
+                    {
+                        let warning =
+                            format!("全量解密失败，降级使用上一份缓存 {rel_key}: {error}");
+                        return Ok(Some(CacheResolve {
+                            path: entry.decrypted_path,
+                            mode: CacheMode::StaleCache,
+                            warning: Some(warning),
+                        }));
+                    }
                 }
+                return Err(error).with_context(|| format!("解密数据库失败: {rel_key}"));
             }
-            return Err(error).with_context(|| format!("解密数据库失败: {rel_key}"));
-        }
+        };
 
         self.entries.insert(
             rel_key.to_string(),
             CacheEntry {
-                db_mtime,
-                wal_mtime,
+                db_mtime: refreshed_stamp.db_mtime,
+                wal_mtime: refreshed_stamp.wal_mtime,
                 decrypted_path: out_path.clone(),
             },
         );
@@ -254,6 +229,55 @@ impl DbCache {
             mode: CacheMode::FullDecrypt,
             warning: None,
         }))
+    }
+
+    fn refresh_from_stable_source(
+        &self,
+        rel_key: &str,
+        db_path: &Path,
+        wal_path: &Path,
+        enc_key: &[u8; 32],
+    ) -> Result<(PathBuf, SourceStamp)> {
+        let id = uuid::Uuid::new_v4();
+        let hash = cache_file_hash(rel_key);
+        let source_db = self.cache_dir.join(format!("{hash}.source.tmp-{id}"));
+        let source_wal = self.cache_dir.join(format!("{hash}.source-wal.tmp-{id}"));
+        let estimated = source_stamp(db_path, wal_path);
+        let estimated_bytes = estimated.db_size.saturating_add(estimated.wal_size);
+        ensure_cache_space(
+            &self.cache_dir,
+            estimated_bytes
+                .saturating_mul(2)
+                .saturating_add(CACHE_DISK_SAFETY_BYTES),
+        )?;
+        let stamp = match capture_stable_source_snapshot(db_path, wal_path, &source_db, &source_wal)
+        {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                remove_cache_snapshot(&source_db);
+                remove_cache_snapshot(&source_wal);
+                return Err(error);
+            }
+        };
+        let out_path = self.cache_file_path(rel_key, stamp.db_mtime, stamp.wal_mtime);
+        let decrypted_tmp = out_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            crypto::full_decrypt(&source_db, &decrypted_tmp, enc_key)?;
+            apply_wal_to_cached(&source_wal, &decrypted_tmp, enc_key)?;
+            validate_sqlite_cache(&decrypted_tmp).with_context(|| {
+                format!(
+                    "稳定快照解密后不是可读 SQLite 数据库，数据库密钥可能不匹配或微信数据库加密格式已变化: {rel_key}"
+                )
+            })?;
+            publish_temp_cache(&decrypted_tmp, &out_path)
+        })();
+        remove_cache_snapshot(&source_db);
+        remove_cache_snapshot(&source_wal);
+        if result.is_err() {
+            remove_cache_snapshot(&decrypted_tmp);
+        }
+        result?;
+        Ok((out_path, stamp))
     }
 
     fn cache_file_path(&self, rel_key: &str, db_mtime: u64, wal_mtime: u64) -> PathBuf {
@@ -354,16 +378,14 @@ impl DbCache {
             if !db_path.exists() {
                 continue;
             }
-            if mtime_nanos(&db_path) == entry.db_mtime {
-                self.entries.insert(
-                    rel_key,
-                    CacheEntry {
-                        db_mtime: entry.db_mtime,
-                        wal_mtime: entry.wal_mtime,
-                        decrypted_path: path,
-                    },
-                );
-            }
+            self.entries.insert(
+                rel_key,
+                CacheEntry {
+                    db_mtime: entry.db_mtime,
+                    wal_mtime: entry.wal_mtime,
+                    decrypted_path: path,
+                },
+            );
         }
     }
 
@@ -452,6 +474,65 @@ fn apply_wal_to_cached(wal_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> 
 
 fn wal_path_for(db_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}-wal", db_path.display()))
+}
+
+fn source_stamp(db_path: &Path, wal_path: &Path) -> SourceStamp {
+    SourceStamp {
+        db_mtime: mtime_nanos(db_path),
+        db_size: file_len(db_path),
+        wal_mtime: mtime_nanos(wal_path),
+        wal_size: file_len(wal_path),
+    }
+}
+
+fn capture_stable_source_snapshot(
+    db_path: &Path,
+    wal_path: &Path,
+    snapshot_db: &Path,
+    snapshot_wal: &Path,
+) -> Result<SourceStamp> {
+    let mut last_before = source_stamp(db_path, wal_path);
+    let mut last_after = last_before;
+    for attempt in 1..=SOURCE_SNAPSHOT_ATTEMPTS {
+        remove_cache_snapshot(snapshot_db);
+        remove_cache_snapshot(snapshot_wal);
+        let before = source_stamp(db_path, wal_path);
+        fs::copy(db_path, snapshot_db).with_context(|| {
+            format!(
+                "复制微信数据库稳定快照失败: {} -> {}",
+                db_path.display(),
+                snapshot_db.display()
+            )
+        })?;
+        if before.wal_size > 0 && wal_path.exists() {
+            fs::copy(wal_path, snapshot_wal).with_context(|| {
+                format!(
+                    "复制微信 WAL 稳定快照失败: {} -> {}",
+                    wal_path.display(),
+                    snapshot_wal.display()
+                )
+            })?;
+        }
+        let after = source_stamp(db_path, wal_path);
+        let copied_db_size = file_len(snapshot_db);
+        let copied_wal_size = file_len(snapshot_wal);
+        if before == after && copied_db_size == before.db_size && copied_wal_size == before.wal_size
+        {
+            return Ok(before);
+        }
+        last_before = before;
+        last_after = after;
+        if attempt < SOURCE_SNAPSHOT_ATTEMPTS {
+            thread::sleep(SOURCE_SNAPSHOT_RETRY_DELAY * attempt as u32);
+        }
+    }
+    remove_cache_snapshot(snapshot_db);
+    remove_cache_snapshot(snapshot_wal);
+    bail!(
+        "微信数据库持续写入，{} 次尝试仍无法取得稳定快照: db={} before={last_before:?} after={last_after:?}",
+        SOURCE_SNAPSHOT_ATTEMPTS,
+        db_path.display()
+    )
 }
 
 fn mtime_nanos(path: &Path) -> u64 {
@@ -549,6 +630,10 @@ fn available_space(_path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wxdb-cache-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
     #[test]
     fn cache_snapshot_matcher_accepts_versioned_and_legacy_db_files() {
         let hash = "170fb82914dc74888c50bb22f0798c60";
@@ -569,5 +654,61 @@ mod tests {
             Path::new("923f080775be265c49f979fda84c0cb6-1-2.db"),
             hash
         ));
+    }
+
+    #[test]
+    fn captures_stable_database_and_wal_snapshot() {
+        let root = test_root("stable-source");
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("message_0.db");
+        let wal = root.join("message_0.db-wal");
+        let snapshot_db = root.join("snapshot.tmp-test");
+        let snapshot_wal = root.join("snapshot-wal.tmp-test");
+        fs::write(&db, b"encrypted database").unwrap();
+        fs::write(&wal, b"encrypted wal").unwrap();
+
+        let stamp = capture_stable_source_snapshot(&db, &wal, &snapshot_db, &snapshot_wal).unwrap();
+
+        assert_eq!(stamp.db_size, 18);
+        assert_eq!(stamp.wal_size, 13);
+        assert_eq!(fs::read(&snapshot_db).unwrap(), b"encrypted database");
+        assert_eq!(fs::read(&snapshot_wal).unwrap(), b"encrypted wal");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persistent_cache_remains_available_after_source_mtime_changes() {
+        let root = test_root("stale-fallback");
+        let db_dir = root.join("db");
+        let message_dir = db_dir.join("message");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&message_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        let source_db = message_dir.join("message_0.db");
+        fs::write(&source_db, b"new encrypted source").unwrap();
+        let cached_db = cache_dir.join("previous.db");
+        {
+            let connection = Connection::open(&cached_db).unwrap();
+            connection
+                .execute("CREATE TABLE messages (id INTEGER)", [])
+                .unwrap();
+        }
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let saved = serde_json::json!({
+            "message/message_0.db": {
+                "db_mtime": 1,
+                "wal_mtime": 2,
+                "path": cached_db.to_string_lossy()
+            }
+        });
+        fs::write(&mtime_file, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let keys = HashMap::from([("message/message_0.db".to_string(), "00".repeat(32))]);
+
+        let cache = DbCache::new(db_dir, cache_dir, mtime_file, keys).unwrap();
+
+        let entry = cache.entries.get("message/message_0.db").unwrap();
+        assert_eq!(entry.decrypted_path, cached_db);
+        assert_ne!(entry.db_mtime, mtime_nanos(&source_db));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -240,6 +240,7 @@ fn should_retry_store_query_error(error: &anyhow::Error) -> bool {
         return false;
     }
     error.contains("源数据库在解密期间发生变化")
+        || error.contains("微信数据库持续写入")
         || error.contains("file is not a database")
         || error.contains("File opened that is not a database file")
         || error.contains("解密结果不是可读 SQLite 数据库")
@@ -2211,6 +2212,13 @@ mod tests {
             "微信数据库读取不完整：以下消息分片缺少数据库密钥"
         ));
         assert!(!is_missing_db_key_error("打开 contact.db 失败"));
+    }
+
+    #[test]
+    fn retries_when_a_stable_source_snapshot_cannot_be_captured() {
+        let error = anyhow::anyhow!("微信数据库持续写入，4 次尝试仍无法取得稳定快照");
+
+        assert!(should_retry_store_query_error(&error));
     }
 
     #[test]
