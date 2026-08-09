@@ -901,7 +901,7 @@ fn default_image_caption_max_images() -> usize {
 }
 
 fn default_image_caption_max_concurrent_requests() -> usize {
-    4
+    10
 }
 
 fn default_video_caption_max_videos() -> usize {
@@ -1122,7 +1122,7 @@ api_key_env = "LLM_API_KEY""#,
         assert!(!image_caption.enabled);
         assert_eq!(image_caption.model_env, "IMAGE_CAPTION_MODEL");
         assert_eq!(image_caption.retry_5xx_attempts, 5);
-        assert_eq!(image_caption.max_concurrent_requests, 4);
+        assert_eq!(image_caption.max_concurrent_requests, 10);
         assert!(image_caption.user_prompt.contains("转述"));
         assert!(!voice_transcription.enabled);
         assert_eq!(voice_transcription.model_env, "VOICE_TRANSCRIPTION_MODEL");

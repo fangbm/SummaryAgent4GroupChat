@@ -236,41 +236,125 @@ impl OpenAiCompatibleLlm {
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
-        let retry_budget = RetryBudget::new();
-        for attempt in 1..=max_attempts {
-            let trace_id = Uuid::new_v4();
-            let started = Instant::now();
-            info!(
-                trace_id = %trace_id,
-                base_url = %self.base_url,
-                model = %self.model,
-                system_chars = system_prompt.chars().count(),
-                user_chars = user_content.chars().count(),
-                max_tokens = ?max_tokens,
-                timeout_seconds = self.config.timeout_seconds,
-                attempt,
-                max_attempts,
-                "LLM chat completion request started"
-            );
-            let response = match self
-                .client
-                .post(&endpoint)
-                .bearer_auth(&self.api_key)
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    let elapsed_ms = started.elapsed().as_millis();
-                    let retry = attempt < max_attempts
-                        && should_retry_http_transport_error(&error)
-                        && retry_budget.allows(http_retry_delay_ms(attempt));
-                    let retry_after_ms = if retry {
-                        http_retry_delay_ms(attempt)
+        let mut thinking_fallback_used = false;
+        'request_variants: loop {
+            let retry_budget = RetryBudget::new();
+            for attempt in 1..=max_attempts {
+                let trace_id = Uuid::new_v4();
+                let started = Instant::now();
+                info!(
+                    trace_id = %trace_id,
+                    base_url = %self.base_url,
+                    model = %self.model,
+                    system_chars = system_prompt.chars().count(),
+                    user_chars = user_content.chars().count(),
+                    max_tokens = ?max_tokens,
+                    timeout_seconds = self.config.timeout_seconds,
+                    attempt,
+                    max_attempts,
+                    thinking_fallback = thinking_fallback_used,
+                    "LLM chat completion request started"
+                );
+                let response = match self
+                    .client
+                    .post(&endpoint)
+                    .bearer_auth(&self.api_key)
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let elapsed_ms = started.elapsed().as_millis();
+                        let retry = attempt < max_attempts
+                            && should_retry_http_transport_error(&error)
+                            && retry_budget.allows(http_retry_delay_ms(attempt));
+                        let retry_after_ms = if retry {
+                            http_retry_delay_ms(attempt)
+                        } else {
+                            0
+                        };
+                        self.write_http_trace(AiHttpTrace {
+                            trace_id,
+                            operation: "llm_chat_completion",
+                            context: self.trace_context.as_ref(),
+                            method: "POST",
+                            endpoint: &endpoint,
+                            model: Some(&self.model),
+                            attempt,
+                            max_attempts,
+                            elapsed_ms,
+                            status: None,
+                            retry,
+                            retry_after_ms,
+                            max_tokens,
+                            request_body: Some(&payload),
+                            response_body: None,
+                            error: Some(&error.to_string()),
+                        });
+                        warn!(
+                            trace_id = %trace_id,
+                            elapsed_ms,
+                            attempt,
+                            max_attempts,
+                            retry,
+                            retry_after_ms,
+                            error = %error,
+                            "LLM chat completion transport failed"
+                        );
+                        if retry {
+                            notify_retry(
+                                &self.retry_notifier,
+                                "LLM chat completion",
+                                attempt,
+                                max_attempts,
+                                retry_after_ms,
+                                retry_reason_from_transport_error(&error),
+                            )
+                            .await;
+                            sleep(http_retry_delay(attempt)).await;
+                            continue;
+                        }
+                        return Err(AiError::Http(error));
+                    }
+                };
+                let status = response.status();
+                let server_retry_after_ms =
+                    retry_after_ms_from_headers(response.headers(), Utc::now());
+                let elapsed_ms = started.elapsed().as_millis();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_else(|error| {
+                        format!("failed to read error response body: {error}")
+                    });
+                    let snippet = truncate_for_log(&body, 500);
+                    let response_for_log = full_response_for_log(&body);
+                    let retry_candidate = attempt < max_attempts
+                        && should_retry_chat_completion_failure(status, &snippet)
+                        && retry_budget.allows(http_retry_delay_ms_for_status(
+                            status,
+                            attempt,
+                            server_retry_after_ms,
+                        ));
+                    let retry_delay_ms = if retry_candidate {
+                        http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
                     } else {
                         0
                     };
+                    let retry_after_ms = if retry_candidate {
+                        wait_before_status_retry(
+                            "LLM chat completion",
+                            status,
+                            attempt,
+                            max_attempts,
+                            &retry_budget,
+                            retry_delay_ms,
+                        )
+                        .await
+                        .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let retry = retry_after_ms > 0;
                     self.write_http_trace(AiHttpTrace {
                         trace_id,
                         operation: "llm_chat_completion",
@@ -281,23 +365,24 @@ impl OpenAiCompatibleLlm {
                         attempt,
                         max_attempts,
                         elapsed_ms,
-                        status: None,
+                        status: Some(status.as_u16()),
                         retry,
                         retry_after_ms,
                         max_tokens,
                         request_body: Some(&payload),
-                        response_body: None,
-                        error: Some(&error.to_string()),
+                        response_body: Some(&body),
+                        error: None,
                     });
                     warn!(
                         trace_id = %trace_id,
+                        status = %status,
                         elapsed_ms,
                         attempt,
                         max_attempts,
                         retry,
                         retry_after_ms,
-                        error = %error,
-                        "LLM chat completion transport failed"
+                        response = %response_for_log,
+                        "LLM chat completion request failed"
                     );
                     if retry {
                         notify_retry(
@@ -306,52 +391,103 @@ impl OpenAiCompatibleLlm {
                             attempt,
                             max_attempts,
                             retry_after_ms,
-                            retry_reason_from_transport_error(&error),
+                            retry_reason_from_status(status, &snippet),
                         )
                         .await;
-                        sleep(http_retry_delay(attempt)).await;
                         continue;
                     }
-                    return Err(AiError::Http(error));
+                    let message =
+                        format!("chat completion API returned {status}: {response_for_log}");
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        return Err(AiError::RateLimited(message));
+                    }
+                    return Err(AiError::InvalidResponse(message));
                 }
-            };
-            let status = response.status();
-            let server_retry_after_ms = retry_after_ms_from_headers(response.headers(), Utc::now());
-            let elapsed_ms = started.elapsed().as_millis();
-            if !status.is_success() {
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-                let snippet = truncate_for_log(&body, 500);
-                let response_for_log = full_response_for_log(&body);
-                let retry_candidate = attempt < max_attempts
-                    && should_retry_chat_completion_failure(status, &snippet)
-                    && retry_budget.allows(http_retry_delay_ms_for_status(
-                        status,
-                        attempt,
-                        server_retry_after_ms,
-                    ));
-                let retry_delay_ms = if retry_candidate {
-                    http_retry_delay_ms_for_status(status, attempt, server_retry_after_ms)
-                } else {
-                    0
+                info!(
+                    trace_id = %trace_id,
+                    status = %status,
+                    elapsed_ms,
+                    attempt,
+                    max_attempts,
+                    "LLM chat completion HTTP request completed"
+                );
+
+                let body = response.text().await?;
+                let response = match serde_json::from_str::<Value>(&body) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.write_http_trace(AiHttpTrace {
+                            trace_id,
+                            operation: "llm_chat_completion",
+                            context: self.trace_context.as_ref(),
+                            method: "POST",
+                            endpoint: &endpoint,
+                            model: Some(&self.model),
+                            attempt,
+                            max_attempts,
+                            elapsed_ms,
+                            status: Some(status.as_u16()),
+                            retry: false,
+                            retry_after_ms: 0,
+                            max_tokens,
+                            request_body: Some(&payload),
+                            response_body: Some(&body),
+                            error: None,
+                        });
+                        let response_for_log = full_response_for_log(&body);
+                        warn!(
+                            trace_id = %trace_id,
+                            elapsed_ms,
+                            response = %response_for_log,
+                            "LLM chat completion JSON parsing failed"
+                        );
+                        return Err(AiError::InvalidResponse(format!(
+                            "invalid chat completion JSON: {error}; response={response_for_log}"
+                        )));
+                    }
                 };
-                let retry_after_ms = if retry_candidate {
-                    wait_before_status_retry(
-                        "LLM chat completion",
-                        status,
+                let Some(content) = extract_chat_completion_content(&response) else {
+                    let finish_reason = chat_completion_finish_reason(&response);
+                    let retry_without_thinking = !thinking_fallback_used
+                        && should_retry_empty_length_completion_without_thinking(
+                            &payload, &response,
+                        );
+                    self.write_http_trace(AiHttpTrace {
+                        trace_id,
+                        operation: "llm_chat_completion",
+                        context: self.trace_context.as_ref(),
+                        method: "POST",
+                        endpoint: &endpoint,
+                        model: Some(&self.model),
                         attempt,
                         max_attempts,
-                        &retry_budget,
-                        retry_delay_ms,
-                    )
-                    .await
-                    .unwrap_or(0)
-                } else {
-                    0
+                        elapsed_ms,
+                        status: Some(status.as_u16()),
+                        retry: retry_without_thinking,
+                        retry_after_ms: 0,
+                        max_tokens,
+                        request_body: Some(&payload),
+                        response_body: Some(&body),
+                        error: None,
+                    });
+                    let response_for_log = full_response_for_log(&response.to_string());
+                    warn!(
+                        trace_id = %trace_id,
+                        finish_reason = %finish_reason,
+                        retry = retry_without_thinking,
+                        fallback = if retry_without_thinking { "thinking_disabled" } else { "none" },
+                        response = %response_for_log,
+                        "LLM chat completion response is missing content"
+                    );
+                    if retry_without_thinking {
+                        disable_chat_completion_thinking(&mut payload);
+                        thinking_fallback_used = true;
+                        continue 'request_variants;
+                    }
+                    return Err(AiError::InvalidResponse(format!(
+                    "missing chat completion content (finish_reason={finish_reason}); response={response_for_log}"
+                )));
                 };
-                let retry = retry_after_ms > 0;
                 self.write_http_trace(AiHttpTrace {
                     trace_id,
                     operation: "llm_chat_completion",
@@ -363,104 +499,23 @@ impl OpenAiCompatibleLlm {
                     max_attempts,
                     elapsed_ms,
                     status: Some(status.as_u16()),
-                    retry,
-                    retry_after_ms,
+                    retry: false,
+                    retry_after_ms: 0,
                     max_tokens,
                     request_body: Some(&payload),
                     response_body: Some(&body),
                     error: None,
                 });
-                warn!(
+                info!(
                     trace_id = %trace_id,
-                    status = %status,
-                    elapsed_ms,
-                    attempt,
-                    max_attempts,
-                    retry,
-                    retry_after_ms,
-                    response = %response_for_log,
-                    "LLM chat completion request failed"
+                    output_chars = content.chars().count(),
+                    "LLM chat completion response parsed"
                 );
-                if retry {
-                    notify_retry(
-                        &self.retry_notifier,
-                        "LLM chat completion",
-                        attempt,
-                        max_attempts,
-                        retry_after_ms,
-                        retry_reason_from_status(status, &snippet),
-                    )
-                    .await;
-                    continue;
-                }
-                let message = format!("chat completion API returned {status}: {response_for_log}");
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    return Err(AiError::RateLimited(message));
-                }
-                return Err(AiError::InvalidResponse(message));
+                return Ok(content);
             }
-            info!(
-                trace_id = %trace_id,
-                status = %status,
-                elapsed_ms,
-                attempt,
-                max_attempts,
-                "LLM chat completion HTTP request completed"
-            );
 
-            let body = response.text().await?;
-            self.write_http_trace(AiHttpTrace {
-                trace_id,
-                operation: "llm_chat_completion",
-                context: self.trace_context.as_ref(),
-                method: "POST",
-                endpoint: &endpoint,
-                model: Some(&self.model),
-                attempt,
-                max_attempts,
-                elapsed_ms,
-                status: Some(status.as_u16()),
-                retry: false,
-                retry_after_ms: 0,
-                max_tokens,
-                request_body: Some(&payload),
-                response_body: Some(&body),
-                error: None,
-            });
-            let response = serde_json::from_str::<Value>(&body).map_err(|error| {
-                let response_for_log = full_response_for_log(&body);
-                warn!(
-                    trace_id = %trace_id,
-                    elapsed_ms,
-                    response = %response_for_log,
-                    "LLM chat completion JSON parsing failed"
-                );
-                AiError::InvalidResponse(format!(
-                    "invalid chat completion JSON: {error}; response={response_for_log}"
-                ))
-            })?;
-            let content = extract_chat_completion_content(&response).ok_or_else(|| {
-                let finish_reason = chat_completion_finish_reason(&response);
-                let response_for_log = full_response_for_log(&response.to_string());
-                warn!(
-                    trace_id = %trace_id,
-                    finish_reason = %finish_reason,
-                    response = %response_for_log,
-                    "LLM chat completion response is missing content"
-                );
-                AiError::InvalidResponse(format!(
-                    "missing chat completion content (finish_reason={finish_reason}); response={response_for_log}"
-                ))
-            })?;
-            info!(
-                trace_id = %trace_id,
-                output_chars = content.chars().count(),
-                "LLM chat completion response parsed"
-            );
-            return Ok(content);
+            unreachable!("chat completion retry loop always returns")
         }
-
-        unreachable!("chat completion retry loop always returns")
     }
 
     fn write_http_trace(&self, trace: AiHttpTrace<'_>) {
@@ -3798,6 +3853,39 @@ fn chat_completion_finish_reason(response: &Value) -> String {
         .to_string()
 }
 
+fn should_retry_empty_length_completion_without_thinking(
+    payload: &Value,
+    response: &Value,
+) -> bool {
+    extract_chat_completion_content(response).is_none()
+        && chat_completion_finish_reason(response).eq_ignore_ascii_case("length")
+        && chat_completion_thinking_enabled(payload)
+}
+
+fn chat_completion_thinking_enabled(payload: &Value) -> bool {
+    payload
+        .pointer("/thinking/type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("enabled"))
+        || payload
+            .get("enable_thinking")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn disable_chat_completion_thinking(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("thinking") {
+        object.insert("thinking".into(), json!({ "type": "disabled" }));
+    }
+    if object.contains_key("enable_thinking") {
+        object.insert("enable_thinking".into(), Value::Bool(false));
+    }
+    object.remove("reasoning_effort");
+}
+
 fn apimart_task_status(value: &Value) -> String {
     data_entries(value)
         .into_iter()
@@ -4865,6 +4953,46 @@ data: {"type":"transcript.text.delta","delta":"文字"}
         });
 
         assert_eq!(extract_chat_completion_content(&response).as_deref(), None);
+    }
+
+    #[test]
+    fn empty_length_completion_with_thinking_enabled_uses_non_thinking_fallback() {
+        let mut payload = json!({
+            "model": "step-3.7-flash",
+            "thinking": { "type": "enabled" },
+            "reasoning_effort": "low"
+        });
+        let response = json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "content": "", "reasoning": "still thinking" }
+            }]
+        });
+
+        assert!(should_retry_empty_length_completion_without_thinking(
+            &payload, &response
+        ));
+        disable_chat_completion_thinking(&mut payload);
+        assert_eq!(payload["thinking"]["type"], "disabled");
+        assert!(payload.get("reasoning_effort").is_none());
+        assert!(!should_retry_empty_length_completion_without_thinking(
+            &payload, &response
+        ));
+    }
+
+    #[test]
+    fn empty_length_completion_without_explicit_thinking_is_not_retried() {
+        let payload = json!({ "model": "plain-model" });
+        let response = json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "content": "" }
+            }]
+        });
+
+        assert!(!should_retry_empty_length_completion_without_thinking(
+            &payload, &response
+        ));
     }
 
     #[test]
