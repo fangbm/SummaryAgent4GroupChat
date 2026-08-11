@@ -194,13 +194,6 @@ pub fn query_history_with_config(
         }
     }
 
-    if !config.explicit_db_dir && !missing_key_store_errors.is_empty() {
-        anyhow::bail!(format_store_query_failure(
-            &errors,
-            &missing_key_store_errors
-        ));
-    }
-
     if !config.explicit_db_dir && successful_stores > 1 {
         anyhow::bail!(
             "微信数据库查询存在多个可读账号目录，无法确认群聊所属账号；请在 Agent 配置的 [wxdb].db_dir 中显式选择账号目录"
