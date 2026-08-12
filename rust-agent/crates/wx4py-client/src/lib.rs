@@ -1295,7 +1295,7 @@ impl Wx4pyTransport {
             | SidecarCommand::SendFile { request_id, .. } => request_id.clone(),
         };
         let (sender, receiver) = mpsc::channel();
-        {
+        let pending_commands = {
             let mut pending = self
                 .pending
                 .lock()
@@ -1306,7 +1306,8 @@ impl Wx4pyTransport {
                 ));
             }
             pending.insert(request_id.clone(), sender);
-        }
+            pending.len()
+        };
         let write_result = (|| -> Result<()> {
             if self.closed.load(Ordering::Acquire) {
                 return Err(Wx4pyError::Sidecar(
@@ -1332,8 +1333,22 @@ impl Wx4pyTransport {
                 .map(|mut waiters| waiters.remove(&request_id));
             return Err(error);
         }
-        receive_command_ack(receiver, &self.pending, &request_id, self.command_timeout)
+        let timeout = queue_aware_command_timeout(self.command_timeout, pending_commands);
+        tracing::debug!(
+            request_id,
+            pending_commands,
+            timeout_seconds = timeout.as_secs(),
+            "waiting for wx4py command ACK"
+        );
+        receive_command_ack(receiver, &self.pending, &request_id, timeout)
     }
+}
+
+fn queue_aware_command_timeout(base_timeout: StdDuration, pending_commands: usize) -> StdDuration {
+    let multiplier = pending_commands.max(1).min(u32::MAX as usize) as u32;
+    base_timeout
+        .checked_mul(multiplier)
+        .unwrap_or(StdDuration::MAX)
 }
 
 fn receive_command_ack(
@@ -2195,6 +2210,16 @@ mod tests {
             &pending,
             &events,
         ));
+    }
+
+    #[test]
+    fn queue_aware_command_timeout_scales_with_pending_commands() {
+        let base = StdDuration::from_secs(30);
+        assert_eq!(queue_aware_command_timeout(base, 0), base);
+        assert_eq!(
+            queue_aware_command_timeout(base, 3),
+            StdDuration::from_secs(90)
+        );
     }
 
     #[test]

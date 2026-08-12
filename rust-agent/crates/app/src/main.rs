@@ -2740,10 +2740,23 @@ async fn run_summary_pipeline(
     }
 
     if options.send_progress {
-        client
+        if let Err(error) = client
             .send_text(&trigger.room_id, progress_message(options))
             .await
-            .context("sending progress message")?;
+        {
+            warn!(
+                room_id = %trigger.room_id,
+                error = %error,
+                "progress message delivery failed; continuing summary pipeline"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "progress message delivery failed room={} action=continue error={error:#}",
+                    trigger.room_id
+                ),
+            );
+        }
     }
 
     if cloud_blocked(config, &trigger.room_id) {
