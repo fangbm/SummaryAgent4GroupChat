@@ -4054,6 +4054,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -4864,6 +4865,21 @@ dependencies = [
  "wechat-summary-core",
  "wechat-summary-storage",
  "wx4py-client",
+]
+
+[[package]]
+name = "wechat-summary-control"
+version = "0.1.4"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "uuid",
+ "wechat-summary-core",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

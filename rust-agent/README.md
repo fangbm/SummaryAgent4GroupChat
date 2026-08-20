@@ -9,6 +9,7 @@ It does not import or modify the existing Python packages under `../src`.
 crates/app/          # CLI entrypoint and runtime wiring
 crates/app/src/platform.rs
                     # platform adapter boundary; wx4py and Discord implementations
+crates/control/      # current-user Named Pipe control service for the WinUI shell
 crates/core/         # config, models, trigger matching, formatting, privacy switches
 crates/wx4py-client/# wx4py sidecar and wxdb history adapter
 crates/ai/           # OpenAI-compatible LLM and image clients
@@ -159,3 +160,8 @@ cargo run -p wechat-summary-app -- --config config\agent.toml
 The real wx4py runtime requires Windows WeChat to be logged in. Configure `[wx4py].groups`
 with WeChat group display names. Install a compatible external history provider separately and
 configure its command or absolute path in `[wxdb].executable`; this repository does not bundle it.
+
+`wechat-summary-control` is a local, single-user control service used by the WinUI
+application. It owns the main agent process, validates and atomically writes TOML
+configuration, redacts secrets in output, and exposes only a fixed set of privileged
+maintenance actions. It is not intended to be exposed over the network.

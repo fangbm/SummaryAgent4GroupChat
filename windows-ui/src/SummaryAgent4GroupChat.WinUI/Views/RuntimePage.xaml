@@ -1,0 +1,24 @@
+<Page
+    x:Class="SummaryAgent4GroupChat.WinUI.Views.RuntimePage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid Padding="28" RowSpacing="14">
+        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+        <StackPanel Spacing="4">
+            <TextBlock Text="运行信息" Style="{ThemeResource TitleTextBlockStyle}" />
+            <TextBlock Text="终端与文件日志彼此独立滚动；输出由 Rust 控制层统一脱敏。" Opacity="0.72" />
+        </StackPanel>
+        <Border Grid.Row="1" Style="{StaticResource StatusCard}">
+            <Grid RowSpacing="8"><Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock Text="终端" Style="{ThemeResource SubtitleTextBlockStyle}" /><CheckBox Content="跟随最新" IsChecked="{Binding FollowTerminal, Mode=TwoWay}" /><Button Content="清空" Click="ClearTerminal_Click" /></StackPanel>
+                <ScrollViewer x:Name="TerminalScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="TerminalBlock" Text="{Binding TerminalText}" FontFamily="Cascadia Mono" TextWrapping="Wrap" SizeChanged="TerminalBlock_SizeChanged" /></ScrollViewer>
+            </Grid>
+        </Border>
+        <Border Grid.Row="2" Style="{StaticResource StatusCard}">
+            <Grid RowSpacing="8"><Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock Text="日志" Style="{ThemeResource SubtitleTextBlockStyle}" /><CheckBox Content="跟随最新" IsChecked="{Binding FollowLogs, Mode=TwoWay}" /><Button Content="清空" Click="ClearLogs_Click" /><Button Content="打开日志" Click="OpenLogs_Click" /></StackPanel>
+                <ScrollViewer x:Name="LogScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="LogBlock" Text="{Binding LogText}" FontFamily="Cascadia Mono" TextWrapping="Wrap" SizeChanged="LogBlock_SizeChanged" /></ScrollViewer>
+            </Grid>
+        </Border>
+    </Grid>
+</Page>

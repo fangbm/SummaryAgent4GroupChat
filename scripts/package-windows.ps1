@@ -7,6 +7,8 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $RustRoot = Join-Path $RepoRoot "rust-agent"
+$WinUiProject = Join-Path $RepoRoot "windows-ui\src\SummaryAgent4GroupChat.WinUI\SummaryAgent4GroupChat.WinUI.csproj"
+$WinUiPublishDir = Join-Path $RepoRoot ".artifacts\winui-publish"
 if ([string]::IsNullOrWhiteSpace($OutDir)) {
     $OutDir = Join-Path $RepoRoot "dist"
 }
@@ -14,19 +16,28 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 if (-not $SkipBuild) {
     Push-Location $RustRoot
     try {
-        cargo build --release -p wechat-summary-app -p wechat-summary-gui
+        cargo build --release -p wechat-summary-app -p wechat-summary-control -p wechat-summary-gui
     }
     finally {
         Pop-Location
     }
 }
 
+if (-not $SkipBuild) {
+    if (Test-Path -LiteralPath $WinUiPublishDir) {
+        Remove-Item -LiteralPath $WinUiPublishDir -Recurse -Force
+    }
+    dotnet publish $WinUiProject -c Release -r win-x64 --self-contained true -p:Platform=x64 -o $WinUiPublishDir
+}
+
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $RustRoot "target" }
 $ReleaseDir = Join-Path $TargetDir "release"
 $AppExe = Join-Path $ReleaseDir "wechat-summary-app.exe"
 $GuiExe = Join-Path $ReleaseDir "wechat-summary-gui.exe"
+$ControlExe = Join-Path $ReleaseDir "wechat-summary-control.exe"
+$WinUiExe = Join-Path $WinUiPublishDir "SummaryAgent4GroupChat.exe"
 
-foreach ($required in @($AppExe, $GuiExe)) {
+foreach ($required in @($AppExe, $GuiExe, $ControlExe, $WinUiExe)) {
     if (-not (Test-Path $required)) {
         throw "Missing build artifact: $required"
     }
@@ -53,8 +64,9 @@ New-Item -ItemType Directory -Force -Path `
     (Join-Path $PackageDir "runtime") | Out-Null
 
 Copy-Item -LiteralPath $AppExe -Destination (Join-Path $PackageDir "bin\wechat-summary-app.exe")
-Copy-Item -LiteralPath $GuiExe -Destination (Join-Path $PackageDir "bin\wechat-summary-gui.exe")
-Copy-Item -LiteralPath $GuiExe -Destination (Join-Path $PackageDir "SummaryAgent4GroupChat.exe")
+Copy-Item -LiteralPath $ControlExe -Destination (Join-Path $PackageDir "bin\wechat-summary-control.exe")
+Copy-Item -LiteralPath $GuiExe -Destination (Join-Path $PackageDir "bin\SummaryAgent4GroupChat.Legacy.exe")
+Copy-Item -Path (Join-Path $WinUiPublishDir "*") -Destination $PackageDir -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\wx4py_sidecar.py") -Destination (Join-Path $PackageDir "scripts\wx4py_sidecar.py")
 Copy-Item -LiteralPath (Join-Path $RepoRoot ".env.example") -Destination (Join-Path $PackageDir ".env.example")
 Copy-Item -LiteralPath (Join-Path $RepoRoot "README.md") -Destination (Join-Path $PackageDir "README-project.md")
@@ -155,7 +167,13 @@ separated key list, or fill `api_keys` in `config\agent.toml`. Add
 The package does not include a database reader. Install and configure a compatible external history provider separately, then set `[wxdb].executable` to its path.
 "@ | Set-Content -LiteralPath (Join-Path $PackageDir "README.md") -Encoding UTF8
 
-Compress-Archive -Path (Join-Path $PackageDir "*") -DestinationPath $ZipPath -Force
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    $PackageDir,
+    $ZipPath,
+    [System.IO.Compression.CompressionLevel]::Optimal,
+    $false
+)
 
 Write-Host "Package directory: $PackageDir"
 Write-Host "Package archive:   $ZipPath"

@@ -141,14 +141,12 @@ Source: "{#PayloadDir}\config\agent.toml"; DestDir: "{app}\config"; Flags: ignor
 
 [Icons]
 Name: "{group}\Manage SummaryAgent4GroupChat"; Filename: "{app}\SummaryAgent4GroupChat.exe"; Parameters: "--config ""{app}\config\agent.toml"""; WorkingDir: "{app}"
-Name: "{group}\Start SummaryAgent4GroupChat"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\start.ps1"""; WorkingDir: "{app}"
-Name: "{group}\Install WeChat Runtime"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"""; WorkingDir: "{app}"
 Name: "{group}\Configure SummaryAgent4GroupChat"; Filename: "{sys}\notepad.exe"; Parameters: """{app}\config\agent.toml"""; WorkingDir: "{app}"
 Name: "{group}\Uninstall SummaryAgent4GroupChat"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\SummaryAgent4GroupChat"; Filename: "{app}\SummaryAgent4GroupChat.exe"; Parameters: "--config ""{app}\config\agent.toml"""; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\SummaryAgent4GroupChat.exe"; Parameters: "--config ""{app}\config\agent.toml"""; Description: "Launch SummaryAgent4GroupChat"; Flags: nowait postinstall skipifsilent shellexec; Verb: "runas"
+Filename: "{app}\SummaryAgent4GroupChat.exe"; Parameters: "--config ""{app}\config\agent.toml"""; Description: "Launch SummaryAgent4GroupChat"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
 procedure StopExistingProcess(ImageName: String);
@@ -164,6 +162,8 @@ begin
   begin
     StopExistingProcess('wechat-summary-app.exe');
     StopExistingProcess('wechat-summary-gui.exe');
+    StopExistingProcess('wechat-summary-control.exe');
+    StopExistingProcess('SummaryAgent4GroupChat.Legacy.exe');
     StopExistingProcess('SummaryAgent4GroupChat.exe');
   end;
 end;

@@ -16,3 +16,8 @@ rust-agent/wx4py_send_audit.jsonl
 *.egg-info/
 .deps/
 rust-agent/target/
+.artifacts/
+.nuget-packages/
+.nuget-http-cache/
+windows-ui/**/bin/
+windows-ui/**/obj/

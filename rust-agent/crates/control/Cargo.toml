@@ -1,0 +1,17 @@
+[package]
+name = "wechat-summary-control"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
+windows-sys.workspace = true
+wechat-summary-core = { path = "../core" }
