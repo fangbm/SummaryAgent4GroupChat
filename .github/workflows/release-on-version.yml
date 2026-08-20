@@ -1,0 +1,102 @@
+name: Release on Version Change
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - rust-agent/Cargo.toml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect workspace version change
+        id: version
+        shell: pwsh
+        run: |
+          function Get-WorkspaceVersion([string]$content) {
+            $match = [regex]::Match(
+              $content,
+              '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"\s*$'
+            )
+            if (-not $match.Success) {
+              throw 'Could not find [workspace.package].version in rust-agent/Cargo.toml'
+            }
+            return $match.Groups[1].Value
+          }
+
+          $current = Get-WorkspaceVersion (Get-Content rust-agent/Cargo.toml -Raw -Encoding UTF8)
+          $before = '${{ github.event.before }}'
+          $previous = ''
+          if ($before -and $before -notmatch '^0+$') {
+            $previousContent = git show "${before}:rust-agent/Cargo.toml" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $previous = Get-WorkspaceVersion ($previousContent -join "`n")
+            }
+          }
+
+          if ($previous -eq $current) {
+            "changed=false" >> $env:GITHUB_OUTPUT
+            Write-Host "Workspace version remains $current; release is not needed."
+            exit 0
+          }
+
+          "changed=true" >> $env:GITHUB_OUTPUT
+          "version=$current" >> $env:GITHUB_OUTPUT
+          "tag=v$current" >> $env:GITHUB_OUTPUT
+          Write-Host "Workspace version changed from '$previous' to '$current'."
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.version.outputs.changed == 'true'
+        with:
+          toolchain: stable
+
+      - name: Install Inno Setup
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build Windows installer
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        run: .\scripts\package-windows-installer.ps1
+
+      - name: Locate release assets
+        if: steps.version.outputs.changed == 'true'
+        id: assets
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist -File -Filter 'SummaryAgent4GroupChat-Inno-Setup-windows-x64-*.exe' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          $archive = Get-ChildItem dist -File -Filter 'SummaryAgent4GroupChat-windows-x64-*.zip' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $installer -or -not $archive) {
+            throw 'The installer build did not produce both expected release assets.'
+          }
+          "installer=$($installer.FullName)" >> $env:GITHUB_OUTPUT
+          "archive=$($archive.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        if: steps.version.outputs.changed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          INSTALLER: ${{ steps.assets.outputs.installer }}
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
+        run: |
+          $header = "Automated release for workspace version $env:RELEASE_VERSION."
+          gh release create $env:RELEASE_TAG $env:INSTALLER $env:ARCHIVE `
+            --title "SummaryAgent4GroupChat $env:RELEASE_TAG" `
+            --notes $header `
+            --generate-notes
