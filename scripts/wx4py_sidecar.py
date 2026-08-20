@@ -68,8 +68,79 @@ def diag_log(message: str) -> None:
         pass
 
 
+SEARCH_INPUT_PATCHED = False
+
+
+def patch_wx4py_search_input() -> None:
+    """Replace wx4py's per-character SendKeys search input with clipboard paste.
+
+    wx4py types search keywords one Unicode char at a time via SendInput
+    (KEYEVENTF_UNICODE). Mixed ASCII/Chinese names with fullwidth punctuation
+    (e.g. "paper2galgame种子用户群（旮旯版）") are reliably mangled or partially
+    dropped by the WeChat 4.x search box, so open_chat/search never finds the
+    room even though the same keyword typed manually finds it. wx4py already
+    pastes chat messages through the clipboard because that is far more reliable
+    on WeChat; reuse that exact path for the search box.
+    """
+    global SEARCH_INPUT_PATCHED
+    if SEARCH_INPUT_PATCHED:
+        return
+    SEARCH_INPUT_PATCHED = True
+    try:
+        from wx4py.features import chat as wx4py_chat
+    except Exception as exc:  # pragma: no cover
+        diag_log(f"search input patch unavailable: {type(exc).__name__}: {exc}")
+        return
+
+    def input_search_via_clipboard(self: Any, keyword: str) -> bool:
+        try:
+            search_edit = self._get_search_edit(retries=wx4py_chat.SEARCH_RETRY_COUNT)
+            if not search_edit:
+                diag_log("clipboard search failed: search box not found")
+                return False
+
+            # Focus the search box the same way wx4py's original does.
+            try:
+                search_edit.Click(simulateMove=False)
+            except Exception:
+                try:
+                    search_edit.SetFocus()
+                except Exception:
+                    pass
+            try:
+                self.root.SendKeys("{Ctrl}f")
+                time.sleep(0.3)
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+            prepared = wx4py_chat.ChatWindow.prepare_input_for_paste(search_edit)
+            if prepared is None:
+                diag_log("clipboard search failed: could not prepare search box")
+                return False
+            if not wx4py_chat.ChatWindow.paste_text_into_focused_input(
+                keyword,
+                log_error="clipboard search paste failed",
+            ):
+                diag_log("clipboard search failed: paste rejected")
+                return False
+
+            time.sleep(1.0)  # let WeChat settle the search results
+            return True
+        except Exception as exc:
+            diag_log(f"clipboard search failed: {type(exc).__name__}: {exc}")
+            return False
+
+    if not hasattr(wx4py_chat.ChatWindow, "_input_search"):
+        diag_log("search input patch skipped: wx4py ChatWindow has no _input_search")
+        return
+    wx4py_chat.ChatWindow._input_search = input_search_via_clipboard
+    diag_log("wx4py search input patched to clipboard paste")
+
+
 class Wx4pySidecar:
     def __init__(self, groups: list[str], ready_timeout_seconds: int):
+        patch_wx4py_search_input()
         self.groups = groups
         self.ready_timeout_seconds = ready_timeout_seconds
         self.client = WeChatClient(auto_connect=False)

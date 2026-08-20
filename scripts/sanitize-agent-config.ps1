@@ -32,7 +32,7 @@ $singleQuotedSensitiveKeyPattern = "'(?:''|[^'])*(?:$sensitiveMarkerPattern)(?:'
 $sensitiveKeyPattern = "(?:$bareSensitiveKeyPattern|$doubleQuotedSensitiveKeyPattern|$singleQuotedSensitiveKeyPattern)"
 
 $output = [System.Collections.Generic.List[string]]::new()
-foreach ($line in Get-Content -LiteralPath $Source) {
+foreach ($line in Get-Content -LiteralPath $Source -Encoding UTF8) {
     if ($line -match '^\s*#') {
         $output.Add($line)
         continue
@@ -85,4 +85,7 @@ $parent = Split-Path -Parent $Destination
 if ($parent) {
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
 }
-$sanitized | Set-Content -LiteralPath $Destination -Encoding UTF8
+# Write UTF-8 without BOM so TOML parsers and later Get-Content reads stay
+# encoding-independent on both Windows PowerShell 5.1 and PowerShell 7.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($Destination, $sanitized, $utf8NoBom)

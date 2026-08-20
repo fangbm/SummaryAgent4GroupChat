@@ -1,9 +1,13 @@
 use std::{
+    collections::{HashMap, HashSet},
     env, fs,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex, OnceLock, Weak,
+    },
     time::Duration,
 };
 
@@ -14,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -137,11 +141,219 @@ pub struct AiTraceContext {
     pub item_total: Option<usize>,
 }
 
+/// A shared pool of API keys with per-key concurrency caps.
+///
+/// Requests call [`ApiKeyPool::acquire`] to grab a key permit. The permit is held
+/// for the whole request (including its retry loop) and released on drop, so the
+/// per-key cap is enforced across the whole process even when many summary tasks
+/// run in parallel. Keys are picked round-robin so load spreads across accounts;
+/// when every key is busy the caller waits for the first candidate key.
+#[derive(Debug)]
+pub struct ApiKeyPool {
+    slots: Vec<Arc<ApiKeySlot>>,
+    next: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct ApiKeySlot {
+    key: Arc<str>,
+    semaphore: Option<Arc<Semaphore>>,
+}
+
+/// A granted key slot. Dropping it releases the per-key concurrency permit.
+#[derive(Debug)]
+pub struct ApiKeyPermit {
+    key_index: usize,
+    key: Arc<str>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ApiKeyPermit {
+    pub fn key_index(&self) -> usize {
+        self.key_index
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl ApiKeyPool {
+    /// Build a pool from raw keys. `max_concurrent_per_key == 0` means unlimited
+    /// (round-robin distribution only, no per-key gating).
+    pub fn from_keys(keys: Vec<String>, max_concurrent_per_key: usize) -> Self {
+        let mut seen = HashSet::new();
+        let slots = keys
+            .into_iter()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty() && seen.insert(key.clone()))
+            .map(|key| {
+                Arc::new(ApiKeySlot {
+                    key: Arc::from(key.as_str()),
+                    semaphore: (max_concurrent_per_key > 0)
+                        .then(|| Arc::new(Semaphore::new(max_concurrent_per_key))),
+                })
+            })
+            .collect();
+        Self {
+            slots,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn keys(&self) -> Vec<&str> {
+        self.slots.iter().map(|slot| slot.key.as_ref()).collect()
+    }
+
+    pub async fn acquire(&self) -> ApiKeyPermit {
+        if self.slots.is_empty() {
+            return ApiKeyPermit {
+                key_index: 0,
+                key: Arc::from(""),
+                _permit: None,
+            };
+        }
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        for offset in 0..self.slots.len() {
+            let index = (start + offset) % self.slots.len();
+            let slot = &self.slots[index];
+            if let Some(semaphore) = &slot.semaphore {
+                if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                    return ApiKeyPermit {
+                        key_index: index,
+                        key: Arc::clone(&slot.key),
+                        _permit: Some(permit),
+                    };
+                }
+            } else {
+                return ApiKeyPermit {
+                    key_index: index,
+                    key: Arc::clone(&slot.key),
+                    _permit: None,
+                };
+            }
+        }
+        let slot = &self.slots[start];
+        let permit = Arc::clone(slot.semaphore.as_ref().expect("slot has a semaphore"))
+            .acquire_owned()
+            .await
+            .expect("key pool semaphore is never closed");
+        ApiKeyPermit {
+            key_index: start,
+            key: Arc::clone(&slot.key),
+            _permit: Some(permit),
+        }
+    }
+}
+
+static KEY_POOL_REGISTRY: OnceLock<StdMutex<HashMap<String, Weak<ApiKeyPool>>>> = OnceLock::new();
+
+/// Get-or-create the process-wide pool for a resolved key set. Clients built from
+/// the same credentials share one pool so per-key concurrency caps are global.
+fn shared_key_pool(keys: Vec<String>, max_concurrent_per_key: usize) -> Arc<ApiKeyPool> {
+    let fingerprint = key_pool_fingerprint(&keys, max_concurrent_per_key);
+    let registry = KEY_POOL_REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()));
+    {
+        let guard = registry.lock().unwrap();
+        if let Some(pool) = guard.get(&fingerprint).and_then(Weak::upgrade) {
+            return pool;
+        }
+    }
+    let pool = Arc::new(ApiKeyPool::from_keys(keys, max_concurrent_per_key));
+    registry
+        .lock()
+        .unwrap()
+        .insert(fingerprint, Arc::downgrade(&pool));
+    pool
+}
+
+/// Stable hash of the (deduped, order-insensitive) key set plus the per-key cap.
+/// Used only as a registry key; never logged or exposed.
+fn key_pool_fingerprint(keys: &[String], max_concurrent_per_key: usize) -> String {
+    let mut sorted = keys
+        .iter()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    sorted.sort();
+    sorted.dedup();
+    let mut hasher = Sha256::new();
+    for key in &sorted {
+        hasher.update(key.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(max_concurrent_per_key.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Resolve the API key list for one client section.
+///
+/// Priority: explicit `api_keys` list, then `api_key` (may be comma/newline
+/// separated), then `api_keys_env` (optional env var, may be comma/newline
+/// separated), then `api_key_env`. Errors only when no key resolves at all.
+fn resolve_api_keys(
+    api_keys: &[String],
+    api_key: Option<&str>,
+    api_keys_env: &str,
+    api_key_env: &str,
+    purpose: &'static str,
+) -> Result<Vec<String>, AiError> {
+    let mut keys = split_api_key_list(&api_keys.join("\n"));
+    if keys.is_empty() {
+        if let Some(value) = api_key.map(str::trim).filter(|value| !value.is_empty()) {
+            keys = split_api_key_list(value);
+        }
+    }
+    if keys.is_empty() {
+        let env_name = api_keys_env.trim();
+        if !env_name.is_empty() {
+            if let Some(direct) = direct_value_in_env_field(env_name, purpose) {
+                keys = split_api_key_list(&direct);
+            } else if let Ok(value) = env::var(env_name) {
+                keys = split_api_key_list(&value);
+            } else {
+                warn!(
+                    env = %env_name,
+                    purpose,
+                    "multi-key environment variable configured but not set; falling back to single-key resolution"
+                );
+            }
+        }
+    }
+    if keys.is_empty() {
+        keys = match direct_value_in_env_field(api_key_env, purpose) {
+            Some(direct) => split_api_key_list(&direct),
+            None => split_api_key_list(&env_var(api_key_env, purpose)?),
+        };
+    }
+    if keys.is_empty() {
+        return Err(missing_api_key(api_key_env));
+    }
+    Ok(keys)
+}
+
+fn split_api_key_list(value: &str) -> Vec<String> {
+    value
+        .split([',', '\n', '\r', ';'])
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct OpenAiCompatibleLlm {
     config: LlmConfig,
     client: reqwest::Client,
-    api_key: String,
+    key_pool: Arc<ApiKeyPool>,
     base_url: String,
     model: String,
     retry_notifier: Option<RetryNotifier>,
@@ -151,12 +363,13 @@ pub struct OpenAiCompatibleLlm {
 
 impl OpenAiCompatibleLlm {
     pub fn new(config: LlmConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
-        let api_key = config_value_or_env(
+        let keys = resolve_api_keys(
+            &config.api_keys,
             config.api_key.as_deref(),
+            &config.api_keys_env,
             &config.api_key_env,
             "LLM API key",
-        )
-        .map_err(|_| missing_api_key(&config.api_key_env))?;
+        )?;
         let base_url = config_value_or_env(
             config.base_url.as_deref(),
             &config.base_url_env,
@@ -165,10 +378,11 @@ impl OpenAiCompatibleLlm {
         let model =
             config_value_or_env(config.model.as_deref(), &config.model_env, "LLM model name")?;
         let client = http_client(config.timeout_seconds, proxy)?;
+        let max_concurrent_per_key = config.max_concurrent_per_key;
         Ok(Self {
             config,
             client,
-            api_key,
+            key_pool: shared_key_pool(keys, max_concurrent_per_key),
             base_url,
             model,
             retry_notifier: None,
@@ -237,6 +451,8 @@ impl OpenAiCompatibleLlm {
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         let mut thinking_fallback_used = false;
+        let permit = self.key_pool.acquire().await;
+        let key_index = permit.key_index();
         'request_variants: loop {
             let retry_budget = RetryBudget::new();
             for attempt in 1..=max_attempts {
@@ -246,6 +462,8 @@ impl OpenAiCompatibleLlm {
                     trace_id = %trace_id,
                     base_url = %self.base_url,
                     model = %self.model,
+                    key_index,
+                    key_count = self.key_pool.len(),
                     system_chars = system_prompt.chars().count(),
                     user_chars = user_content.chars().count(),
                     max_tokens = ?max_tokens,
@@ -258,7 +476,7 @@ impl OpenAiCompatibleLlm {
                 let response = match self
                     .client
                     .post(&endpoint)
-                    .bearer_auth(&self.api_key)
+                    .bearer_auth(permit.key())
                     .json(&payload)
                     .send()
                     .await
@@ -624,7 +842,7 @@ fn write_optional_ai_http_trace(trace_dir: &Option<PathBuf>, trace: AiHttpTrace<
 pub struct OpenAiVisionCaptionClient {
     config: ImageCaptionConfig,
     client: reqwest::Client,
-    api_key: String,
+    key_pool: Arc<ApiKeyPool>,
     base_url: String,
     model: String,
     retry_notifier: Option<RetryNotifier>,
@@ -634,12 +852,13 @@ pub struct OpenAiVisionCaptionClient {
 
 impl OpenAiVisionCaptionClient {
     pub fn new(config: ImageCaptionConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
-        let api_key = config_value_or_env(
+        let keys = resolve_api_keys(
+            &config.api_keys,
             config.api_key.as_deref(),
+            &config.api_keys_env,
             &config.api_key_env,
             "image caption API key",
-        )
-        .map_err(|_| missing_api_key(&config.api_key_env))?;
+        )?;
         let base_url = config_value_or_env(
             config.base_url.as_deref(),
             &config.base_url_env,
@@ -651,10 +870,11 @@ impl OpenAiVisionCaptionClient {
             "image caption model name",
         )?;
         let client = http_client(config.timeout_seconds, proxy)?;
+        let max_concurrent_per_key = config.max_concurrent_per_key;
         Ok(Self {
             config,
             client,
-            api_key,
+            key_pool: shared_key_pool(keys, max_concurrent_per_key),
             base_url,
             model,
             retry_notifier: None,
@@ -844,6 +1064,8 @@ impl OpenAiVisionCaptionClient {
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let permit = self.key_pool.acquire().await;
+        let key_index = permit.key_index();
         let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
@@ -852,6 +1074,8 @@ impl OpenAiVisionCaptionClient {
                 trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
+                key_index,
+                key_count = self.key_pool.len(),
                 prompt_chars = self.config.user_prompt.chars().count(),
                 max_tokens = self.config.max_output_tokens,
                 timeout_seconds = self.config.timeout_seconds,
@@ -863,7 +1087,7 @@ impl OpenAiVisionCaptionClient {
             let response = match self
                 .client
                 .post(&endpoint)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(permit.key())
                 .json(&payload)
                 .send()
                 .await
@@ -1077,7 +1301,7 @@ impl OpenAiVisionCaptionClient {
 pub struct OpenAiAudioTranscriptionClient {
     config: VoiceTranscriptionConfig,
     client: reqwest::Client,
-    api_key: String,
+    key_pool: Arc<ApiKeyPool>,
     base_url: String,
     model: String,
     trace_dir: Option<PathBuf>,
@@ -1088,7 +1312,7 @@ pub struct OpenAiAudioTranscriptionClient {
 pub struct OpenAiVideoCaptionClient {
     config: VideoCaptionConfig,
     client: reqwest::Client,
-    api_key: String,
+    key_pool: Arc<ApiKeyPool>,
     base_url: String,
     model: String,
     trace_dir: Option<PathBuf>,
@@ -1097,12 +1321,13 @@ pub struct OpenAiVideoCaptionClient {
 
 impl OpenAiVideoCaptionClient {
     pub fn new(config: VideoCaptionConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
-        let api_key = config_value_or_env(
+        let keys = resolve_api_keys(
+            &config.api_keys,
             config.api_key.as_deref(),
+            &config.api_keys_env,
             &config.api_key_env,
             "video caption API key",
-        )
-        .map_err(|_| missing_api_key(&config.api_key_env))?;
+        )?;
         let base_url = config_value_or_env(
             config.base_url.as_deref(),
             &config.base_url_env,
@@ -1114,10 +1339,11 @@ impl OpenAiVideoCaptionClient {
             "video caption model name",
         )?;
         let client = http_client(config.timeout_seconds, proxy)?;
+        let max_concurrent_per_key = config.max_concurrent_per_key;
         Ok(Self {
             config,
             client,
-            api_key,
+            key_pool: shared_key_pool(keys, max_concurrent_per_key),
             base_url,
             model,
             trace_dir: None,
@@ -1283,6 +1509,8 @@ impl OpenAiVideoCaptionClient {
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let permit = self.key_pool.acquire().await;
+        let key_index = permit.key_index();
         let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
@@ -1291,6 +1519,8 @@ impl OpenAiVideoCaptionClient {
                 trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
+                key_index,
+                key_count = self.key_pool.len(),
                 prompt_chars = self.config.user_prompt.chars().count(),
                 max_tokens = self.config.max_output_tokens,
                 timeout_seconds = self.config.timeout_seconds,
@@ -1302,7 +1532,7 @@ impl OpenAiVideoCaptionClient {
             let response = match self
                 .client
                 .post(&endpoint)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(permit.key())
                 .json(&payload)
                 .send()
                 .await
@@ -1496,12 +1726,13 @@ impl OpenAiVideoCaptionClient {
 
 impl OpenAiAudioTranscriptionClient {
     pub fn new(config: VoiceTranscriptionConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
-        let api_key = config_value_or_env(
+        let keys = resolve_api_keys(
+            &config.api_keys,
             config.api_key.as_deref(),
+            &config.api_keys_env,
             &config.api_key_env,
             "voice transcription API key",
-        )
-        .map_err(|_| missing_api_key(&config.api_key_env))?;
+        )?;
         let base_url = config_value_or_env(
             config.base_url.as_deref(),
             &config.base_url_env,
@@ -1513,10 +1744,11 @@ impl OpenAiAudioTranscriptionClient {
             "voice transcription model name",
         )?;
         let client = http_client(config.timeout_seconds, proxy)?;
+        let max_concurrent_per_key = config.max_concurrent_per_key;
         Ok(Self {
             config,
             client,
-            api_key,
+            key_pool: shared_key_pool(keys, max_concurrent_per_key),
             base_url,
             model,
             trace_dir: None,
@@ -1549,6 +1781,8 @@ impl OpenAiAudioTranscriptionClient {
 
         let endpoint = audio_transcriptions_endpoint(&self.base_url);
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let permit = self.key_pool.acquire().await;
+        let key_index = permit.key_index();
         let retry_budget = RetryBudget::new();
 
         for attempt in 1..=max_attempts {
@@ -1590,6 +1824,8 @@ impl OpenAiAudioTranscriptionClient {
                 trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
+                key_index,
+                key_count = self.key_pool.len(),
                 file = %file_name,
                 bytes = bytes.len(),
                 timeout_seconds = self.config.timeout_seconds,
@@ -1600,7 +1836,7 @@ impl OpenAiAudioTranscriptionClient {
             let response = match self
                 .client
                 .post(&endpoint)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(permit.key())
                 .multipart(form)
                 .send()
                 .await
@@ -1785,6 +2021,8 @@ impl OpenAiAudioTranscriptionClient {
         let endpoint = stepfun_asr_endpoint(&self.base_url);
         let payload = stepfun_asr_payload(&self.model, &self.config, path, &bytes)?;
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let permit = self.key_pool.acquire().await;
+        let key_index = permit.key_index();
         let retry_budget = RetryBudget::new();
 
         for attempt in 1..=max_attempts {
@@ -1794,6 +2032,8 @@ impl OpenAiAudioTranscriptionClient {
                 trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
+                key_index,
+                key_count = self.key_pool.len(),
                 file = %file_name,
                 bytes = bytes.len(),
                 timeout_seconds = self.config.timeout_seconds,
@@ -1804,7 +2044,7 @@ impl OpenAiAudioTranscriptionClient {
             let response = match self
                 .client
                 .post(&endpoint)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(permit.key())
                 .header(ACCEPT, "text/event-stream")
                 .header(CONTENT_TYPE, "application/json")
                 .json(&payload)
@@ -2823,7 +3063,7 @@ fn merge_json_override(target: &mut Value, override_value: Value) {
 pub struct OpenAiImageClient {
     config: ImageGenConfig,
     client: reqwest::Client,
-    api_key: String,
+    key_pool: Arc<ApiKeyPool>,
     base_url: String,
     model: String,
     retry_notifier: Option<RetryNotifier>,
@@ -2833,12 +3073,13 @@ pub struct OpenAiImageClient {
 
 impl OpenAiImageClient {
     pub fn new(config: ImageGenConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
-        let api_key = config_value_or_env(
+        let keys = resolve_api_keys(
+            &config.api_keys,
             config.api_key.as_deref(),
+            &config.api_keys_env,
             &config.api_key_env,
             "image API key",
-        )
-        .map_err(|_| missing_api_key(&config.api_key_env))?;
+        )?;
         let base_url = config_value_or_env(
             config.base_url.as_deref(),
             &config.base_url_env,
@@ -2850,10 +3091,11 @@ impl OpenAiImageClient {
             "image model name",
         )?;
         let client = http_client(config.timeout_seconds, proxy)?;
+        let max_concurrent_per_key = config.max_concurrent_per_key;
         Ok(Self {
             config,
             client,
-            api_key,
+            key_pool: shared_key_pool(keys, max_concurrent_per_key),
             base_url,
             model,
             retry_notifier: None,
@@ -2900,6 +3142,8 @@ impl OpenAiImageClient {
         let payload = self.image_generation_payload(prompt);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
+        let permit = self.key_pool.acquire().await;
+        let key_index = permit.key_index();
         let retry_budget = RetryBudget::new();
         for attempt in 1..=max_attempts {
             let trace_id = Uuid::new_v4();
@@ -2908,6 +3152,8 @@ impl OpenAiImageClient {
                 trace_id = %trace_id,
                 base_url = %self.base_url,
                 model = %self.model,
+                key_index,
+                key_count = self.key_pool.len(),
                 prompt_chars = prompt.chars().count(),
                 size = %self.config.size,
                 quality = ?self.config.quality,
@@ -2920,7 +3166,7 @@ impl OpenAiImageClient {
             let response = match self
                 .client
                 .post(&endpoint)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(permit.key())
                 .json(&payload)
                 .send()
                 .await
@@ -3110,7 +3356,9 @@ impl OpenAiImageClient {
                     "invalid image generation JSON: {error}; response={response_for_log}"
                 ))
             })?;
-            let bytes = self.image_bytes_from_generation_response(response).await?;
+            let bytes = self
+                .image_bytes_from_generation_response(response, permit.key())
+                .await?;
             return self.write_image(output_dir, &bytes);
         }
 
@@ -3153,6 +3401,7 @@ impl OpenAiImageClient {
     async fn image_bytes_from_generation_response(
         &self,
         response: Value,
+        api_key: &str,
     ) -> Result<Vec<u8>, AiError> {
         if let Some(image) = direct_image_data(&response) {
             info!("image generation returned direct image data");
@@ -3160,14 +3409,14 @@ impl OpenAiImageClient {
         }
         if let Some(task_id) = apimart_task_id(&response) {
             info!(task_id = %task_id, "image generation task accepted; polling started");
-            return self.poll_apimart_task(&task_id).await;
+            return self.poll_apimart_task(&task_id, api_key).await;
         }
         Err(AiError::InvalidResponse(format!(
             "image response has neither direct image data nor task_id: {response}"
         )))
     }
 
-    async fn poll_apimart_task(&self, task_id: &str) -> Result<Vec<u8>, AiError> {
+    async fn poll_apimart_task(&self, task_id: &str, api_key: &str) -> Result<Vec<u8>, AiError> {
         let deadline = Instant::now() + Duration::from_secs(self.config.timeout_seconds.max(1));
         let retry_budget = RetryBudget::with_deadline(deadline);
         info!(
@@ -3202,7 +3451,7 @@ impl OpenAiImageClient {
                     }
                     let response = match timeout(
                         remaining,
-                        self.client.get(&endpoint).bearer_auth(&self.api_key).send(),
+                        self.client.get(&endpoint).bearer_auth(api_key).send(),
                     )
                     .await
                     {
@@ -4316,7 +4565,7 @@ mod tests {
         OpenAiImageClient {
             config,
             client: reqwest::Client::new(),
-            api_key: "test-key".into(),
+            key_pool: Arc::new(ApiKeyPool::from_keys(vec!["test-key".to_string()], 0)),
             base_url: "https://api.apimart.ai/v1".into(),
             model: "gpt-image-2".into(),
             retry_notifier: None,
@@ -4418,7 +4667,7 @@ mod tests {
         let client = OpenAiAudioTranscriptionClient {
             config: voice_transcription_config(),
             client: reqwest::Client::new(),
-            api_key: "test-key".into(),
+            key_pool: Arc::new(ApiKeyPool::from_keys(vec!["test-key".to_string()], 0)),
             base_url: "https://api.example.com/v1".into(),
             model: "voice-model".into(),
             trace_dir: None,
@@ -4467,6 +4716,8 @@ mod tests {
             provider: "openai_compatible".into(),
             api_key: None,
             api_key_env: "IMAGE_CAPTION_API_KEY".into(),
+            api_keys: Vec::new(),
+            api_keys_env: "IMAGE_CAPTION_API_KEYS".into(),
             base_url: None,
             base_url_env: "IMAGE_CAPTION_BASE_URL".into(),
             model: None,
@@ -4479,6 +4730,7 @@ mod tests {
             user_prompt: "caption".into(),
             max_images_per_summary: 20,
             max_concurrent_requests: 4,
+            max_concurrent_per_key: 0,
             request_body_overrides: Default::default(),
         }
     }
@@ -4489,6 +4741,8 @@ mod tests {
             provider: "openai_compatible".into(),
             api_key: None,
             api_key_env: "VOICE_TRANSCRIPTION_API_KEY".into(),
+            api_keys: Vec::new(),
+            api_keys_env: "VOICE_TRANSCRIPTION_API_KEYS".into(),
             base_url: None,
             base_url_env: "VOICE_TRANSCRIPTION_BASE_URL".into(),
             model: None,
@@ -4503,6 +4757,7 @@ mod tests {
             mp3_bitrate: "64k".into(),
             max_voices_per_summary: 20,
             max_concurrent_requests: 2,
+            max_concurrent_per_key: 0,
             request_body_overrides: Default::default(),
         }
     }
@@ -4513,6 +4768,8 @@ mod tests {
             provider: "openai".into(),
             api_key: None,
             api_key_env: "IMAGE_API_KEY".into(),
+            api_keys: Vec::new(),
+            api_keys_env: "IMAGE_API_KEYS".into(),
             base_url: None,
             base_url_env: "IMAGE_BASE_URL".into(),
             model: None,
@@ -4525,6 +4782,7 @@ mod tests {
             poll_interval_seconds: 5,
             timeout_seconds: 300,
             retry_5xx_attempts: 5,
+            max_concurrent_per_key: 0,
             prompt_template: None,
         }
     }
@@ -4598,7 +4856,8 @@ mod tests {
 
         let client = OpenAiVisionCaptionClient::new(config, &proxy).unwrap();
 
-        assert_eq!(client.api_key, "persisted-key");
+        assert_eq!(client.key_pool.len(), 1);
+        assert_eq!(client.key_pool.keys(), vec!["persisted-key"]);
         assert_eq!(client.base_url, "https://api.example.com/v1");
         assert_eq!(client.model, "vision-model");
     }
@@ -4703,7 +4962,8 @@ data: {"type":"transcript.text.delta","delta":"文字"}
 
         let client = OpenAiAudioTranscriptionClient::new(config, &proxy).unwrap();
 
-        assert_eq!(client.api_key, "persisted-voice-key");
+        assert_eq!(client.key_pool.len(), 1);
+        assert_eq!(client.key_pool.keys(), vec!["persisted-voice-key"]);
         assert_eq!(client.base_url, "https://voice.example.com/v1");
         assert_eq!(client.model, "whisper-model");
     }
@@ -4855,7 +5115,8 @@ data: {"type":"transcript.text.delta","delta":"文字"}
         };
         let client = OpenAiImageClient::new(config, &proxy).unwrap();
 
-        assert_eq!(client.api_key, "persisted-key");
+        assert_eq!(client.key_pool.len(), 1);
+        assert_eq!(client.key_pool.keys(), vec!["persisted-key"]);
         assert_eq!(client.base_url, "https://api.apimart.ai/v1");
         assert_eq!(client.model, "gpt-image-2");
     }
@@ -4875,7 +5136,8 @@ data: {"type":"transcript.text.delta","delta":"文字"}
         };
         let client = OpenAiImageClient::new(config, &proxy).unwrap();
 
-        assert_eq!(client.api_key, direct_key);
+        assert_eq!(client.key_pool.len(), 1);
+        assert_eq!(client.key_pool.keys(), vec![direct_key]);
         assert_eq!(client.base_url, "https://api.apimart.ai/v1");
         assert_eq!(client.model, "gpt-image-2");
     }
@@ -5179,5 +5441,135 @@ reasoning_effort = "none"
             api_root_url("https://api.apimart.ai/v1/images/generations"),
             "https://api.apimart.ai/v1"
         );
+    }
+
+    #[test]
+    fn key_pool_dedupes_and_trims_keys() {
+        let pool = ApiKeyPool::from_keys(
+            vec![
+                "sk-a".to_string(),
+                "sk-a".to_string(),
+                "".to_string(),
+                "  sk-b  ".to_string(),
+            ],
+            0,
+        );
+
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.keys(), vec!["sk-a", "sk-b"]);
+    }
+
+    #[tokio::test]
+    async fn key_pool_round_robin_distributes_across_keys() {
+        let pool = ApiKeyPool::from_keys(
+            vec!["sk-a".to_string(), "sk-b".to_string(), "sk-c".to_string()],
+            1,
+        );
+
+        let first = pool.acquire().await;
+        let second = pool.acquire().await;
+        let third = pool.acquire().await;
+
+        let mut indices = vec![first.key_index(), second.key_index(), third.key_index()];
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert_eq!(first.key(), "sk-a");
+        assert_eq!(second.key(), "sk-b");
+        assert_eq!(third.key(), "sk-c");
+    }
+
+    #[tokio::test]
+    async fn key_pool_per_key_cap_limits_concurrency() {
+        let pool = ApiKeyPool::from_keys(vec!["sk-a".to_string()], 1);
+        let first = pool.acquire().await;
+        assert_eq!(first.key_index(), 0);
+
+        // Second concurrent acquire on the same key must wait for the first permit.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let waiter_pool = Arc::new(pool);
+        let waiter = {
+            let pool = Arc::clone(&waiter_pool);
+            tokio::spawn(async move {
+                let _permit = pool.acquire().await;
+                release_rx.await.ok();
+            })
+        };
+        sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(first);
+        release_tx.send(()).ok();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should finish after first permit released")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn key_pool_unlimited_cap_allows_all_concurrent_acquires() {
+        let pool = ApiKeyPool::from_keys(vec!["sk-a".to_string(), "sk-b".to_string()], 0);
+
+        let a = pool.acquire().await;
+        let b = pool.acquire().await;
+        let c = pool.acquire().await;
+        assert_eq!(a.key_index(), 0);
+        assert_eq!(b.key_index(), 1);
+        assert_eq!(c.key_index(), 0);
+    }
+
+    #[test]
+    fn shared_key_pool_reuses_pool_for_same_credentials() {
+        let first = shared_key_pool(vec!["sk-a".to_string(), "sk-b".to_string()], 1);
+        let second = shared_key_pool(vec!["sk-b".to_string(), "sk-a".to_string()], 1);
+        let different = shared_key_pool(vec!["sk-a".to_string(), "sk-b".to_string()], 2);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &different));
+        assert_eq!(first.len(), 2);
+        assert_eq!(different.len(), 2);
+    }
+
+    #[test]
+    fn resolve_api_keys_prefers_explicit_list_over_single_fields() {
+        let keys = resolve_api_keys(
+            &["sk-list-1".to_string(), "sk-list-2".to_string()],
+            Some("sk-single"),
+            "LLM_API_KEYS",
+            "LLM_API_KEY",
+            "test key",
+        )
+        .unwrap();
+
+        assert_eq!(keys, vec!["sk-list-1", "sk-list-2"]);
+    }
+
+    #[test]
+    fn resolve_api_keys_splits_comma_newline_and_semicolon_separated_single_key() {
+        let keys = resolve_api_keys(
+            &[],
+            Some("sk-a, sk-b\nsk-c;sk-d"),
+            "",
+            "LLM_API_KEY",
+            "test key",
+        )
+        .unwrap();
+
+        assert_eq!(keys, vec!["sk-a", "sk-b", "sk-c", "sk-d"]);
+    }
+
+    #[test]
+    fn resolve_api_keys_accepts_direct_value_in_api_keys_env() {
+        let keys =
+            resolve_api_keys(&[], None, "sk-env-1,sk-env-2", "LLM_API_KEY", "test key").unwrap();
+
+        assert_eq!(keys, vec!["sk-env-1", "sk-env-2"]);
+    }
+
+    #[test]
+    fn resolve_api_keys_errors_when_no_key_resolves() {
+        let error = resolve_api_keys(&[], None, "", "LLM_API_KEY", "test key").unwrap_err();
+
+        assert!(error.to_string().contains("LLM_API_KEY"));
+        assert!(!error.to_string().contains("sk-"));
     }
 }
