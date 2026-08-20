@@ -3034,13 +3034,14 @@ where
 {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+        let mut bytes = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let text = line.trim_end_matches(&['\r', '\n'][..]);
+                    let text = String::from_utf8_lossy(&bytes);
+                    let text = text.trim_end_matches(&['\r', '\n'][..]);
                     let _ = sender.send(format!("[{label}] {text}\n"));
                 }
                 Err(error) => {

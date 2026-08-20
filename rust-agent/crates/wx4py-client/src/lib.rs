@@ -566,6 +566,7 @@ fn should_skip_export_after_history_error(error: &Wx4pyError) -> bool {
     error.contains("wx-daemon 启动超时")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_text_messages_via_history(
     wx_cli: &WxCliConfig,
     chat_name: &str,

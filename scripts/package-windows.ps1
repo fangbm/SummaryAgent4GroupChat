@@ -73,8 +73,15 @@ $ConfigText = $ConfigText -replace 'sidecar_script\s*=\s*".*"', 'sidecar_script 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($PackageConfig, $ConfigText, $utf8NoBom)
 
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install-python-runtime.ps1") `
-    -Destination (Join-Path $PackageDir "install.ps1")
+# Windows PowerShell 5.1 treats a BOM-less script as the current ANSI code page.
+# Keep the packaged script BOM-marked so its Chinese status and error messages parse correctly.
+$RuntimeInstallerSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot "install-python-runtime.ps1") -Raw -Encoding UTF8
+$RuntimeInstallerEncoding = New-Object System.Text.UTF8Encoding($true)
+[System.IO.File]::WriteAllText(
+    (Join-Path $PackageDir "install.ps1"),
+    $RuntimeInstallerSource,
+    $RuntimeInstallerEncoding
+)
 
 @'
 $ErrorActionPreference = "Stop"

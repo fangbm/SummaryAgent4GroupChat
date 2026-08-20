@@ -1,93 +1,193 @@
-# WeChat-AI-Pipeline
+# SummaryAgent4GroupChat
 
-Windows 单机版微信智能群聊监控系统。Windows 端直接监听微信群触发词、读取本机微信记录、统计发言、调用 LLM 摘要、生成图片，并回发到群聊。
+Windows 原生群聊总结助手。它监听微信或 Discord 的群聊指令，按指定时间范围读取消息，调用兼容 OpenAI Chat Completions 的模型生成中文总结，并可选生成配图后发回原群。
 
-当前仓库实现的是“生产增强版”工程骨架：Windows 单机主流程、协议、配置、SQLite 状态、隐私保护、重试降级、健康检查、指标、fake 依赖测试和部署文档都已经纳入。旧的 Linux Bot / WebSocket IPC 模式保留为兼容路径，但不再是默认方案。
+项目把运行控制、配置和日志集中到一个 Rust 桌面 GUI 中；微信的窗口自动化由 `wx4py` 完成，聊天历史由独立的外部 `wxdb` 命令提供。主仓库不包含、链接或分发微信数据库读取实现。
 
-## 快速开始
+## 能力
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-pytest
-```
+- 微信群与 Discord 频道接入，统一使用 `/总结` 指令和定时任务。
+- `/总结 [platform] [time] [图片]`：支持 `wx`、`微信`、`wechat`、`dc`、`discord`，大小写不敏感；平台省略时使用收到指令的平台。
+- 文本总结、图片总结、图片生成，以及超长历史按页读取和分段处理。
+- 可选图片转述、视频转述和语音转写；语音可通过 FFmpeg 转为 MP3。
+- 5xx 指数退避重试、429 串行重试队列、多 API Key 并发控制、失败原因与请求 trace 脱敏落盘。
+- 微信长文本自动分段发送，或按配置改为发送 `.txt` 文件。
+- 原生管理 GUI：平台、群组、定时任务、模型、媒体、日志、终端和运行状态都可直接管理；配置变更会被主程序热重载。
 
-## Rust Windows-only Agent
-
-新的 Rust 单机方案位于 `rust-agent/`，与现有 Python 项目隔离。本分支使用 `wx4py` 做 Windows 微信 UI 自动化监听和图片/文本发送；历史消息由独立的外部 `wxdb` 命令读取。主项目不包含或链接数据库读取实现；Linux / `wx-bot-cli` 链路在该方案中废弃。
-
-```powershell
-cd rust-agent
-cargo test --workspace
-cargo run -p wechat-summary-app -- --config config\agent.toml
-```
-
-完整设计见 `docs/rust-windows-wx4py-wxdb-dev-doc.md`。
-
-Windows 真实微信监听与回发默认使用 `wx4py`：
-
-```powershell
-python -m pip install -e ".[windows]"
-python -m pip install wx4py
-cd rust-agent
-cargo run -p wechat-summary-app -- --config config\agent.toml
-```
-
-注意：`wx4py` 是 UI 自动化方案，需要 Windows 微信保持登录，并且 `rust-agent/config/agent.toml` 中 `[wx4py].groups` 必须填写可搜索到的微信群显示名。历史读取需要单独安装兼容的外部提供器，并将其路径配置到 `[wxdb].executable`。
-
-### 已安装版本的微信运行环境
-
-安装包中的原生 GUI 提供“安装微信运行环境”按钮；它会将完整过程输出到 GUI 终端：
-
-1. 检测 Python 3.11/3.12；缺失时通过 `winget` 安装 Python 3.12。
-2. 在安装目录创建 `.venv` 并安装 `wx4py`。
-3. 从独立 `wxdb` 项目的 GitHub Release 下载 `wxdb.exe` 到安装目录的 `tools\wxdb`。
-4. 更新 `config\agent.toml` 中的 Python、sidecar、wxdb 路径，并创建 `runtime\wxdb-cache`。
-5. 尝试执行 `wxdb init`。微信未登录、未运行或当前权限不足时，此步骤会给出警告；登录微信后可在 GUI 中点击“运行外部 wxdb init”重试。
-
-该流程不会把 wxdb 源码或数据库实现打进本仓库。安装器会优先复用 GUI 中已配置的 wxdb 路径，其次查找 `PATH`，最后下载独立 Release。若独立 wxdb Release 暂未发布，安装器会给出明确错误；可先配置本地 `wxdb.exe` 或将其加入 `PATH` 后重新点击按钮。
-
-## 目录
+## 工作方式
 
 ```text
-src/pipeline_core/      # 共享协议、配置、鉴权、存储、隐私、重试、日志
-src/linux_bot/          # 旧双端模式：Linux 监听与回发服务
-src/windows_worker/     # Windows 单机监听、任务处理、回发、API Server、AI Provider
-config/                 # 示例配置
-docs/                   # 部署、API、隐私、故障排查
-scripts/                # 服务安装/启动辅助脚本
-tests/                  # 单元和集成测试
+微信 wx4py / Discord Gateway
+            |
+          指令或定时任务
+            |
+外部 wxdb 历史读取 / Discord 历史读取
+            |
+可选图片、视频、语音转述
+            |
+LLM 文本总结 -> 可选图片提示词 -> 图片生成
+            |
+原平台发送文字、图片或长文本文件
 ```
 
-## 本地开发
+微信使用 UI 自动化，因此微信必须保持登录，并且运行 GUI 的用户需要能操作当前桌面会话。历史读取依赖外部 `wxdb`；请只在你有权访问的本机账号和聊天记录上使用它。
 
-1. 复制 `.env.example` 并填入本地密钥。
-2. 按需修改 `config/worker.yaml`，重点设置 `wechat.provider`、群白名单、LLM 和图片模型。
-3. Windows 单机启动：
+## 安装
+
+### 使用 Windows 安装包
+
+从本仓库的 [Releases](https://github.com/fangbm/SummaryAgent4GroupChat/releases) 下载 Inno Setup 安装程序并安装。安装完成后从开始菜单或桌面快捷方式打开 `SummaryAgent4GroupChat`。
+
+GUI 启动时会请求管理员权限，以便微信 UI 自动化和 wxdb 初始化能访问同一桌面会话。主程序由 GUI 托管，不会额外弹出命令行窗口。
+
+在 GUI 左侧点击“安装微信运行环境”，安装器会：
+
+1. 检测 Python 3.11/3.12；未安装时通过 `winget` 安装 Python 3.12。
+2. 创建安装目录内的 `.venv` 并安装 `wx4py`。
+3. 优先使用 GUI 已配置的 wxdb 路径，其次查找 `PATH`；都找不到时从独立 wxdb Release 下载 Windows x64 运行时。
+4. 写入 Python、sidecar、wxdb 和 wxdb 缓存目录到 `config\agent.toml`。
+5. 尝试执行 `wxdb init`。微信未登录、未运行或权限不足时会显示警告，可在登录微信后点击“运行外部 wxdb init”重试。
+
+主项目不附带 wxdb。如果独立 wxdb 项目尚未发布 Windows Release，请自行配置本地 `wxdb.exe` 的绝对路径或将其加入 `PATH`，再运行安装流程。
+
+### 从源码构建
+
+前置条件：Windows 10/11、Rust stable、Python 3.11 或 3.12、已登录的 Windows 微信，以及可用的外部 wxdb 命令。
 
 ```powershell
-python -m windows_worker.main --config config\worker.yaml --mode single
+git clone https://github.com/fangbm/SummaryAgent4GroupChat.git
+cd SummaryAgent4GroupChat
+
+cd rust-agent
+cargo build --release -p wechat-summary-app -p wechat-summary-gui
 ```
 
-4. 旧 IPC API 模式：
+启动 GUI：
 
 ```powershell
-python -m windows_worker.main --config config\worker.yaml --mode api
+.\rust-agent\target\release\wechat-summary-gui.exe --config .\rust-agent\config\agent.toml
 ```
 
-5. 旧 Linux Bot 模式：
-
-```bash
-python -m linux_bot.main --config config/bot.yaml
-```
-
-真实微信依赖通过 adapter 封装：`wx4py` 负责 Windows 本机 UI 自动化监听和回发，外部历史提供器负责返回 JSON 历史记录。`wxhook` / `wcferry` 在本分支中不作为默认链路。
-
-## 质量门禁
+构建 zip 与 Inno Setup 安装程序：
 
 ```powershell
-ruff check .
-mypy src
-pytest --cov
+.\scripts\package-windows-installer.ps1
 ```
+
+生成物位于 `dist\`。若脚本找不到 Inno Setup，可先安装：
+
+```powershell
+winget install --id JRSoftware.InnoSetup -e --scope user --accept-package-agreements --accept-source-agreements
+```
+
+## 首次配置
+
+打开 GUI 后，依次完成以下内容：
+
+1. 在“接入平台”页选择 `wx` 或 `discord`。
+2. 微信模式填写可搜索到的群显示名；Discord 模式填写频道 ID 与机器人 Token 环境变量名。
+3. 在“模型与图片”页填写 LLM 的 API Key、Base URL 和模型名称。支持直接填值，也支持环境变量名。
+4. 微信模式点击“安装微信运行环境”，并在微信登录后运行 `wxdb init`。
+5. 在“监听与命令”页确认触发词、白名单和冷却时间；保存配置后启动主程序。
+
+默认配置文件为 [`rust-agent/config/agent.toml`](rust-agent/config/agent.toml)。安装版使用安装目录下的 `config\agent.toml`。GUI 保存后主程序会自动重载配置，无需重启。
+
+### 最小 LLM 配置
+
+以下为 OpenAI 兼容服务的最小环境变量示例：
+
+```powershell
+$env:LLM_API_KEY = "your-api-key"
+$env:LLM_BASE_URL = "https://api.example.com/v1"
+$env:LLM_MODEL = "your-model"
+```
+
+也可将值直接写入 `[llm]`，或填写 `api_keys` / `api_keys_env` 使用多个 Key 并发。模型页面的“LLM 请求体覆盖（JSON）”可写入服务商特定字段，例如 `reasoning_effort`、`thinking`、`tools` 或 `tool_choice`。
+
+### wxdb 配置
+
+推荐使用绝对路径，避免安装版依赖交互式 shell 的 `PATH`：
+
+```toml
+[wxdb]
+executable = "D:\\tools\\wxdb\\wxdb.exe"
+cache_dir = "D:\\SummaryAgentCache\\wxdb"
+# 多微信账号时可指定唯一的 db_storage 目录。
+# db_dir = "D:\\Temp\\xwechat_files\\wxid_xxx\\db_storage"
+```
+
+`wxdb init` 会刷新本地密钥缓存。缓存和密钥数据敏感，请放在受信任磁盘；缓存目录可在 GUI 的接入平台页修改。
+
+## 指令与定时任务
+
+| 指令 | 作用 |
+| --- | --- |
+| `/总结` | 总结当前平台、默认时间范围内的聊天。 |
+| `/总结 24h` | 总结最近 24 小时。支持 `30m`、`2h`、`1d`、`48h`、`30d` 等时长。 |
+| `/总结 dc 1d` | 在当前群中请求 Discord 平台最近一天的总结。 |
+| `/总结 微信 2h 图片` | 总结微信最近两小时，并按图片开关生成或跳过配图。 |
+
+`图片`、`image`、`img` 均可用。`[manual_summary].image_by_default = false` 时，只有包含图片参数才生成图片；设为 `true` 时含图片参数表示跳过生图。
+
+定时总结由 `[scheduled_summary]` 控制，默认每天本地时间 22:00 汇总 24 小时。定时任务不受手动图片冷却影响。
+
+## 媒体与图片
+
+| 功能 | 配置段 | 说明 |
+| --- | --- | --- |
+| 图片生成 | `[image_gen]` | 在文本总结后生成群聊配图。 |
+| 图片转述 | `[image_caption]` | 将图片内容插回对应消息位置，再交给文本总结模型。 |
+| 视频转述 | `[video_caption]` | 将视频以 base64 发送到多模态模型进行转述。 |
+| 语音转写 | `[voice_transcription]` | 可先用 FFmpeg 统一转为 MP3，再请求转写模型。 |
+
+四类模型均可单独设置 Provider、Key、Base URL、模型名、重试次数、并发数与请求体覆盖 JSON。媒体请求失败不会阻止纯文本聊天记录继续总结。
+
+## 运行与排障
+
+GUI 的“运行信息”页包含主程序终端与日志尾部。默认日志路径为：
+
+```text
+runtime\rust-output\wechat-summary-app.log
+```
+
+常见处理方式：
+
+- **没有收到指令**：确认平台、群/频道白名单、触发词和主程序状态；微信还需确认 UI 自动化能找到该群。
+- **wxdb 找不到密钥或没有消息**：保持目标微信登录，使用与微信相同权限启动 GUI，然后执行“运行外部 wxdb init”；多账号时配置 `wxdb.db_dir`。
+- **图片、语音或视频失败**：先检查各自模型的 Key、Base URL、模型名和网络可达性；完整脱敏错误会写入运行日志。
+- **长总结发不完**：在 `[wx4py]` 中保留 `long_text_delivery = "chunks"`，或改为 `file`，让超长结果以 UTF-8 文本文件发送。
+
+更多细节见 [部署说明](docs/deploy-guide.md)、[故障排查](docs/troubleshooting.md)、[隐私与合规](docs/privacy-and-compliance.md) 和 [Rust 设计文档](docs/rust-windows-wx4py-wxdb-dev-doc.md)。
+
+## 隐私与安全
+
+- 只有启用 `cloud_allowed` 后，内容才会发给云端模型。
+- 为敏感群配置 `privacy.sensitive_rooms`，并根据你的数据处理要求启用脱敏。
+- API Key 优先放入环境变量；GUI 会对显示的密钥样式内容进行脱敏，但不要将真实密钥提交到 Git。
+- AI trace 用于故障排查，会记录已脱敏的请求与响应；仅在受信任环境启用，并定期清理 `runtime.ai_trace_dir`。
+
+## 开发与质量检查
+
+```powershell
+cd rust-agent
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+```
+
+GUI 使用 Windows UAC manifest；本地 `cargo test -p wechat-summary-gui` 在未提权终端中可能无法直接执行测试二进制，可用 `--no-run` 验证测试编译。
+
+## 发布
+
+更新 [`rust-agent/Cargo.toml`](rust-agent/Cargo.toml) 的 `[workspace.package].version` 并推送到 `main` 后，GitHub Actions 会自动构建 Windows zip 和 Inno Setup 安装程序，创建 `v<version>` Release，并生成 GitHub Release Notes。
+
+```toml
+[workspace.package]
+version = "0.1.1"
+```
+
+发布工作流只关注版本变化；仅修改 README、GUI 或配置不会生成 Release。这样可以避免每次普通提交都制造安装包版本。
+
+## 许可证与范围
+
+本项目采用 [MIT License](rust-agent/Cargo.toml)。微信历史读取由独立外部提供器完成；使用者须遵守当地法律、平台规则和账号数据权限边界。
