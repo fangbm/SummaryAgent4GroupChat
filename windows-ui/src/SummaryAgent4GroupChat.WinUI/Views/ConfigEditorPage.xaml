@@ -30,6 +30,7 @@
                     <TextBlock Text="平台与历史记录" Style="{ThemeResource SubtitleTextBlockStyle}" />
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                         <StackPanel Spacing="5"><TextBlock Text="运行平台" /><ComboBox SelectedValuePath="Content" SelectedValue="{Binding PlatformKind, Mode=TwoWay}"><ComboBoxItem Content="wx" /><ComboBoxItem Content="discord" /></ComboBox></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="每页历史读取条数" /><NumberBox Value="{Binding HistoryPageSize, Mode=TwoWay}" SpinButtonPlacementMode="Compact" Minimum="1" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="微信目标群（逗号或换行分隔）" /><TextBox Text="{Binding WeChatGroups, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="88" /></StackPanel>
@@ -44,6 +45,7 @@
                     <TextBlock Text="触发与冷却" Style="{ThemeResource SubtitleTextBlockStyle}" />
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                         <StackPanel Spacing="5"><TextBlock Text="总结指令（逗号或换行分隔）" /><TextBox Text="{Binding TriggerCommands, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="允许触发的群聊（留空不额外限制）" /><TextBox Text="{Binding WhitelistRooms, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="文字总结成功后冷却（秒）" /><NumberBox Value="{Binding RequestCooldownSeconds, Mode=TwoWay}" SpinButtonPlacementMode="Compact" Minimum="0" /></StackPanel>
@@ -58,6 +60,7 @@
                     <CheckBox Content="启用定时总结" IsChecked="{Binding ScheduleEnabled, Mode=TwoWay}" />
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                         <StackPanel Spacing="5"><TextBlock Text="每天执行时间（HH:mm）" /><TextBox Text="{Binding ScheduleTime, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="总结最近（小时）" /><NumberBox Value="{Binding ScheduleRangeHours, Mode=TwoWay}" SpinButtonPlacementMode="Compact" Minimum="1" /></StackPanel>
                         <StackPanel Grid.Column="2" Spacing="5"><TextBlock Text="目标群聊（留空使用平台目标）" /><TextBox Text="{Binding ScheduleRooms, Mode=TwoWay}" /></StackPanel>
@@ -69,6 +72,7 @@
                     <TextBlock Text="文字总结模型" Style="{ThemeResource SubtitleTextBlockStyle}" />
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                         <StackPanel Spacing="5"><TextBlock Text="API Key 环境变量" /><TextBox Text="{Binding LlmApiKeyEnvironment, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="模型名称" /><TextBox Text="{Binding LlmModel, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="Base URL" /><TextBox Text="{Binding LlmBaseUrl, Mode=TwoWay}" /></StackPanel>
@@ -79,6 +83,7 @@
                     <StackPanel Orientation="Horizontal" Spacing="20"><CheckBox Content="启用图片生成" IsChecked="{Binding ImageGenerationEnabled, Mode=TwoWay}" /><CheckBox Content="启用图片转述" IsChecked="{Binding ImageCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用视频转述" IsChecked="{Binding VideoCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用语音转写" IsChecked="{Binding VoiceTranscriptionEnabled, Mode=TwoWay}" /></StackPanel>
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                         <StackPanel Spacing="5"><TextBlock Text="图片 API Key 环境变量" /><TextBox Text="{Binding ImageApiKeyEnvironment, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片模型名称" /><TextBox Text="{Binding ImageModel, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="图片 Base URL" /><TextBox Text="{Binding ImageBaseUrl, Mode=TwoWay}" /></StackPanel>
