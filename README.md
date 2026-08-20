@@ -15,7 +15,7 @@ pytest
 
 ## Rust Windows-only Agent
 
-新的 Rust 单机方案位于 `rust-agent/`，与现有 Python 项目隔离。本分支使用 `wx4py` 做 Windows 微信 UI 自动化监听和图片/文本发送；历史消息由用户单独安装和配置的外部历史提供器读取。主项目不包含、链接或分发数据库解密实现；Linux / `wx-bot-cli` 链路在该方案中废弃。
+新的 Rust 单机方案位于 `rust-agent/`，与现有 Python 项目隔离。本分支使用 `wx4py` 做 Windows 微信 UI 自动化监听和图片/文本发送；历史消息由独立的外部 `wxdb` 命令读取。主项目不包含或链接数据库读取实现；Linux / `wx-bot-cli` 链路在该方案中废弃。
 
 ```powershell
 cd rust-agent
@@ -35,6 +35,18 @@ cargo run -p wechat-summary-app -- --config config\agent.toml
 ```
 
 注意：`wx4py` 是 UI 自动化方案，需要 Windows 微信保持登录，并且 `rust-agent/config/agent.toml` 中 `[wx4py].groups` 必须填写可搜索到的微信群显示名。历史读取需要单独安装兼容的外部提供器，并将其路径配置到 `[wxdb].executable`。
+
+### 已安装版本的微信运行环境
+
+安装包中的原生 GUI 提供“安装微信运行环境”按钮；它会将完整过程输出到 GUI 终端：
+
+1. 检测 Python 3.11/3.12；缺失时通过 `winget` 安装 Python 3.12。
+2. 在安装目录创建 `.venv` 并安装 `wx4py`。
+3. 从独立 `wxdb` 项目的 GitHub Release 下载 `wxdb.exe` 到安装目录的 `tools\wxdb`。
+4. 更新 `config\agent.toml` 中的 Python、sidecar、wxdb 路径，并创建 `runtime\wxdb-cache`。
+5. 尝试执行 `wxdb init`。微信未登录、未运行或当前权限不足时，此步骤会给出警告；登录微信后可在 GUI 中点击“运行外部 wxdb init”重试。
+
+该流程不会把 wxdb 源码或数据库实现打进本仓库。安装器会优先复用 GUI 中已配置的 wxdb 路径，其次查找 `PATH`，最后下载独立 Release。若独立 wxdb Release 暂未发布，安装器会给出明确错误；可先配置本地 `wxdb.exe` 或将其加入 `PATH` 后重新点击按钮。
 
 ## 目录
 

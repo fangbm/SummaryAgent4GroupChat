@@ -73,26 +73,8 @@ $ConfigText = $ConfigText -replace 'sidecar_script\s*=\s*".*"', 'sidecar_script 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($PackageConfig, $ConfigText, $utf8NoBom)
 
-@'
-param(
-    [string]$Python = "python"
-)
-
-$ErrorActionPreference = "Stop"
-$Root = $PSScriptRoot
-Set-Location $Root
-
-if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
-    & $Python -m venv .venv
-}
-
-& ".\.venv\Scripts\python.exe" -m pip install --upgrade pip
-& ".\.venv\Scripts\python.exe" -m pip install wx4py
-
-Write-Host "Runtime installed."
-Write-Host "Set LLM_API_KEY / LLM_BASE_URL / LLM_MODEL and optional IMAGE_* environment variables before running start.ps1."
-Write-Host "For multi-key concurrency, set the *_API_KEYS variables (e.g. LLM_API_KEYS) with comma/newline separated keys."
-'@ | Set-Content -LiteralPath (Join-Path $PackageDir "install.ps1") -Encoding UTF8
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install-python-runtime.ps1") `
+    -Destination (Join-Path $PackageDir "install.ps1")
 
 @'
 $ErrorActionPreference = "Stop"
@@ -118,12 +100,17 @@ $env:PATH = "$Root\bin;$env:PATH"
 Build: $Stamp
 Commit: $Commit
 
-## Install runtime
+## Install or repair the WeChat runtime
 
 ~~~powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\install.ps1
 ~~~
+
+The installer detects Python 3.11/3.12, installs Python 3.12 with `winget` when
+needed, creates `.venv`, installs `wx4py`, downloads the separately released
+`wxdb` runtime, updates `config\agent.toml`, and then attempts `wxdb init`.
+The application package does not contain wxdb source code or database logic.
 
 ## Configure
 

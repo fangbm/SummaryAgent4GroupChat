@@ -178,6 +178,7 @@ struct GuiApp {
     terminal_output: String,
     agent: Option<AgentProcess>,
     wxdb_init: Option<WxdbInitProcess>,
+    runtime_install: Option<RuntimeInstallProcess>,
     status: StatusView,
     tab: Tab,
     message: Option<String>,
@@ -191,6 +192,12 @@ struct AgentProcess {
 }
 
 struct WxdbInitProcess {
+    child: Child,
+    output: Receiver<String>,
+    pid: u32,
+}
+
+struct RuntimeInstallProcess {
     child: Child,
     output: Receiver<String>,
     pid: u32,
@@ -323,6 +330,7 @@ impl GuiApp {
             terminal_output: "GUI 已就绪，主程序终端输出会显示在这里。\n".to_string(),
             agent: None,
             wxdb_init: None,
+            runtime_install: None,
             status: StatusView::default(),
             tab: Tab::Dashboard,
             message: None,
@@ -408,8 +416,22 @@ impl GuiApp {
     }
 
     fn install_runtime(&mut self) {
-        match install_runtime(&self.state) {
-            Ok(_) => self.message = Some("已启动 Python Runtime 安装脚本".to_string()),
+        self.poll_runtime_install_output();
+        if self.runtime_install.is_some() {
+            self.message = Some("微信运行环境安装正在进行".to_string());
+            return;
+        }
+
+        match start_runtime_install(&self.state, &self.view.wx_cli_executable) {
+            Ok(process) => {
+                self.append_terminal_line(format!(
+                    "[gui] 微信运行环境安装已启动 pid={}\n",
+                    process.pid
+                ));
+                self.runtime_install = Some(process);
+                self.message =
+                    Some("正在检查 Python、安装 wx4py 和 wxdb，输出会显示在 GUI 终端".to_string());
+            }
             Err(error) => self.message = Some(format!("安装运行时失败：{error:#}")),
         }
     }
@@ -446,7 +468,7 @@ impl GuiApp {
             let python = resolve_working_path(&self.state, &self.view.wx_python);
             if !python.exists() {
                 self.message = Some(format!(
-                    "Python 运行时不存在：{}。请先运行安装目录里的 install.ps1 或开始菜单里的 Install Python Runtime。",
+                    "Python 运行时不存在：{}。请点击“安装微信运行环境”完成 Python、wx4py 和 wxdb 安装。",
                     python.display()
                 ));
                 return;
@@ -472,45 +494,6 @@ impl GuiApp {
                 self.message = Some("主程序已启动，终端输出已合并到 GUI".to_string());
             }
             Err(error) => self.message = Some(format!("启动失败：{error:#}")),
-        }
-    }
-
-    fn start_agent_elevated(&mut self) {
-        self.poll_agent_output();
-        if self.agent.is_some() {
-            self.message = Some("主程序已在 GUI 中运行".to_string());
-            return;
-        }
-
-        if self.view.platform_kind.eq_ignore_ascii_case("wx") {
-            let python = resolve_working_path(&self.state, &self.view.wx_python);
-            if !python.exists() {
-                self.message = Some(format!(
-                    "Python 运行时不存在：{}。请先运行安装目录里的 install.ps1 或开始菜单里的 Install Python Runtime。",
-                    python.display()
-                ));
-                return;
-            }
-        }
-
-        match stop_existing_agent_processes() {
-            Ok(Some(summary)) => self.append_terminal_line(format!("[gui] {summary}\n")),
-            Ok(None) => {}
-            Err(error) => {
-                self.message = Some(format!("清理旧主程序失败：{error:#}"));
-                return;
-            }
-        }
-
-        match start_agent_elevated(&self.state) {
-            Ok(_) => {
-                self.append_terminal_line(
-                    "[gui] 已请求管理员权限启动主程序；UAC 提权进程输出请查看日志尾部。\n"
-                        .to_string(),
-                );
-                self.message = Some("已请求管理员权限启动主程序，请确认 UAC 弹窗".to_string());
-            }
-            Err(error) => self.message = Some(format!("管理员启动失败：{error:#}")),
         }
     }
 
@@ -579,6 +562,40 @@ impl GuiApp {
         }
     }
 
+    fn poll_runtime_install_output(&mut self) {
+        let mut lines = Vec::new();
+        let mut exit_status = None;
+        if let Some(process) = &mut self.runtime_install {
+            lines.extend(process.output.try_iter());
+            match process.child.try_wait() {
+                Ok(Some(status)) => exit_status = Some(status),
+                Ok(None) => {}
+                Err(error) => {
+                    self.append_terminal_line(format!(
+                        "[gui] 检查微信运行环境安装状态失败：{error}\n"
+                    ));
+                    self.runtime_install = None;
+                }
+            }
+        }
+
+        for line in lines {
+            self.append_terminal_line(line);
+        }
+
+        if let Some(status) = exit_status {
+            let success = status.success();
+            self.append_terminal_line(format!("[gui] 微信运行环境安装已退出：{status}\n"));
+            self.runtime_install = None;
+            self.refresh();
+            self.message = Some(if success {
+                "微信运行环境已安装并更新配置".to_string()
+            } else {
+                "微信运行环境安装失败，请查看 GUI 终端中的完整错误".to_string()
+            });
+        }
+    }
+
     fn append_terminal_line(&mut self, line: String) {
         self.terminal_output
             .push_str(&redact_secret_like_tokens(&line));
@@ -598,8 +615,11 @@ impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_agent_output();
         self.poll_wxdb_init_output();
-        let should_refresh_runtime =
-            self.agent.is_some() || self.wxdb_init.is_some() || self.tab == Tab::Runtime;
+        self.poll_runtime_install_output();
+        let should_refresh_runtime = self.agent.is_some()
+            || self.wxdb_init.is_some()
+            || self.runtime_install.is_some()
+            || self.tab == Tab::Runtime;
         if should_refresh_runtime && self.last_status_refresh.elapsed() >= Duration::from_secs(1) {
             self.refresh_status();
             self.last_status_refresh = Instant::now();
@@ -634,7 +654,7 @@ impl eframe::App for GuiApp {
                 if ui.button("打开输出目录").clicked() {
                     self.open_output();
                 }
-                if ui.button("安装 Python Runtime").clicked() {
+                if ui.button("安装微信运行环境").clicked() {
                     self.install_runtime();
                 }
                 if ui.button("运行外部 wxdb init").clicked() {
@@ -642,9 +662,6 @@ impl eframe::App for GuiApp {
                 }
                 if ui.button("启动主程序").clicked() {
                     self.start_agent();
-                }
-                if ui.button("管理员启动主程序").clicked() {
-                    self.start_agent_elevated();
                 }
                 if ui.button("停止托管主程序").clicked() {
                     self.stop_agent();
@@ -3120,42 +3137,26 @@ fn hide_command_window(command: &mut Command) {
     }
 }
 
-fn start_agent_elevated(state: &AppState) -> Result<()> {
-    let app = find_exe("wechat-summary-app");
-    if !app.exists() {
-        return Err(anyhow!("主程序不存在: {}", app.display()));
-    }
-
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("powershell.exe");
-        command
-            .arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-Command")
-            .arg(
-                "Start-Process -FilePath $args[0] -ArgumentList @('--config', $args[1]) -WorkingDirectory $args[2] -WindowStyle Hidden -Verb RunAs",
-            )
-            .arg(&app)
-            .arg(&state.config_path)
-            .arg(&state.working_dir);
-        hide_command_window(&mut command);
-        command
-            .spawn()
-            .context("starting wechat-summary-app as administrator")?;
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _agent = start_agent(state)?;
-        Ok(())
-    }
-}
-
-fn install_runtime(state: &AppState) -> Result<()> {
-    let script = state.working_dir.join("install.ps1");
+fn start_runtime_install(
+    state: &AppState,
+    configured_wxdb_executable: &str,
+) -> Result<RuntimeInstallProcess> {
+    let packaged_script = state.working_dir.join("install.ps1");
+    let (script, runtime_root) = if packaged_script.exists() {
+        (packaged_script, state.working_dir.clone())
+    } else {
+        let runtime_root = state
+            .working_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| state.working_dir.clone());
+        (
+            runtime_root
+                .join("scripts")
+                .join("install-python-runtime.ps1"),
+            runtime_root,
+        )
+    };
     if !script.exists() {
         return Err(anyhow!("安装脚本不存在: {}", script.display()));
     }
@@ -3166,10 +3167,34 @@ fn install_runtime(state: &AppState) -> Result<()> {
         .arg("Bypass")
         .arg("-File")
         .arg(&script)
+        .arg("-RootPath")
+        .arg(&runtime_root)
+        .arg("-ConfigPath")
+        .arg(&state.config_path)
+        .arg("-ExistingWxdbExecutable")
+        .arg(configured_wxdb_executable)
         .current_dir(&state.working_dir);
     hide_command_window(&mut command);
-    command.spawn().context("starting install.ps1")?;
-    Ok(())
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .context("starting Python runtime installer")?;
+    let pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .context("capturing Python runtime installer stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capturing Python runtime installer stderr")?;
+    let (sender, output) = mpsc::channel();
+    spawn_output_reader("setup stdout", stdout, sender.clone());
+    spawn_output_reader("setup stderr", stderr, sender);
+    Ok(RuntimeInstallProcess { child, output, pid })
 }
 
 fn resolve_config_path(config_arg: Option<&Path>) -> Result<PathBuf> {
