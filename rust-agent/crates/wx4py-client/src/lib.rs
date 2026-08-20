@@ -1027,7 +1027,7 @@ pub fn build_wx_cli_history_command(
         "--until".to_string(),
         format_beijing_date(until),
         "--type".to_string(),
-        "text".to_string(),
+        "all".to_string(),
         "--json".to_string(),
         "-n".to_string(),
         limit.to_string(),
@@ -1422,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_wx_cli_history_command_with_beijing_time_and_text_filter() {
+    fn builds_wx_cli_history_command_with_beijing_time_and_all_supported_media() {
         let cmd = build_wx_cli_history_command(
             &wx_cli_config(),
             "测试群",
@@ -1438,7 +1438,7 @@ mod tests {
         assert!(cmd.contains(&"2026-05-24".to_string()));
         assert!(cmd.contains(&"--json".to_string()));
         assert!(cmd.contains(&"--type".to_string()));
-        assert!(cmd.contains(&"text".to_string()));
+        assert!(cmd.contains(&"all".to_string()));
         let cursor_index = cmd
             .iter()
             .position(|value| value == "--before-local-id")
