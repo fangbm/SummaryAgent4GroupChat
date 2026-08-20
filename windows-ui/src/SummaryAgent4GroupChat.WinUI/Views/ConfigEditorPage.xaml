@@ -3,18 +3,97 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <Grid Padding="28" RowSpacing="14">
-        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
         <StackPanel Spacing="4">
             <TextBlock x:Name="PageTitle" Style="{ThemeResource TitleTextBlockStyle}" />
             <TextBlock x:Name="PageDescription" Opacity="0.72" TextWrapping="Wrap" />
         </StackPanel>
+
         <InfoBar Grid.Row="1" IsOpen="True" IsClosable="False" Severity="Informational" Message="{Binding ValidationMessage}" />
+
         <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="10">
             <Button Content="校验" Click="Validate_Click" />
             <Button Content="保存并热重载" Click="Save_Click" Style="{StaticResource AccentButtonStyle}" />
             <Button Content="还原磁盘配置" Click="Refresh_Click" />
             <Button Content="打开配置文件" Click="OpenConfig_Click" />
         </StackPanel>
-        <TextBox Grid.Row="3" Margin="0,0,0,4" Text="{Binding ConfigText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" FontFamily="Cascadia Mono" TextWrapping="NoWrap" AcceptsReturn="True" VerticalAlignment="Stretch" HorizontalAlignment="Stretch" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" />
+
+        <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel MaxWidth="1060" Spacing="18" Padding="0,4,12,24">
+                <StackPanel x:Name="PlatformPanel" Spacing="14" Visibility="Collapsed">
+                    <TextBlock Text="平台与历史记录" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="运行平台" /><ComboBox SelectedValuePath="Content" SelectedValue="{Binding PlatformKind, Mode=TwoWay}"><ComboBoxItem Content="wx" /><ComboBoxItem Content="discord" /></ComboBox></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="每页历史读取条数" /><NumberBox Value="{Binding HistoryPageSize, Mode=TwoWay}" SpinButtonPlacementMode="Compact" Minimum="1" /></StackPanel>
+                        <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="微信目标群（逗号或换行分隔）" /><TextBox Text="{Binding WeChatGroups, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="88" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="Discord 频道 ID（逗号或换行分隔）" /><TextBox Text="{Binding DiscordChannels, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="88" /></StackPanel>
+                        <StackPanel Grid.Row="2" Spacing="5"><TextBlock Text="wxdb 可执行文件" /><TextBox Text="{Binding WxdbExecutable, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="2" Grid.Column="1" Spacing="5"><TextBlock Text="wxdb 缓存目录（留空使用默认位置）" /><TextBox Text="{Binding WxdbCacheDirectory, Mode=TwoWay}" /></StackPanel>
+                    </Grid>
+                    <StackPanel Spacing="5"><TextBlock Text="禁用图片总结的群聊（逗号或换行分隔）" /><TextBox Text="{Binding DisabledImageRooms, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="72" /></StackPanel>
+                </StackPanel>
+
+                <StackPanel x:Name="ListenPanel" Spacing="14" Visibility="Collapsed">
+                    <TextBlock Text="触发与冷却" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="总结指令（逗号或换行分隔）" /><TextBox Text="{Binding TriggerCommands, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="允许触发的群聊（留空不额外限制）" /><TextBox Text="{Binding WhitelistRooms, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="文字总结成功后冷却（秒）" /><NumberBox Value="{Binding RequestCooldownSeconds, Mode=TwoWay}" SpinButtonPlacementMode="Compact" Minimum="0" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片额外冷却（秒）" /><NumberBox Value="{Binding ImageCooldownSeconds, Mode=TwoWay}" SpinButtonPlacementMode="Compact" Minimum="0" /></StackPanel>
+                    </Grid>
+                    <CheckBox Content="忽略机器人自己发送的消息" IsChecked="{Binding IgnoreSelf, Mode=TwoWay}" />
+                    <CheckBox Content="手动总结默认生成图片（带 图片/image/img 参数时反向切换）" IsChecked="{Binding ManualImagesByDefault, Mode=TwoWay}" />
+                </StackPanel>
+
+                <StackPanel x:Name="SchedulePanel" Spacing="14" Visibility="Collapsed">
+                    <TextBlock Text="定时总结" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <CheckBox Content="启用定时总结" IsChecked="{Binding ScheduleEnabled, Mode=TwoWay}" />
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="每天执行时间（HH:mm）" /><TextBox Text="{Binding ScheduleTime, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="总结最近（小时）" /><NumberBox Value="{Binding ScheduleRangeHours, Mode=TwoWay}" SpinButtonPlacementMode="Compact" Minimum="1" /></StackPanel>
+                        <StackPanel Grid.Column="2" Spacing="5"><TextBlock Text="目标群聊（留空使用平台目标）" /><TextBox Text="{Binding ScheduleRooms, Mode=TwoWay}" /></StackPanel>
+                    </Grid>
+                    <StackPanel Orientation="Horizontal" Spacing="20"><CheckBox Content="发送文字总结" IsChecked="{Binding ScheduleSendText, Mode=TwoWay}" /><CheckBox Content="发送图片总结" IsChecked="{Binding ScheduleSendImage, Mode=TwoWay}" /></StackPanel>
+                </StackPanel>
+
+                <StackPanel x:Name="ModelsPanel" Spacing="16" Visibility="Collapsed">
+                    <TextBlock Text="文字总结模型" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="API Key 环境变量" /><TextBox Text="{Binding LlmApiKeyEnvironment, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="模型名称" /><TextBox Text="{Binding LlmModel, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="Base URL" /><TextBox Text="{Binding LlmBaseUrl, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Spacing="16"><StackPanel Width="150" Spacing="5"><TextBlock Text="超时（秒）" /><NumberBox Value="{Binding LlmTimeoutSeconds, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel><StackPanel Width="150" Spacing="5"><TextBlock Text="最大输出 Token" /><NumberBox Value="{Binding LlmMaxOutputTokens, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel><StackPanel Width="150" Spacing="5"><TextBlock Text="分段并发数" /><NumberBox Value="{Binding LlmChunkConcurrency, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel></StackPanel>
+                    </Grid>
+
+                    <TextBlock Text="图片生成与媒体理解" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
+                    <StackPanel Orientation="Horizontal" Spacing="20"><CheckBox Content="启用图片生成" IsChecked="{Binding ImageGenerationEnabled, Mode=TwoWay}" /><CheckBox Content="启用图片转述" IsChecked="{Binding ImageCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用视频转述" IsChecked="{Binding VideoCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用语音转写" IsChecked="{Binding VoiceTranscriptionEnabled, Mode=TwoWay}" /></StackPanel>
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="图片 API Key 环境变量" /><TextBox Text="{Binding ImageApiKeyEnvironment, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片模型名称" /><TextBox Text="{Binding ImageModel, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="图片 Base URL" /><TextBox Text="{Binding ImageBaseUrl, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片超时（秒）" /><NumberBox Value="{Binding ImageTimeoutSeconds, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel>
+                    </Grid>
+                </StackPanel>
+
+                <Expander Header="高级配置（请求体覆写、提示词与未覆盖字段）" IsExpanded="False">
+                    <StackPanel Spacing="10" Padding="0,12,0,0">
+                        <TextBlock Text="这里保留完整 TOML；普通配置请优先用上方表单。保存前会由 Rust 使用主程序相同规则校验。" TextWrapping="Wrap" Opacity="0.72" />
+                        <StackPanel Orientation="Horizontal" Spacing="10"><Button Content="从 TOML 载入表单" Click="LoadForm_Click" /><Button Content="保存高级 TOML" Click="SaveRaw_Click" /></StackPanel>
+                        <TextBox Text="{Binding ConfigText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" FontFamily="Cascadia Mono" FontSize="13" TextWrapping="NoWrap" AcceptsReturn="True" MinHeight="360" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" />
+                    </StackPanel>
+                </Expander>
+            </StackPanel>
+        </ScrollViewer>
     </Grid>
 </Page>
