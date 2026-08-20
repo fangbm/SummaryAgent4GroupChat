@@ -32,6 +32,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub scheduled_summary: ScheduledSummaryConfig,
     #[serde(default)]
+    pub room_capabilities: BTreeMap<String, RoomCapabilityConfig>,
+    #[serde(default)]
     pub history: HistoryConfig,
     pub storage: StorageConfig,
     #[serde(default, alias = "wxdb")]
@@ -74,6 +76,20 @@ impl AgentConfig {
             .or_else(|| self.wx_cli.max_messages.map(|value| value as usize))
             .unwrap_or_else(default_history_max_messages)
     }
+
+    pub fn image_summary_enabled_for_room(&self, room_id: &str) -> bool {
+        self.room_capabilities
+            .get(room_id)
+            .and_then(|capabilities| capabilities.image_summary_enabled)
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RoomCapabilityConfig {
+    /// `None` inherits the global image-generation configuration.
+    #[serde(default)]
+    pub image_summary_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1256,6 +1272,40 @@ api_key_env = "LLM_API_KEY""#,
         assert_eq!(cfg.history_message_limit(), 10_000);
         assert_eq!(cfg.runtime.max_log_mb, 50);
         assert!(!cfg.runtime.ai_trace_enabled);
+    }
+
+    #[test]
+    fn room_capabilities_override_image_summary_per_room() {
+        #[derive(Deserialize)]
+        struct RoomCapabilitiesOnly {
+            #[serde(default)]
+            room_capabilities: BTreeMap<String, RoomCapabilityConfig>,
+        }
+
+        let cfg: RoomCapabilitiesOnly = toml::from_str(
+            r#"
+[room_capabilities."只发文字的群"]
+image_summary_enabled = false
+
+[room_capabilities."图片仍开启"]
+image_summary_enabled = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.room_capabilities["只发文字的群"].image_summary_enabled,
+            Some(false)
+        );
+        assert_eq!(
+            cfg.room_capabilities["图片仍开启"].image_summary_enabled,
+            Some(true)
+        );
+        assert!(cfg
+            .room_capabilities
+            .get("未配置的群")
+            .and_then(|capability| capability.image_summary_enabled)
+            .unwrap_or(true));
     }
 
     #[test]

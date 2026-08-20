@@ -66,6 +66,11 @@ send_image = true
 # Scheduled summaries are allowed to run even if a manual summary succeeded recently.
 ignore_rate_limit = true
 
+[room_capabilities]
+# Per-room capability overrides. Keys are WeChat group display names or Discord channel IDs.
+# Omit a room to inherit the global image-generation settings.
+# "Example Group" = { image_summary_enabled = false }
+
 [storage]
 sqlite_path = ".\\runtime\\rust-agent.sqlite3"
 

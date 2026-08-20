@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::{
+    collections::BTreeSet,
     env, fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
@@ -52,6 +53,7 @@ struct ConfigView {
     wx_long_text_file_dir: String,
     discord_channels: String,
     discord_token_env: String,
+    room_image_summary_disabled: String,
     triggers: String,
     match_mode: String,
     whitelist_rooms: String,
@@ -671,7 +673,16 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Dashboard => dashboard_tab(ui, self),
             Tab::Platform => {
-                egui::Frame::group(ui.style()).show(ui, |ui| platform_tab(ui, &mut self.view));
+                egui::ScrollArea::vertical()
+                    .id_salt("platform-tab-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            platform_tab(ui, &mut self.view);
+                        });
+                    });
             }
             Tab::Listen => {
                 egui::Frame::group(ui.style()).show(ui, |ui| listen_tab(ui, &mut self.view));
@@ -900,6 +911,10 @@ fn platform_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             text_field(ui, "Discord Token 环境变量", &mut view.discord_token_env);
         },
     );
+    ui.separator();
+    ui.heading("按群聊/频道能力覆盖");
+    ui.label("禁用图片总结的群聊/频道（每行一个；微信填群显示名，Discord 填频道 ID）");
+    multiline_field(ui, "禁用图片总结", &mut view.room_image_summary_disabled, 5);
 }
 
 fn listen_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
@@ -1764,6 +1779,15 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             wx_long_text_file_dir: config.wx4py.long_text_file_dir,
             discord_channels: join_lines(&config.discord.channels),
             discord_token_env: config.discord.token_env,
+            room_image_summary_disabled: join_lines(
+                &config
+                    .room_capabilities
+                    .iter()
+                    .filter_map(|(room, capabilities)| {
+                        (capabilities.image_summary_enabled == Some(false)).then_some(room.clone())
+                    })
+                    .collect::<Vec<_>>(),
+            ),
             triggers: join_lines(&config.listen.triggers),
             match_mode: format!("{:?}", config.listen.match_mode).to_ascii_lowercase(),
             whitelist_rooms: join_lines(&config.listen.whitelist_rooms),
@@ -1966,6 +1990,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         wx_long_text_file_dir: get_str(doc, "wx4py", "long_text_file_dir", ""),
         discord_channels: join_lines(&get_array(doc, "discord", "channels")),
         discord_token_env: get_str(doc, "discord", "token_env", "DISCORD_BOT_TOKEN"),
+        room_image_summary_disabled: disabled_image_summary_rooms_from_doc(doc),
         triggers: join_lines(&get_array(doc, "listen", "triggers")),
         match_mode: get_str(doc, "listen", "match_mode", "prefix"),
         whitelist_rooms: join_lines(&get_array(doc, "listen", "whitelist_rooms")),
@@ -2267,6 +2292,7 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
     let discord = table_mut(&mut doc, "discord");
     set_str(discord, "token_env", &update.discord_token_env);
     set_array(discord, "channels", &split_lines(&update.discord_channels));
+    set_disabled_image_summary_rooms(&mut doc, &split_lines(&update.room_image_summary_disabled));
 
     let listen = table_mut(&mut doc, "listen");
     set_array(listen, "triggers", &split_lines(&update.triggers));
@@ -2662,6 +2688,76 @@ fn table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut Table {
         doc[name] = Item::Table(Table::new());
     }
     doc[name].as_table_mut().expect("table must exist")
+}
+
+fn disabled_image_summary_rooms_from_doc(doc: &DocumentMut) -> String {
+    let mut rooms = table(doc, "room_capabilities")
+        .into_iter()
+        .flat_map(|capabilities| capabilities.iter())
+        .filter_map(|(room, item)| {
+            let enabled = item
+                .as_inline_table()
+                .and_then(|entry| entry.get("image_summary_enabled"))
+                .and_then(TomlValue::as_bool)
+                .or_else(|| {
+                    item.as_table()
+                        .and_then(|entry| entry.get("image_summary_enabled"))
+                        .and_then(Item::as_bool)
+                });
+            (enabled == Some(false)).then_some(room.to_string())
+        })
+        .collect::<Vec<_>>();
+    rooms.sort();
+    join_lines(&rooms)
+}
+
+fn set_disabled_image_summary_rooms(doc: &mut DocumentMut, rooms: &[String]) {
+    let disabled = rooms
+        .iter()
+        .map(|room| room.trim())
+        .filter(|room| !room.is_empty())
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let capabilities = table_mut(doc, "room_capabilities");
+    let existing_rooms = capabilities
+        .iter()
+        .map(|(room, _)| room.to_string())
+        .collect::<Vec<_>>();
+
+    for room in existing_rooms {
+        if disabled.contains(&room) {
+            continue;
+        }
+        let mut remove_room = false;
+        if let Some(item) = capabilities.get_mut(&room) {
+            if let Some(entry) = item.as_inline_table_mut() {
+                entry.remove("image_summary_enabled");
+                remove_room = entry.is_empty();
+            } else if let Some(entry) = item.as_table_mut() {
+                entry.remove("image_summary_enabled");
+                remove_room = entry.is_empty();
+            }
+        }
+        if remove_room {
+            capabilities.remove(&room);
+        }
+    }
+
+    for room in disabled {
+        if let Some(item) = capabilities.get_mut(&room) {
+            if let Some(entry) = item.as_inline_table_mut() {
+                entry.insert("image_summary_enabled", TomlValue::from(false));
+                continue;
+            }
+            if let Some(entry) = item.as_table_mut() {
+                entry["image_summary_enabled"] = value(false);
+                continue;
+            }
+        }
+        let mut entry = InlineTable::new();
+        entry.insert("image_summary_enabled", TomlValue::from(false));
+        capabilities.insert(&room, Item::Value(TomlValue::InlineTable(entry)));
+    }
 }
 
 fn get_str(doc: &DocumentMut, table_name: &str, key: &str, default: &str) -> String {
@@ -3472,6 +3568,9 @@ provider = "openai"
 api_key_env = "IMAGE_API_KEY"
 size = "2:3"
 
+[room_capabilities]
+"原先禁图的群" = { image_summary_enabled = false, future_option = "keep" }
+
 [runtime]
 output_dir = ".\\runtime\\test"
 "#;
@@ -3487,6 +3586,7 @@ output_dir = ".\\runtime\\test"
         view.llm_max_concurrent_per_key = 3;
         view.image_api_keys = "img-key".to_string();
         view.image_max_concurrent_per_key = 1;
+        view.room_image_summary_disabled = "新的禁图群".to_string();
         save_config_update(&state, view).unwrap();
 
         let reloaded_text = std::fs::read_to_string(&path).unwrap();
@@ -3499,6 +3599,10 @@ output_dir = ".\\runtime\\test"
         assert_eq!(reloaded.llm_max_concurrent_per_key, 3);
         assert_eq!(reloaded.image_api_keys, "img-key");
         assert_eq!(reloaded.image_max_concurrent_per_key, 1);
+        assert_eq!(reloaded.room_image_summary_disabled, "新的禁图群");
+        assert!(reloaded_text.contains("future_option = \"keep\""));
+        assert!(!reloaded_text.contains("\"原先禁图的群\" = { image_summary_enabled"));
+        assert!(reloaded_text.contains("\"新的禁图群\" = { image_summary_enabled = false"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

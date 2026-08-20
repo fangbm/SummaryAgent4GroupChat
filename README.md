@@ -9,6 +9,7 @@ Windows 原生群聊总结助手。它监听微信或 Discord 的群聊指令，
 - 微信群与 Discord 频道接入，统一使用 `/总结` 指令和定时任务。
 - `/总结 [platform] [time] [图片]`：支持 `wx`、`微信`、`wechat`、`dc`、`discord`，大小写不敏感；平台省略时使用收到指令的平台。
 - 文本总结、图片总结、图片生成，以及超长历史按页读取和分段处理。
+- 按群聊或频道单独关闭图片总结，让指定房间只发送文字总结。
 - 可选图片转述、视频转述和语音转写；语音可通过 FFmpeg 转为 MP3。
 - 5xx 指数退避重试、429 串行重试队列、多 API Key 并发控制、失败原因与请求 trace 脱敏落盘。
 - 微信长文本自动分段发送，或按配置改为发送 `.txt` 文件。
@@ -118,6 +119,18 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 
 `wxdb init` 会刷新本地密钥缓存。缓存和密钥数据敏感，请放在受信任磁盘；缓存目录可在 GUI 的接入平台页修改。
 
+### 按群聊/频道能力覆盖
+
+全局图片生成保持开启时，可以让某些群只发送文字总结。GUI 的“接入平台”页提供每行一个的房间列表；保存后会写入以下配置。微信填写群显示名，Discord 填频道 ID：
+
+```toml
+[room_capabilities]
+"只发文字的微信群" = { image_summary_enabled = false }
+"123456789012345678" = { image_summary_enabled = false }
+```
+
+未列出的房间继承全局图片总结配置。该覆盖同时作用于手动指令和定时任务，且不会开启图片冷却。
+
 ## 指令与定时任务
 
 | 指令 | 作用 |
@@ -183,7 +196,7 @@ GUI 使用 Windows UAC manifest；本地 `cargo test -p wechat-summary-gui` 在�
 
 ```toml
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 ```
 
 发布工作流只关注版本变化；仅修改 README、GUI 或配置不会生成 Release。这样可以避免每次普通提交都制造安装包版本。

@@ -1924,7 +1924,18 @@ async fn handle_platform_event(
         return Ok(());
     }
 
-    let mut pipeline_options = PipelineOptions::manual(config, command.image_token_present);
+    let mut pipeline_options =
+        PipelineOptions::manual(config, &trigger.room_id, command.image_token_present);
+    if config.image_gen.enabled && !config.image_summary_enabled_for_room(&trigger.room_id) {
+        info!(room_id = %trigger.room_id, "image summary disabled by room capability");
+        append_runtime_log(
+            config,
+            &format!(
+                "image summary disabled by room capability room={}",
+                trigger.room_id
+            ),
+        );
+    }
     if pipeline_options.image_gen_enabled {
         let last_image = store.get_last_image(&trigger.room_id)?;
         if let Some(remaining) = image_cooldown_remaining(incoming.timestamp, last_image, config) {
@@ -2326,13 +2337,23 @@ async fn run_scheduled_summary_task(
     range: ResolvedTimeRange,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    if config.image_gen.enabled && !config.image_summary_enabled_for_room(&trigger.room_id) {
+        info!(room_id = %trigger.room_id, "scheduled image summary disabled by room capability");
+        append_runtime_log(
+            config,
+            &format!(
+                "scheduled image summary disabled by room capability room={}",
+                trigger.room_id
+            ),
+        );
+    }
     match run_summary_pipeline(
         config,
         client,
         &incoming,
         &trigger,
         &range,
-        PipelineOptions::scheduled(config),
+        PipelineOptions::scheduled(config, &trigger.room_id),
         None,
         None,
     )
@@ -2399,12 +2420,14 @@ enum PipelineOutcome {
 }
 
 impl PipelineOptions {
-    fn manual(config: &AgentConfig, image_token_present: bool) -> Self {
+    fn manual(config: &AgentConfig, room_id: &str, image_token_present: bool) -> Self {
         let image_enabled_for_request =
             config.manual_summary.image_by_default ^ image_token_present;
         Self {
             text_summary_enabled: config.text_summary.enabled,
-            image_gen_enabled: config.image_gen.enabled && image_enabled_for_request,
+            image_gen_enabled: config.image_gen.enabled
+                && config.image_summary_enabled_for_room(room_id)
+                && image_enabled_for_request,
             send_progress: true,
             defer_text_until_image_ready: false,
             send_disabled_message: true,
@@ -2412,10 +2435,12 @@ impl PipelineOptions {
         }
     }
 
-    fn scheduled(config: &AgentConfig) -> Self {
+    fn scheduled(config: &AgentConfig, room_id: &str) -> Self {
         Self {
             text_summary_enabled: config.scheduled_summary.send_text && config.text_summary.enabled,
-            image_gen_enabled: config.scheduled_summary.send_image && config.image_gen.enabled,
+            image_gen_enabled: config.scheduled_summary.send_image
+                && config.image_gen.enabled
+                && config.image_summary_enabled_for_room(room_id),
             send_progress: false,
             defer_text_until_image_ready: true,
             send_disabled_message: false,
@@ -7201,8 +7226,8 @@ mod tests {
         config.image_gen.enabled = true;
         config.manual_summary.image_by_default = false;
 
-        assert!(!PipelineOptions::manual(&config, false).image_gen_enabled);
-        assert!(PipelineOptions::manual(&config, true).image_gen_enabled);
+        assert!(!PipelineOptions::manual(&config, "test-room", false).image_gen_enabled);
+        assert!(PipelineOptions::manual(&config, "test-room", true).image_gen_enabled);
     }
 
     #[test]
@@ -7211,22 +7236,41 @@ mod tests {
         config.image_gen.enabled = true;
         config.manual_summary.image_by_default = true;
 
-        assert!(PipelineOptions::manual(&config, false).image_gen_enabled);
-        assert!(!PipelineOptions::manual(&config, true).image_gen_enabled);
+        assert!(PipelineOptions::manual(&config, "test-room", false).image_gen_enabled);
+        assert!(!PipelineOptions::manual(&config, "test-room", true).image_gen_enabled);
     }
 
     #[test]
     fn manual_pipeline_logs_retry_attempts() {
         let config = test_config();
 
-        assert!(PipelineOptions::manual(&config, false).log_retry_attempts);
+        assert!(PipelineOptions::manual(&config, "test-room", false).log_retry_attempts);
     }
 
     #[test]
     fn scheduled_pipeline_suppresses_retry_attempt_logs() {
         let config = test_config();
 
-        assert!(!PipelineOptions::scheduled(&config).log_retry_attempts);
+        assert!(!PipelineOptions::scheduled(&config, "test-room").log_retry_attempts);
+    }
+
+    #[test]
+    fn room_capability_disables_manual_and_scheduled_image_summary() {
+        let mut config = test_config();
+        config.image_gen.enabled = true;
+        config.manual_summary.image_by_default = true;
+        config.scheduled_summary.send_image = true;
+        config.room_capabilities.insert(
+            "text-only-room".to_string(),
+            wechat_summary_core::config::RoomCapabilityConfig {
+                image_summary_enabled: Some(false),
+            },
+        );
+
+        assert!(!PipelineOptions::manual(&config, "text-only-room", false).image_gen_enabled);
+        assert!(PipelineOptions::manual(&config, "other-room", false).image_gen_enabled);
+        assert!(!PipelineOptions::scheduled(&config, "text-only-room").image_gen_enabled);
+        assert!(PipelineOptions::scheduled(&config, "other-room").image_gen_enabled);
     }
 
     #[test]
