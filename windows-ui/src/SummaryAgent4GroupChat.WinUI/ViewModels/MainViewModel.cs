@@ -50,6 +50,9 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _llmBaseUrl = string.Empty;
     [ObservableProperty] private string _llmModel = string.Empty;
     [ObservableProperty] private string _llmTimeoutSeconds = "120";
+    [ObservableProperty] private bool _llmStreamingEnabled = true;
+    [ObservableProperty] private string _llmStreamFirstEventTimeoutSeconds = "30";
+    [ObservableProperty] private string _llmStreamIdleTimeoutSeconds = "30";
     [ObservableProperty] private string _llmMaxOutputTokens = "2000";
     [ObservableProperty] private string _llmChunkConcurrency = "4";
     [ObservableProperty] private bool _imageGenerationEnabled = true;
@@ -192,6 +195,9 @@ public sealed partial class MainViewModel : ObservableObject
         LlmBaseUrl = ReadString("llm", "base_url", string.Empty);
         LlmModel = ReadString("llm", "model", string.Empty);
         LlmTimeoutSeconds = ReadString("llm", "timeout_seconds", "120");
+        LlmStreamingEnabled = ReadBool("llm", "stream", true);
+        LlmStreamFirstEventTimeoutSeconds = ReadString("llm", "stream_first_event_timeout_seconds", "30");
+        LlmStreamIdleTimeoutSeconds = ReadString("llm", "stream_idle_timeout_seconds", "30");
         LlmMaxOutputTokens = ReadString("llm", "max_output_tokens", "2000");
         LlmChunkConcurrency = ReadString("llm", "max_concurrent_chunk_requests", "4");
         ImageGenerationEnabled = ReadBool("image_gen", "enabled", true);
@@ -234,6 +240,9 @@ public sealed partial class MainViewModel : ObservableObject
         WriteOptionalString("llm", "base_url", LlmBaseUrl);
         WriteOptionalString("llm", "model", LlmModel);
         WriteNumber("llm", "timeout_seconds", LlmTimeoutSeconds, 120);
+        WriteBool("llm", "stream", LlmStreamingEnabled);
+        WriteNumber("llm", "stream_first_event_timeout_seconds", LlmStreamFirstEventTimeoutSeconds, 30);
+        WriteNumber("llm", "stream_idle_timeout_seconds", LlmStreamIdleTimeoutSeconds, 30);
         WriteNumber("llm", "max_output_tokens", LlmMaxOutputTokens, 2000);
         WriteNumber("llm", "max_concurrent_chunk_requests", LlmChunkConcurrency, 4);
         WriteBool("image_gen", "enabled", ImageGenerationEnabled);

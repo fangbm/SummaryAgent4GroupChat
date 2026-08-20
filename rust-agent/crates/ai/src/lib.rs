@@ -103,6 +103,8 @@ pub enum AiError {
     Io(#[from] std::io::Error),
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    #[error("streaming response failed: {0}")]
+    Stream(String),
     #[error("rate limited: {0}")]
     RateLimited(String),
     #[error("image task failed: {0}")]
@@ -111,6 +113,95 @@ pub enum AiError {
     ImageTaskTimeout(u64),
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
+}
+
+#[derive(Debug)]
+enum ChatCompletionRequestError {
+    Http(reqwest::Error),
+    FirstEventTimeout(u64),
+}
+
+impl ChatCompletionRequestError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Http(error) => should_retry_http_transport_error(error),
+            Self::FirstEventTimeout(_) => true,
+        }
+    }
+
+    fn retry_reason(&self) -> String {
+        match self {
+            Self::Http(error) => retry_reason_from_transport_error(error),
+            Self::FirstEventTimeout(seconds) => {
+                format!("stream first event timed out after {seconds} seconds")
+            }
+        }
+    }
+
+    fn into_ai_error(self) -> AiError {
+        match self {
+            Self::Http(error) => AiError::Http(error),
+            Self::FirstEventTimeout(seconds) => AiError::Stream(format!(
+                "did not receive response headers within {seconds} seconds"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ChatCompletionRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(error) => error.fmt(formatter),
+            Self::FirstEventTimeout(seconds) => write!(
+                formatter,
+                "stream first event timed out after {seconds} seconds before response headers"
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ChatCompletionStreamError {
+    FirstEventTimeout(u64),
+    IdleTimeout(u64),
+    EndedWithoutDone,
+    Read(reqwest::Error),
+    InvalidEvent(String),
+}
+
+impl ChatCompletionStreamError {
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::FirstEventTimeout(_)
+                | Self::IdleTimeout(_)
+                | Self::EndedWithoutDone
+                | Self::Read(_)
+        )
+    }
+
+    fn into_ai_error(self) -> AiError {
+        AiError::Stream(self.to_string())
+    }
+}
+
+impl std::fmt::Display for ChatCompletionStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FirstEventTimeout(seconds) => {
+                write!(
+                    formatter,
+                    "did not receive first SSE event within {seconds} seconds"
+                )
+            }
+            Self::IdleTimeout(seconds) => {
+                write!(formatter, "SSE stream was idle for {seconds} seconds")
+            }
+            Self::EndedWithoutDone => write!(formatter, "SSE stream ended before [DONE]"),
+            Self::Read(error) => write!(formatter, "failed to read SSE stream: {error}"),
+            Self::InvalidEvent(error) => write!(formatter, "invalid SSE event: {error}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -448,6 +539,9 @@ impl OpenAiCompatibleLlm {
             max_tokens,
         );
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
+        if self.config.stream {
+            payload["stream"] = Value::Bool(true);
+        }
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         let mut thinking_fallback_used = false;
@@ -468,24 +562,34 @@ impl OpenAiCompatibleLlm {
                     user_chars = user_content.chars().count(),
                     max_tokens = ?max_tokens,
                     timeout_seconds = self.config.timeout_seconds,
+                    stream = self.config.stream,
+                    stream_first_event_timeout_seconds = self.config.stream_first_event_timeout_seconds,
+                    stream_idle_timeout_seconds = self.config.stream_idle_timeout_seconds,
                     attempt,
                     max_attempts,
                     thinking_fallback = thinking_fallback_used,
                     "LLM chat completion request started"
                 );
-                let response = match self
+                let stream_first_event_timeout_seconds =
+                    self.config.stream_first_event_timeout_seconds.max(1);
+                let request = self
                     .client
                     .post(&endpoint)
                     .bearer_auth(permit.key())
-                    .json(&payload)
-                    .send()
-                    .await
+                    .json(&payload);
+                let response = match send_chat_completion_request(
+                    request,
+                    self.config
+                        .stream
+                        .then(|| Duration::from_secs(stream_first_event_timeout_seconds)),
+                )
+                .await
                 {
                     Ok(response) => response,
                     Err(error) => {
                         let elapsed_ms = started.elapsed().as_millis();
                         let retry = attempt < max_attempts
-                            && should_retry_http_transport_error(&error)
+                            && error.is_retryable()
                             && retry_budget.allows(http_retry_delay_ms(attempt));
                         let retry_after_ms = if retry {
                             http_retry_delay_ms(attempt)
@@ -527,13 +631,13 @@ impl OpenAiCompatibleLlm {
                                 attempt,
                                 max_attempts,
                                 retry_after_ms,
-                                retry_reason_from_transport_error(&error),
+                                error.retry_reason(),
                             )
                             .await;
                             sleep(http_retry_delay(attempt)).await;
                             continue;
                         }
-                        return Err(AiError::Http(error));
+                        return Err(error.into_ai_error());
                     }
                 };
                 let status = response.status();
@@ -630,40 +734,111 @@ impl OpenAiCompatibleLlm {
                     "LLM chat completion HTTP request completed"
                 );
 
-                let body = response.text().await?;
-                let response = match serde_json::from_str::<Value>(&body) {
-                    Ok(response) => response,
-                    Err(error) => {
-                        self.write_http_trace(AiHttpTrace {
-                            trace_id,
-                            operation: "llm_chat_completion",
-                            context: self.trace_context.as_ref(),
-                            method: "POST",
-                            endpoint: &endpoint,
-                            model: Some(&self.model),
-                            attempt,
-                            max_attempts,
-                            elapsed_ms,
-                            status: Some(status.as_u16()),
-                            retry: false,
-                            retry_after_ms: 0,
-                            max_tokens,
-                            request_body: Some(&payload),
-                            response_body: Some(&body),
-                            error: None,
-                        });
-                        let response_for_log = full_response_for_log(&body);
-                        warn!(
-                            trace_id = %trace_id,
-                            elapsed_ms,
-                            response = %response_for_log,
-                            "LLM chat completion JSON parsing failed"
-                        );
-                        return Err(AiError::InvalidResponse(format!(
-                            "invalid chat completion JSON: {error}; response={response_for_log}"
-                        )));
+                let (body, response) = if self.config.stream && response_is_sse(&response) {
+                    let remaining_first_event_timeout =
+                        Duration::from_secs(stream_first_event_timeout_seconds)
+                            .saturating_sub(started.elapsed());
+                    match collect_streamed_chat_completion(
+                        response,
+                        remaining_first_event_timeout,
+                        Duration::from_secs(self.config.stream_idle_timeout_seconds.max(1)),
+                    )
+                    .await
+                    {
+                        Ok(streamed) => (streamed.raw_body, streamed.response),
+                        Err(error) => {
+                            let elapsed_ms = started.elapsed().as_millis();
+                            let retry = attempt < max_attempts
+                                && error.is_retryable()
+                                && retry_budget.allows(http_retry_delay_ms(attempt));
+                            let retry_after_ms = if retry {
+                                http_retry_delay_ms(attempt)
+                            } else {
+                                0
+                            };
+                            let error_message = error.to_string();
+                            self.write_http_trace(AiHttpTrace {
+                                trace_id,
+                                operation: "llm_chat_completion",
+                                context: self.trace_context.as_ref(),
+                                method: "POST",
+                                endpoint: &endpoint,
+                                model: Some(&self.model),
+                                attempt,
+                                max_attempts,
+                                elapsed_ms,
+                                status: Some(status.as_u16()),
+                                retry,
+                                retry_after_ms,
+                                max_tokens,
+                                request_body: Some(&payload),
+                                response_body: None,
+                                error: Some(&error_message),
+                            });
+                            warn!(
+                                trace_id = %trace_id,
+                                elapsed_ms,
+                                attempt,
+                                max_attempts,
+                                retry,
+                                retry_after_ms,
+                                error = %error_message,
+                                "LLM chat completion stream failed"
+                            );
+                            if retry {
+                                notify_retry(
+                                    &self.retry_notifier,
+                                    "LLM chat completion",
+                                    attempt,
+                                    max_attempts,
+                                    retry_after_ms,
+                                    error_message,
+                                )
+                                .await;
+                                sleep(http_retry_delay(attempt)).await;
+                                continue;
+                            }
+                            return Err(error.into_ai_error());
+                        }
                     }
+                } else {
+                    let body = response.text().await?;
+                    let response = match serde_json::from_str::<Value>(&body) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.write_http_trace(AiHttpTrace {
+                                trace_id,
+                                operation: "llm_chat_completion",
+                                context: self.trace_context.as_ref(),
+                                method: "POST",
+                                endpoint: &endpoint,
+                                model: Some(&self.model),
+                                attempt,
+                                max_attempts,
+                                elapsed_ms,
+                                status: Some(status.as_u16()),
+                                retry: false,
+                                retry_after_ms: 0,
+                                max_tokens,
+                                request_body: Some(&payload),
+                                response_body: Some(&body),
+                                error: None,
+                            });
+                            let response_for_log = full_response_for_log(&body);
+                            warn!(
+                                trace_id = %trace_id,
+                                elapsed_ms,
+                                response = %response_for_log,
+                                "LLM chat completion JSON parsing failed"
+                            );
+                            return Err(AiError::InvalidResponse(format!(
+                                "invalid chat completion JSON: {error}; response={response_for_log}"
+                            )));
+                        }
+                    };
+                    (body, response)
                 };
+                let elapsed_ms = started.elapsed().as_millis();
                 let Some(content) = extract_chat_completion_content(&response) else {
                     let finish_reason = chat_completion_finish_reason(&response);
                     let retry_without_thinking = !thinking_fallback_used
@@ -3869,6 +4044,176 @@ impl OpenAiImageClient {
     }
 }
 
+async fn send_chat_completion_request(
+    request: reqwest::RequestBuilder,
+    first_event_timeout: Option<Duration>,
+) -> Result<reqwest::Response, ChatCompletionRequestError> {
+    match first_event_timeout {
+        Some(timeout_duration) => match timeout(timeout_duration, request.send()).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => Err(ChatCompletionRequestError::Http(error)),
+            Err(_) => Err(ChatCompletionRequestError::FirstEventTimeout(
+                timeout_duration.as_secs(),
+            )),
+        },
+        None => request
+            .send()
+            .await
+            .map_err(ChatCompletionRequestError::Http),
+    }
+}
+
+struct StreamedChatCompletion {
+    raw_body: String,
+    response: Value,
+}
+
+struct SseChatCompletionAccumulator {
+    raw_body: Vec<u8>,
+    pending: Vec<u8>,
+    content: String,
+    finish_reason: Option<String>,
+    received_data: bool,
+    completed: bool,
+}
+
+impl SseChatCompletionAccumulator {
+    fn new() -> Self {
+        Self {
+            raw_body: Vec::new(),
+            pending: Vec::new(),
+            content: String::new(),
+            finish_reason: None,
+            received_data: false,
+            completed: false,
+        }
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), ChatCompletionStreamError> {
+        self.raw_body.extend_from_slice(chunk);
+        self.pending.extend_from_slice(chunk);
+
+        while let Some(frame_end) = sse_frame_end(&self.pending) {
+            let frame = self.pending.drain(..frame_end).collect::<Vec<_>>();
+            self.process_frame(&frame)?;
+            if self.completed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn process_frame(&mut self, frame: &[u8]) -> Result<(), ChatCompletionStreamError> {
+        let frame = std::str::from_utf8(frame).map_err(|error| {
+            ChatCompletionStreamError::InvalidEvent(format!("frame is not UTF-8: {error}"))
+        })?;
+        let data = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+            .collect::<Vec<_>>();
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        self.received_data = true;
+        let data = data.join("\n");
+        if data.trim() == "[DONE]" {
+            self.completed = true;
+            return Ok(());
+        }
+
+        let event: Value = serde_json::from_str(&data).map_err(|error| {
+            ChatCompletionStreamError::InvalidEvent(format!("invalid JSON data payload: {error}"))
+        })?;
+        if let Some(content) = content_value_to_text(event.pointer("/choices/0/delta/content")) {
+            self.content.push_str(&content);
+        }
+        if let Some(finish_reason) = event
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.finish_reason = Some(finish_reason.to_string());
+        }
+        Ok(())
+    }
+
+    fn into_streamed_response(self) -> StreamedChatCompletion {
+        StreamedChatCompletion {
+            raw_body: String::from_utf8_lossy(&self.raw_body).into_owned(),
+            response: json!({
+                "choices": [{
+                    "message": { "content": self.content },
+                    "finish_reason": self.finish_reason.unwrap_or_else(|| "stop".to_string()),
+                }]
+            }),
+        }
+    }
+}
+
+async fn collect_streamed_chat_completion(
+    mut response: reqwest::Response,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<StreamedChatCompletion, ChatCompletionStreamError> {
+    let mut accumulator = SseChatCompletionAccumulator::new();
+    loop {
+        let wait_timeout = if accumulator.received_data {
+            idle_timeout
+        } else {
+            first_event_timeout
+        };
+        let chunk = match timeout(wait_timeout, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => return Err(ChatCompletionStreamError::EndedWithoutDone),
+            Ok(Err(error)) => return Err(ChatCompletionStreamError::Read(error)),
+            Err(_) if accumulator.received_data => {
+                return Err(ChatCompletionStreamError::IdleTimeout(
+                    idle_timeout.as_secs(),
+                ))
+            }
+            Err(_) => {
+                return Err(ChatCompletionStreamError::FirstEventTimeout(
+                    first_event_timeout.as_secs(),
+                ))
+            }
+        };
+        accumulator.push_chunk(&chunk)?;
+        if accumulator.completed {
+            return Ok(accumulator.into_streamed_response());
+        }
+    }
+}
+
+fn response_is_sse(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
+}
+
+fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
+    let lf_end = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index + 2);
+    let crlf_end = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4);
+    match (lf_end, crlf_end) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
+}
+
 fn http_client(timeout_seconds: u64, proxy: &ProxyConfig) -> Result<reqwest::Client, AiError> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_seconds));
     if proxy.enabled {
@@ -5215,6 +5560,42 @@ data: {"type":"transcript.text.delta","delta":"文字"}
         });
 
         assert_eq!(extract_chat_completion_content(&response).as_deref(), None);
+    }
+
+    #[test]
+    fn streamed_chat_completion_collects_content_and_discards_reasoning() {
+        let mut accumulator = SseChatCompletionAccumulator::new();
+        let first = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"internal\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\r\n\r\n"
+        );
+        let second = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+            "data: [DONE]\r\n\r\n"
+        );
+
+        accumulator.push_chunk(first.as_bytes()).unwrap();
+        accumulator.push_chunk(second.as_bytes()).unwrap();
+
+        assert!(accumulator.received_data);
+        assert!(accumulator.completed);
+        let streamed = accumulator.into_streamed_response();
+        assert_eq!(
+            extract_chat_completion_content(&streamed.response).as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(chat_completion_finish_reason(&streamed.response), "stop");
+        assert!(streamed.raw_body.contains("reasoning_content"));
+    }
+
+    #[test]
+    fn streamed_chat_completion_requires_done_event() {
+        let mut accumulator = SseChatCompletionAccumulator::new();
+        let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        accumulator.push_chunk(partial.as_bytes()).unwrap();
+
+        assert!(accumulator.received_data);
+        assert!(!accumulator.completed);
     }
 
     #[test]

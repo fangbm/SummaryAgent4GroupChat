@@ -137,6 +137,11 @@ model_env = "LLM_MODEL"
 # api_keys_env = "LLM_API_KEYS"        # env var with comma/newline separated keys
 # max_concurrent_per_key = 1           # per-account concurrent cap; 0 = unlimited (default)
 timeout_seconds = 120
+# Stream text completions. A request must receive its first SSE event within 30 seconds,
+# then may not stay silent for more than 30 seconds. timeout_seconds remains the total cap.
+stream = true
+stream_first_event_timeout_seconds = 30
+stream_idle_timeout_seconds = 30
 # Extra attempts shared by transient 5xx and 429 responses; Retry-After is honored for 429.
 retry_5xx_attempts = 5
 max_output_tokens = 2000

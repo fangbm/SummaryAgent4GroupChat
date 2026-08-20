@@ -403,6 +403,15 @@ pub struct LlmConfig {
     pub model_env: String,
     #[serde(default = "default_llm_timeout")]
     pub timeout_seconds: u64,
+    /// Use Server-Sent Events for text completions and collect the final response locally.
+    #[serde(default = "default_llm_stream")]
+    pub stream: bool,
+    /// Maximum time to wait for the first valid SSE data event after a request starts.
+    #[serde(default = "default_llm_stream_first_event_timeout")]
+    pub stream_first_event_timeout_seconds: u64,
+    /// Maximum silence between valid SSE data events after the stream has started.
+    #[serde(default = "default_llm_stream_idle_timeout")]
+    pub stream_idle_timeout_seconds: u64,
     #[serde(default = "default_retry_5xx_attempts")]
     pub retry_5xx_attempts: usize,
     #[serde(default = "default_max_output_tokens")]
@@ -863,6 +872,18 @@ fn default_llm_timeout() -> u64 {
     120
 }
 
+fn default_llm_stream() -> bool {
+    true
+}
+
+fn default_llm_stream_first_event_timeout() -> u64 {
+    30
+}
+
+fn default_llm_stream_idle_timeout() -> u64 {
+    30
+}
+
 fn default_retry_5xx_attempts() -> usize {
     5
 }
@@ -1211,6 +1232,9 @@ api_key_env = "LLM_API_KEY""#,
         let voice_transcription: VoiceTranscriptionConfig = toml::from_str("").unwrap();
 
         assert_eq!(llm.max_concurrent_chunk_requests, 4);
+        assert!(llm.stream);
+        assert_eq!(llm.stream_first_event_timeout_seconds, 30);
+        assert_eq!(llm.stream_idle_timeout_seconds, 30);
         assert!(llm.api_keys.is_empty());
         assert_eq!(llm.api_keys_env, "LLM_API_KEYS");
         assert_eq!(llm.max_concurrent_per_key, 0);
