@@ -3,7 +3,7 @@
 ## Windows Single-Host Worker
 
 1. 安装 Python 3.11+、Windows 微信客户端。
-   当前 Rust 分支使用 `wx4py` UI 自动化监听/回发，并用内置 `wxdb` 解密读取历史。
+   当前 Rust 分支使用 `wx4py` UI 自动化监听/回发；历史读取通过单独安装和配置的外部提供器完成。
 2. 创建虚拟环境并安装依赖。生产监听和回发默认使用 `wx4py`：
 
 ```powershell
@@ -16,7 +16,8 @@ python -m pip install wx4py
 3. 配置 `.env`、`rust-agent\config\agent.toml`：
 
 - `[wx4py].groups`: 微信群显示名
-- `[wxdb].group_name_map`: 群名到 wxdb 可识别名称
+- `[wxdb].executable`: 外部历史提供器的命令或绝对路径
+- `[wxdb].group_name_map`: 群名到外部提供器可识别名称
 - `privacy.sensitive_groups`: 禁止云端 LLM 的敏感群
 
 4. 启动 Rust 单机服务：

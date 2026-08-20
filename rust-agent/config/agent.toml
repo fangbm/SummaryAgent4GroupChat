@@ -75,8 +75,9 @@ sqlite_path = ".\\runtime\\rust-agent.sqlite3"
 max_messages = 10000
 
 [wxdb]
-# builtin uses the in-process wxdb reader.
-executable = "builtin"
+# External history provider command. SummaryAgent does not bundle or link wxdb.
+# Set an absolute path when wxdb.exe is not available on PATH.
+executable = "wxdb"
 export_format = "json"
 # Per history read command timeout. Timed-out external commands are force-terminated.
 timeout_seconds = 20
@@ -126,6 +127,10 @@ provider = "openai_compatible"
 api_key_env = "LLM_API_KEY"
 base_url_env = "LLM_BASE_URL"
 model_env = "LLM_MODEL"
+# Multi-key concurrency (all optional, higher priority wins):
+# api_keys = ["sk-1", "sk-2"]          # explicit key list (overrides api_key/api_key_env)
+# api_keys_env = "LLM_API_KEYS"        # env var with comma/newline separated keys
+# max_concurrent_per_key = 1           # per-account concurrent cap; 0 = unlimited (default)
 timeout_seconds = 120
 # Extra attempts shared by transient 5xx and 429 responses; Retry-After is honored for 429.
 retry_5xx_attempts = 5
@@ -395,6 +400,10 @@ provider = "openai"
 api_key_env = "IMAGE_API_KEY"
 base_url_env = "IMAGE_BASE_URL"
 model_env = "IMAGE_MODEL"
+# Multi-key concurrency (all optional):
+# api_keys = ["img-key-1", "img-key-2"]
+# api_keys_env = "IMAGE_API_KEYS"
+# max_concurrent_per_key = 1          # 0 = unlimited (default)
 size = "2:3"
 resolution = "1k"
 timeout_seconds = 300
@@ -410,6 +419,10 @@ provider = "openai_compatible"
 api_key_env = "IMAGE_CAPTION_API_KEY"
 base_url_env = "IMAGE_CAPTION_BASE_URL"
 model_env = "IMAGE_CAPTION_MODEL"
+# Multi-key concurrency (all optional):
+# api_keys = ["cap-key-1", "cap-key-2"]
+# api_keys_env = "IMAGE_CAPTION_API_KEYS"
+# max_concurrent_per_key = 1          # 0 = unlimited (default)
 timeout_seconds = 120
 retry_5xx_attempts = 5
 max_output_tokens = 500
@@ -433,6 +446,10 @@ provider = "stepfun"
 api_key_env = "VIDEO_CAPTION_API_KEY"
 base_url_env = "VIDEO_CAPTION_BASE_URL"
 model_env = "VIDEO_CAPTION_MODEL"
+# Multi-key concurrency (all optional):
+# api_keys = ["video-key-1", "video-key-2"]
+# api_keys_env = "VIDEO_CAPTION_API_KEYS"
+# max_concurrent_per_key = 1          # 0 = unlimited (default)
 timeout_seconds = 180
 retry_5xx_attempts = 5
 max_output_tokens = 800
@@ -462,6 +479,10 @@ provider = "openai_compatible"
 api_key_env = "VOICE_TRANSCRIPTION_API_KEY"
 base_url_env = "VOICE_TRANSCRIPTION_BASE_URL"
 model_env = "VOICE_TRANSCRIPTION_MODEL"
+# Multi-key concurrency (all optional):
+# api_keys = ["voice-key-1", "voice-key-2"]
+# api_keys_env = "VOICE_TRANSCRIPTION_API_KEYS"
+# max_concurrent_per_key = 1          # 0 = unlimited (default)
 timeout_seconds = 120
 retry_5xx_attempts = 5
 language = "zh"

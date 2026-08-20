@@ -371,6 +371,12 @@ pub struct LlmConfig {
     #[serde(default)]
     pub api_key: Option<String>,
     pub api_key_env: String,
+    /// Optional explicit multi-key list. When non-empty it overrides `api_key` / `api_key_env`.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// Optional environment variable holding multiple keys separated by commas/newlines.
+    #[serde(default = "default_llm_api_keys_env")]
+    pub api_keys_env: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default = "default_llm_base_url_env")]
@@ -387,6 +393,10 @@ pub struct LlmConfig {
     pub max_output_tokens: u32,
     #[serde(default = "default_llm_max_concurrent_chunk_requests")]
     pub max_concurrent_chunk_requests: usize,
+    /// Max concurrent requests served by a single API key across the whole process.
+    /// 0 means unlimited (no per-key cap).
+    #[serde(default = "default_max_concurrent_per_key")]
+    pub max_concurrent_per_key: usize,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default)]
@@ -440,6 +450,12 @@ pub struct ImageGenConfig {
     #[serde(default)]
     pub api_key: Option<String>,
     pub api_key_env: String,
+    /// Optional explicit multi-key list. When non-empty it overrides `api_key` / `api_key_env`.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// Optional environment variable holding multiple keys separated by commas/newlines.
+    #[serde(default = "default_image_api_keys_env")]
+    pub api_keys_env: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default = "default_image_base_url_env")]
@@ -463,6 +479,10 @@ pub struct ImageGenConfig {
     pub timeout_seconds: u64,
     #[serde(default = "default_retry_5xx_attempts")]
     pub retry_5xx_attempts: usize,
+    /// Max concurrent requests served by a single API key across the whole process.
+    /// 0 means unlimited (no per-key cap).
+    #[serde(default = "default_max_concurrent_per_key")]
+    pub max_concurrent_per_key: usize,
     #[serde(default)]
     pub prompt_template: Option<String>,
 }
@@ -494,6 +514,12 @@ pub struct ImageCaptionConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_image_caption_api_key_env")]
     pub api_key_env: String,
+    /// Optional explicit multi-key list. When non-empty it overrides `api_key` / `api_key_env`.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// Optional environment variable holding multiple keys separated by commas/newlines.
+    #[serde(default = "default_image_caption_api_keys_env")]
+    pub api_keys_env: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default = "default_image_caption_base_url_env")]
@@ -518,6 +544,10 @@ pub struct ImageCaptionConfig {
     pub max_images_per_summary: usize,
     #[serde(default = "default_image_caption_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// Max concurrent requests served by a single API key across the whole process.
+    /// 0 means unlimited (no per-key cap).
+    #[serde(default = "default_max_concurrent_per_key")]
+    pub max_concurrent_per_key: usize,
     #[serde(default)]
     pub request_body_overrides: BTreeMap<String, toml::Value>,
 }
@@ -529,6 +559,8 @@ impl Default for ImageCaptionConfig {
             provider: default_image_caption_provider(),
             api_key: None,
             api_key_env: default_image_caption_api_key_env(),
+            api_keys: Vec::new(),
+            api_keys_env: default_image_caption_api_keys_env(),
             base_url: None,
             base_url_env: default_image_caption_base_url_env(),
             model: None,
@@ -541,6 +573,7 @@ impl Default for ImageCaptionConfig {
             user_prompt: default_image_caption_user_prompt(),
             max_images_per_summary: default_image_caption_max_images(),
             max_concurrent_requests: default_image_caption_max_concurrent_requests(),
+            max_concurrent_per_key: default_max_concurrent_per_key(),
             request_body_overrides: BTreeMap::new(),
         }
     }
@@ -556,6 +589,12 @@ pub struct VideoCaptionConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_video_caption_api_key_env")]
     pub api_key_env: String,
+    /// Optional explicit multi-key list. When non-empty it overrides `api_key` / `api_key_env`.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// Optional environment variable holding multiple keys separated by commas/newlines.
+    #[serde(default = "default_video_caption_api_keys_env")]
+    pub api_keys_env: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default = "default_video_caption_base_url_env")]
@@ -580,6 +619,10 @@ pub struct VideoCaptionConfig {
     pub max_videos_per_summary: usize,
     #[serde(default = "default_video_caption_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// Max concurrent requests served by a single API key across the whole process.
+    /// 0 means unlimited (no per-key cap).
+    #[serde(default = "default_max_concurrent_per_key")]
+    pub max_concurrent_per_key: usize,
     #[serde(default = "default_video_caption_max_video_bytes")]
     pub max_video_bytes: u64,
     #[serde(default)]
@@ -593,6 +636,8 @@ impl Default for VideoCaptionConfig {
             provider: default_video_caption_provider(),
             api_key: None,
             api_key_env: default_video_caption_api_key_env(),
+            api_keys: Vec::new(),
+            api_keys_env: default_video_caption_api_keys_env(),
             base_url: None,
             base_url_env: default_video_caption_base_url_env(),
             model: None,
@@ -605,6 +650,7 @@ impl Default for VideoCaptionConfig {
             user_prompt: default_video_caption_user_prompt(),
             max_videos_per_summary: default_video_caption_max_videos(),
             max_concurrent_requests: default_video_caption_max_concurrent_requests(),
+            max_concurrent_per_key: default_max_concurrent_per_key(),
             max_video_bytes: default_video_caption_max_video_bytes(),
             request_body_overrides: BTreeMap::new(),
         }
@@ -621,6 +667,12 @@ pub struct VoiceTranscriptionConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_voice_transcription_api_key_env")]
     pub api_key_env: String,
+    /// Optional explicit multi-key list. When non-empty it overrides `api_key` / `api_key_env`.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// Optional environment variable holding multiple keys separated by commas/newlines.
+    #[serde(default = "default_voice_transcription_api_keys_env")]
+    pub api_keys_env: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default = "default_voice_transcription_base_url_env")]
@@ -649,6 +701,10 @@ pub struct VoiceTranscriptionConfig {
     pub max_voices_per_summary: usize,
     #[serde(default = "default_voice_transcription_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// Max concurrent requests served by a single API key across the whole process.
+    /// 0 means unlimited (no per-key cap).
+    #[serde(default = "default_max_concurrent_per_key")]
+    pub max_concurrent_per_key: usize,
     #[serde(default)]
     pub request_body_overrides: BTreeMap<String, toml::Value>,
 }
@@ -660,6 +716,8 @@ impl Default for VoiceTranscriptionConfig {
             provider: default_voice_transcription_provider(),
             api_key: None,
             api_key_env: default_voice_transcription_api_key_env(),
+            api_keys: Vec::new(),
+            api_keys_env: default_voice_transcription_api_keys_env(),
             base_url: None,
             base_url_env: default_voice_transcription_base_url_env(),
             model: None,
@@ -674,6 +732,7 @@ impl Default for VoiceTranscriptionConfig {
             mp3_bitrate: default_voice_transcription_mp3_bitrate(),
             max_voices_per_summary: default_voice_transcription_max_voices(),
             max_concurrent_requests: default_voice_transcription_max_concurrent_requests(),
+            max_concurrent_per_key: default_max_concurrent_per_key(),
             request_body_overrides: BTreeMap::new(),
         }
     }
@@ -737,7 +796,7 @@ fn default_discord_token_env() -> String {
 }
 
 fn default_wx_cli_executable() -> String {
-    "builtin".to_string()
+    "wxdb".to_string()
 }
 
 fn default_wx_cli_export_format() -> String {
@@ -798,6 +857,31 @@ fn default_llm_base_url_env() -> String {
 
 fn default_llm_model_env() -> String {
     "LLM_MODEL".to_string()
+}
+
+fn default_llm_api_keys_env() -> String {
+    "LLM_API_KEYS".to_string()
+}
+
+fn default_image_api_keys_env() -> String {
+    "IMAGE_API_KEYS".to_string()
+}
+
+fn default_image_caption_api_keys_env() -> String {
+    "IMAGE_CAPTION_API_KEYS".to_string()
+}
+
+fn default_video_caption_api_keys_env() -> String {
+    "VIDEO_CAPTION_API_KEYS".to_string()
+}
+
+fn default_voice_transcription_api_keys_env() -> String {
+    "VOICE_TRANSCRIPTION_API_KEYS".to_string()
+}
+
+/// 0 means no per-key concurrency cap (backward compatible single-key behavior).
+fn default_max_concurrent_per_key() -> usize {
+    0
 }
 
 fn default_image_base_url_env() -> String {
@@ -1111,6 +1195,9 @@ api_key_env = "LLM_API_KEY""#,
         let voice_transcription: VoiceTranscriptionConfig = toml::from_str("").unwrap();
 
         assert_eq!(llm.max_concurrent_chunk_requests, 4);
+        assert!(llm.api_keys.is_empty());
+        assert_eq!(llm.api_keys_env, "LLM_API_KEYS");
+        assert_eq!(llm.max_concurrent_per_key, 0);
         assert!(text_summary.enabled);
         assert!(text_summary.system_prompt.contains("文字总结"));
         assert!(text_summary.user_prompt_template.contains("{chat_input}"));
@@ -1123,10 +1210,18 @@ api_key_env = "LLM_API_KEY""#,
         assert_eq!(image_caption.model_env, "IMAGE_CAPTION_MODEL");
         assert_eq!(image_caption.retry_5xx_attempts, 5);
         assert_eq!(image_caption.max_concurrent_requests, 10);
+        assert!(image_caption.api_keys.is_empty());
+        assert_eq!(image_caption.api_keys_env, "IMAGE_CAPTION_API_KEYS");
+        assert_eq!(image_caption.max_concurrent_per_key, 0);
         assert!(image_caption.user_prompt.contains("转述"));
         assert!(!voice_transcription.enabled);
         assert_eq!(voice_transcription.model_env, "VOICE_TRANSCRIPTION_MODEL");
         assert_eq!(voice_transcription.max_concurrent_requests, 2);
+        assert_eq!(
+            voice_transcription.api_keys_env,
+            "VOICE_TRANSCRIPTION_API_KEYS"
+        );
+        assert_eq!(voice_transcription.max_concurrent_per_key, 0);
         assert_eq!(voice_transcription.language, "zh");
         assert!(voice_transcription.transcode_to_mp3);
         assert_eq!(voice_transcription.ffmpeg_executable, "ffmpeg");
@@ -1146,7 +1241,7 @@ api_key_env = "LLM_API_KEY""#,
         assert!(wx4py.long_text_file_dir.is_empty());
         assert_eq!(discord.token_env, "DISCORD_BOT_TOKEN");
         assert!(discord.channels.is_empty());
-        assert_eq!(wxdb.executable, "builtin");
+        assert_eq!(wxdb.executable, "wxdb");
         assert_eq!(wxdb.export_format, "json");
         assert_eq!(wxdb.max_messages, None);
         assert_eq!(wxdb.timeout_seconds, 20);
@@ -1157,7 +1252,7 @@ api_key_env = "LLM_API_KEY""#,
     #[test]
     fn default_agent_config_accepts_wxdb_section() {
         let cfg = AgentConfig::from_toml_str(include_str!("../../../config/agent.toml")).unwrap();
-        assert_eq!(cfg.wx_cli.executable, "builtin");
+        assert_eq!(cfg.wx_cli.executable, "wxdb");
         assert_eq!(cfg.history_message_limit(), 10_000);
         assert_eq!(cfg.runtime.max_log_mb, 50);
         assert!(!cfg.runtime.ai_trace_enabled);
@@ -1192,5 +1287,48 @@ reasoning_effort = "none"
                 .and_then(toml::Value::as_str),
             Some("none")
         );
+    }
+
+    #[test]
+    fn ai_configs_accept_multi_key_fields() {
+        let llm: LlmConfig = toml::from_str(
+            r#"
+provider = "openai_compatible"
+api_key_env = "LLM_API_KEY"
+api_keys = ["sk-1", "sk-2"]
+api_keys_env = "LLM_API_KEYS"
+max_concurrent_per_key = 2
+"#,
+        )
+        .unwrap();
+        let image: ImageGenConfig = toml::from_str(
+            r#"
+provider = "openai"
+api_key_env = "IMAGE_API_KEY"
+api_keys = ["img-1"]
+max_concurrent_per_key = 1
+size = "2:3"
+"#,
+        )
+        .unwrap();
+        let caption: ImageCaptionConfig = toml::from_str(
+            r#"
+api_keys_env = "IMAGE_CAPTION_API_KEYS"
+max_concurrent_per_key = 3
+"#,
+        )
+        .unwrap();
+        let video: VideoCaptionConfig = toml::from_str("max_concurrent_per_key = 1").unwrap();
+        let voice: VoiceTranscriptionConfig = toml::from_str("max_concurrent_per_key = 4").unwrap();
+
+        assert_eq!(llm.api_keys, vec!["sk-1", "sk-2"]);
+        assert_eq!(llm.api_keys_env, "LLM_API_KEYS");
+        assert_eq!(llm.max_concurrent_per_key, 2);
+        assert_eq!(image.api_keys, vec!["img-1"]);
+        assert_eq!(image.max_concurrent_per_key, 1);
+        assert_eq!(caption.api_keys_env, "IMAGE_CAPTION_API_KEYS");
+        assert_eq!(caption.max_concurrent_per_key, 3);
+        assert_eq!(video.max_concurrent_per_key, 1);
+        assert_eq!(voice.max_concurrent_per_key, 4);
     }
 }

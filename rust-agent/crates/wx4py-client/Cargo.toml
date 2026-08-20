@@ -13,4 +13,3 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 wechat-summary-core = { path = "../core" }
-wechat-summary-wxdb = { path = "../wxdb" }

@@ -6,7 +6,7 @@ use std::{
     process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc, Mutex, MutexGuard, OnceLock, TryLockError,
     },
     thread,
@@ -40,39 +40,6 @@ pub enum Wx4pyError {
 }
 
 pub type Result<T> = std::result::Result<T, Wx4pyError>;
-
-#[derive(Debug, Clone)]
-pub struct WxdbInitReport {
-    pub db_dir: String,
-    pub before_keys: usize,
-    pub imported_legacy_keys: usize,
-    pub scanned_keys: usize,
-    pub after_keys: usize,
-    pub scan_error: Option<String>,
-}
-
-pub fn refresh_builtin_wxdb_keys_on_start(
-    wx_cli: &WxCliConfig,
-) -> Result<Option<Vec<WxdbInitReport>>> {
-    if !should_use_builtin_wxdb(wx_cli) {
-        return Ok(None);
-    }
-
-    let config = builtin_wxdb_runtime_config(wx_cli);
-    let reports = wechat_summary_wxdb::refresh_keys(&config)
-        .map_err(|error| Wx4pyError::WxCli(format!("builtin wxdb init failed: {error:#}")))?
-        .into_iter()
-        .map(|report| WxdbInitReport {
-            db_dir: report.db_dir.display().to_string(),
-            before_keys: report.before_keys,
-            imported_legacy_keys: report.imported_legacy_keys,
-            scanned_keys: report.scanned_keys,
-            after_keys: report.after_keys,
-            scan_error: report.scan_error,
-        })
-        .collect();
-    Ok(Some(reports))
-}
 
 #[derive(Debug)]
 pub struct Wx4pyClient {
@@ -109,7 +76,6 @@ impl Wx4pyClient {
         wx_cli: &WxCliConfig,
     ) -> Result<Self> {
         let groups = listen_groups(config, listen)?;
-        stop_wx_cli_daemon_on_start(wx_cli);
         let mut child = Command::new(&config.python_executable)
             .arg(&config.sidecar_script)
             .arg("--ready-timeout-seconds")
@@ -514,18 +480,6 @@ fn query_text_messages_inner(
     before_local_id: Option<i64>,
     output: &Path,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
-    if should_use_builtin_wxdb(wx_cli) {
-        return query_text_messages_via_builtin_wxdb(
-            wx_cli,
-            chat_name,
-            since,
-            until,
-            limit,
-            media_decode_limit,
-            before_local_id,
-        );
-    }
-
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -543,6 +497,7 @@ fn query_text_messages_inner(
         since,
         until,
         limit,
+        media_decode_limit,
         before_local_id,
         deadline,
     ) {
@@ -579,14 +534,8 @@ fn query_text_messages_inner(
     )
 }
 
-fn should_use_builtin_wxdb(wx_cli: &WxCliConfig) -> bool {
-    matches!(
-        wx_cli.executable.trim().to_ascii_lowercase().as_str(),
-        "builtin" | "internal" | "wxdb-builtin"
-    )
-}
-
-fn query_text_messages_via_builtin_wxdb(
+#[allow(clippy::too_many_arguments)]
+pub fn query_external_history_page(
     wx_cli: &WxCliConfig,
     chat_name: &str,
     since: DateTime<Utc>,
@@ -595,15 +544,12 @@ fn query_text_messages_via_builtin_wxdb(
     media_decode_limit: Option<usize>,
     before_local_id: Option<i64>,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
-    tracing::debug!(
-        chat_name,
-        %since,
-        %until,
-        limit,
-        media_decode_limit = ?media_decode_limit,
-        "querying builtin wxdb history"
-    );
-    let mut result = match query_builtin_wxdb_history(
+    let output = PathBuf::from(&wx_cli.temp_dir).join(format!(
+        "summary-agent-history-{}-{}.json",
+        std::process::id(),
+        Utc::now().timestamp_millis()
+    ));
+    query_text_messages_inner(
         wx_cli,
         chat_name,
         since,
@@ -611,390 +557,8 @@ fn query_text_messages_via_builtin_wxdb(
         limit,
         media_decode_limit,
         before_local_id,
-    ) {
-        Ok(result) => result,
-        Err(error) if should_retry_builtin_wxdb_history_error(&error) => {
-            tracing::warn!(
-                chat_name,
-                error = %error,
-                "builtin wxdb history failed with a transient cache/decrypt error; retrying once"
-            );
-            thread::sleep(StdDuration::from_millis(800));
-            query_builtin_wxdb_history(
-                wx_cli,
-                chat_name,
-                since,
-                until,
-                limit,
-                media_decode_limit,
-                before_local_id,
-            )?
-        }
-        Err(error) => return Err(error),
-    };
-    if result.messages.is_empty() && until.signed_duration_since(since) >= Duration::minutes(5) {
-        tracing::warn!(
-            chat_name,
-            %since,
-            %until,
-            "builtin wxdb returned no messages; retrying once after a short delay"
-        );
-        thread::sleep(StdDuration::from_millis(800));
-        result = query_builtin_wxdb_history(
-            wx_cli,
-            chat_name,
-            since,
-            until,
-            limit,
-            media_decode_limit,
-            before_local_id,
-        )?;
-    }
-
-    for warning in &result.meta.warnings {
-        tracing::warn!(chat_name, warning = %warning, "builtin wxdb warning");
-    }
-    tracing::debug!(
-        chat_name,
-        count = result.messages.len(),
-        db_dir = ?result.meta.db_dir,
-        shards_scanned = result.meta.shards_scanned,
-        shards_hit = result.meta.shards_hit,
-        unknown_shards = ?result.meta.unknown_shards,
-        "builtin wxdb history completed"
-    );
-    if result.messages.is_empty() {
-        if let Some(reason) = empty_builtin_wxdb_result_uncertain_reason(&result) {
-            return Err(Wx4pyError::WxCli(reason));
-        }
-    }
-
-    result
-        .messages
-        .into_iter()
-        .map(|message| {
-            let timestamp = Utc
-                .timestamp_opt(message.timestamp, 0)
-                .single()
-                .ok_or_else(|| {
-                    Wx4pyError::InvalidWxCli(format!(
-                        "invalid wxdb timestamp: {}",
-                        message.timestamp
-                    ))
-                })?;
-            Ok(Wx4pyHistoryMessage {
-                local_id: message.local_id,
-                timestamp,
-                sender_id: message
-                    .sender_username
-                    .clone()
-                    .filter(|sender| !sender.is_empty())
-                    .unwrap_or_else(|| message.sender.clone()),
-                sender_name: (!message.sender.is_empty()).then_some(message.sender),
-                content: message.content,
-                msg_type: message.msg_type,
-                media_path: message
-                    .media_path
-                    .map(|path| path.to_string_lossy().into_owned()),
-                thumbnail_path: message
-                    .thumbnail_path
-                    .map(|path| path.to_string_lossy().into_owned()),
-                decoded_media_path: message
-                    .decoded_media_path
-                    .map(|path| path.to_string_lossy().into_owned()),
-                media_decode_error: message.media_decode_error,
-                is_self: false,
-            })
-        })
-        .collect()
-}
-
-fn should_retry_builtin_wxdb_history_error(error: &Wx4pyError) -> bool {
-    let error = error.to_string();
-    if error.contains("wxdb 缓存磁盘空间不足") || error.contains("磁盘空间不足") {
-        return false;
-    }
-    error.contains("源数据库在解密期间发生变化")
-        || error.contains("file is not a database")
-        || error.contains("File opened that is not a database file")
-        || error.contains("解密结果不是可读 SQLite 数据库")
-}
-
-fn empty_builtin_wxdb_result_uncertain_reason(
-    result: &wechat_summary_wxdb::HistoryResult,
-) -> Option<String> {
-    if !result.messages.is_empty() {
-        return None;
-    }
-
-    let mut reasons = result.meta.warnings.clone();
-    reasons.extend(
-        result
-            .meta
-            .unknown_shards
-            .iter()
-            .map(|shard| format!("磁盘存在但没有密钥的消息分片: {shard}")),
-    );
-    if reasons.is_empty() {
-        return None;
-    }
-
-    const MAX_REASON_CHARS: usize = 900;
-    let mut reason = reasons.join(" | ");
-    if reason.chars().count() > MAX_REASON_CHARS {
-        reason = reason
-            .chars()
-            .take(MAX_REASON_CHARS)
-            .chain("...".chars())
-            .collect();
-    }
-    Some(format!(
-        "builtin wxdb returned no messages, but some WeChat database candidates were not fully readable; cannot confirm the chat is empty: {reason}"
-    ))
-}
-
-fn query_builtin_wxdb_history(
-    wx_cli: &WxCliConfig,
-    chat_name: &str,
-    since: DateTime<Utc>,
-    until: DateTime<Utc>,
-    limit: u32,
-    media_decode_limit: Option<usize>,
-    before_local_id: Option<i64>,
-) -> Result<wechat_summary_wxdb::HistoryResult> {
-    query_builtin_wxdb_history_controlled(
-        wx_cli,
-        wechat_summary_wxdb::HistoryQuery {
-            chat_name: chat_name.to_string(),
-            since: Some(since),
-            until: Some(until),
-            before_local_id,
-            limit: limit as usize,
-            text_only: false,
-            msg_types: vec!["text".to_string(), "image".to_string(), "voice".to_string()],
-            media_decode_limit,
-        },
+        &output,
     )
-}
-
-const BUILTIN_QUERY_QUEUE_CAPACITY: usize = 4;
-const BUILTIN_QUERY_WORKER_COUNT: usize = 4;
-
-struct BuiltinQueryRequest {
-    wx_cli: WxCliConfig,
-    query: wechat_summary_wxdb::HistoryQuery,
-    deadline: Instant,
-    response: Sender<Result<wechat_summary_wxdb::HistoryResult>>,
-}
-
-static BUILTIN_QUERY_SERVICE: OnceLock<SyncSender<BuiltinQueryRequest>> = OnceLock::new();
-
-type BuiltinQueryHandler = Arc<
-    dyn Fn(
-            &WxCliConfig,
-            &wechat_summary_wxdb::HistoryQuery,
-            Instant,
-        ) -> Result<wechat_summary_wxdb::HistoryResult>
-        + Send
-        + Sync,
->;
-
-pub fn query_builtin_wxdb_history_controlled(
-    wx_cli: &WxCliConfig,
-    query: wechat_summary_wxdb::HistoryQuery,
-) -> Result<wechat_summary_wxdb::HistoryResult> {
-    let timeout_seconds = history_query_timeout_seconds(wx_cli);
-    let timeout = StdDuration::from_secs(timeout_seconds);
-    let deadline = Instant::now() + timeout;
-    let (response, receiver) = mpsc::channel();
-    let request = BuiltinQueryRequest {
-        wx_cli: wx_cli.clone(),
-        query,
-        deadline,
-        response,
-    };
-    match builtin_query_sender().try_send(request) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            return Err(Wx4pyError::WxCli(format!(
-                "builtin wxdb query queue is full (capacity {BUILTIN_QUERY_QUEUE_CAPACITY})"
-            )))
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            return Err(Wx4pyError::WxCli(
-                "builtin wxdb query service stopped".to_string(),
-            ))
-        }
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => Err(Wx4pyError::HistoryQueryTimeout(timeout_seconds)),
-        Err(RecvTimeoutError::Disconnected) => Err(Wx4pyError::WxCli(
-            "builtin wxdb query service exited without a result".to_string(),
-        )),
-    }
-}
-
-fn builtin_query_sender() -> &'static SyncSender<BuiltinQueryRequest> {
-    BUILTIN_QUERY_SERVICE.get_or_init(|| {
-        spawn_builtin_query_service(
-            BUILTIN_QUERY_QUEUE_CAPACITY,
-            BUILTIN_QUERY_WORKER_COUNT,
-            Arc::new(run_builtin_query_subprocess),
-        )
-    })
-}
-
-fn spawn_builtin_query_service(
-    capacity: usize,
-    worker_count: usize,
-    handler: BuiltinQueryHandler,
-) -> SyncSender<BuiltinQueryRequest> {
-    let (sender, receiver) = mpsc::sync_channel(capacity);
-    let receiver = Arc::new(Mutex::new(receiver));
-    for _ in 0..worker_count.max(1) {
-        let receiver = Arc::clone(&receiver);
-        let handler = Arc::clone(&handler);
-        thread::spawn(move || run_builtin_query_service(receiver, handler));
-    }
-    sender
-}
-
-fn run_builtin_query_service(
-    receiver: Arc<Mutex<Receiver<BuiltinQueryRequest>>>,
-    handler: BuiltinQueryHandler,
-) {
-    loop {
-        let request = match receiver.lock() {
-            Ok(receiver) => receiver.recv(),
-            Err(_) => return,
-        };
-        let Ok(request) = request else {
-            return;
-        };
-        let result = if Instant::now() >= request.deadline {
-            Err(Wx4pyError::HistoryQueryTimeout(
-                history_query_timeout_seconds(&request.wx_cli),
-            ))
-        } else {
-            handler(&request.wx_cli, &request.query, request.deadline)
-        };
-        let _ = request.response.send(result);
-    }
-}
-
-fn run_builtin_query_subprocess(
-    wx_cli: &WxCliConfig,
-    query: &wechat_summary_wxdb::HistoryQuery,
-    deadline: Instant,
-) -> Result<wechat_summary_wxdb::HistoryResult> {
-    let mut cmd = vec![
-        builtin_wxdb_executable(),
-        "history".to_string(),
-        query.chat_name.clone(),
-        "--since".to_string(),
-        query
-            .since
-            .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().expect("unix epoch"))
-            .to_rfc3339(),
-        "--until".to_string(),
-        query.until.unwrap_or_else(Utc::now).to_rfc3339(),
-        "--json".to_string(),
-        "--limit".to_string(),
-        query.limit.to_string(),
-    ];
-    if query.text_only {
-        cmd.extend(["--type".to_string(), "text".to_string()]);
-    }
-    if let Some(local_id) = query.before_local_id {
-        cmd.extend(["--before-local-id".to_string(), local_id.to_string()]);
-    }
-    if let Some(limit) = query.media_decode_limit {
-        cmd.extend(["--media-decode-limit".to_string(), limit.to_string()]);
-    }
-    let mut envs = Vec::new();
-    if let Some(db_dir) = wx_cli
-        .db_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        envs.push(("WXDB_DB_DIR".to_string(), db_dir.to_string()));
-    }
-    if !wx_cli.cache_dir.trim().is_empty() {
-        envs.push((
-            "WXDB_CACHE_DIR".to_string(),
-            wx_cli.cache_dir.trim().to_string(),
-        ));
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(Wx4pyError::HistoryQueryTimeout(
-            history_query_timeout_seconds(wx_cli),
-        ));
-    }
-    let output = run_command_with_timeout_env(&cmd, remaining, &envs).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::TimedOut {
-            Wx4pyError::HistoryQueryTimeout(history_query_timeout_seconds(wx_cli))
-        } else {
-            Wx4pyError::WxCli(format!(
-                "failed to run builtin wxdb subprocess {}: {error}",
-                cmd[0]
-            ))
-        }
-    })?;
-    if !output.status.success() {
-        return Err(Wx4pyError::WxCli(format!(
-            "builtin wxdb subprocess failed: {}",
-            command_error_text(&output)
-        )));
-    }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| Wx4pyError::InvalidWxCli(format!("invalid builtin wxdb JSON: {error}")))
-}
-
-fn builtin_wxdb_executable() -> String {
-    if let Some(path) = std::env::var_os("SUMMARY_AGENT_WXDB_EXE") {
-        return path.to_string_lossy().into_owned();
-    }
-    let file_name = if cfg!(windows) { "wxdb.exe" } else { "wxdb" };
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(parent) = current.parent() {
-            let sibling = parent.join(file_name);
-            if sibling.is_file() {
-                return sibling.to_string_lossy().into_owned();
-            }
-            if parent.file_name().is_some_and(|name| name == "deps") {
-                if let Some(target_dir) = parent.parent() {
-                    let target_binary = target_dir.join(file_name);
-                    if target_binary.is_file() {
-                        return target_binary.to_string_lossy().into_owned();
-                    }
-                }
-            }
-        }
-    }
-    file_name.to_string()
-}
-
-fn builtin_wxdb_runtime_config(wx_cli: &WxCliConfig) -> wechat_summary_wxdb::RuntimeConfig {
-    let config = wechat_summary_wxdb::RuntimeConfig::load();
-    let config = if let Some(db_dir) = wx_cli
-        .db_dir
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-    {
-        config.with_db_dir(db_dir.trim())
-    } else {
-        config
-    };
-    let cache_dir = wx_cli.cache_dir.trim();
-    if cache_dir.is_empty() {
-        config
-    } else {
-        config.with_cache_dir(cache_dir)
-    }
 }
 
 fn should_skip_export_after_history_error(error: &Wx4pyError) -> bool {
@@ -1008,19 +572,26 @@ fn query_text_messages_via_history(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    media_decode_limit: Option<usize>,
     before_local_id: Option<i64>,
     deadline: Instant,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     let mut last_error = None;
     let mut empty_messages = None;
     for candidate in wx_cli_chat_candidates(chat_name) {
-        let cmd =
+        let mut cmd =
             build_wx_cli_history_command(wx_cli, &candidate, since, until, limit, before_local_id);
-        let output_result = match run_wx_cli_command_until(&cmd, deadline) {
+        if let Some(media_decode_limit) = media_decode_limit {
+            cmd.extend([
+                "--media-decode-limit".to_string(),
+                media_decode_limit.to_string(),
+            ]);
+        }
+        let output_result = match run_wx_cli_command_until(&cmd, deadline, wx_cli) {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Wx4pyError::WxCli(format!(
-                        "wxdb executable not found: {}. Set [wxdb].executable to builtin, wxdb.exe, or an external history command.",
+                        "external history provider executable not found: {}. Install the provider and set [wxdb].executable to its path.",
                         cmd[0]
                     )));
             }
@@ -1089,11 +660,11 @@ fn query_text_messages_via_export(
     for candidate in wx_cli_chat_candidates(chat_name) {
         let _ = fs::remove_file(output);
         let cmd = build_wx_cli_export_command(wx_cli, &candidate, since, until, limit, output);
-        let output_result = match run_wx_cli_command_until(&cmd, deadline) {
+        let output_result = match run_wx_cli_command_until(&cmd, deadline, wx_cli) {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Wx4pyError::WxCli(format!(
-                        "wxdb executable not found: {}. Set [wxdb].executable to builtin, wxdb.exe, or an external history command.",
+                        "external history provider executable not found: {}. Install the provider and set [wxdb].executable to its path.",
                         cmd[0]
                     )));
             }
@@ -1467,67 +1038,22 @@ pub fn build_wx_cli_history_command(
     command
 }
 
-pub fn build_wx_cli_daemon_stop_command(config: &WxCliConfig) -> Vec<String> {
-    vec![
-        config.executable.clone(),
-        "daemon".to_string(),
-        "stop".to_string(),
-    ]
-}
-
 static WX_CLI_COMMAND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-const WX_CLI_DAEMON_STOP_TIMEOUT_SECONDS: u64 = 5;
 
-fn stop_wx_cli_daemon_on_start(wx_cli: &WxCliConfig) {
-    if should_use_builtin_wxdb(wx_cli) {
-        tracing::info!("builtin wxdb selected; no external wxdb daemon to stop");
-        return;
-    }
-    let cmd = build_wx_cli_daemon_stop_command(wx_cli);
-    match run_wx_cli_command_with_timeout(&cmd, WX_CLI_DAEMON_STOP_TIMEOUT_SECONDS) {
-        Ok(output) if output.status.success() => {
-            tracing::info!("stopped wxdb daemon before wx4py startup");
-        }
-        Ok(output) => {
-            tracing::warn!(
-                error = %command_error_text(&output),
-                "wxdb daemon stop returned a non-success status before startup"
-            );
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!(
-                executable = %wx_cli.executable,
-                "wxdb executable not found while trying to stop stale daemon"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "failed to stop wxdb daemon before startup"
-            );
-        }
-    }
-}
-
-fn run_wx_cli_command_with_timeout(
+fn run_wx_cli_command_until(
     cmd: &[String],
-    timeout_seconds: u64,
+    deadline: Instant,
+    wx_cli: &WxCliConfig,
 ) -> std::io::Result<Output> {
-    run_wx_cli_command_until(
-        cmd,
-        Instant::now() + StdDuration::from_secs(timeout_seconds.max(1)),
-    )
-}
-
-fn run_wx_cli_command_until(cmd: &[String], deadline: Instant) -> std::io::Result<Output> {
     let lock = WX_CLI_COMMAND_LOCK.get_or_init(|| Mutex::new(()));
-    run_command_with_deadline_on_lock(lock, cmd, deadline)
+    run_command_with_deadline_on_lock(lock, cmd, deadline, &wxdb_provider_env(wx_cli))
 }
 
 fn run_command_with_deadline_on_lock(
     lock: &Mutex<()>,
     cmd: &[String],
     deadline: Instant,
+    envs: &[(String, String)],
 ) -> std::io::Result<Output> {
     let _guard = lock_with_deadline(lock, deadline)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1537,7 +1063,25 @@ fn run_command_with_deadline_on_lock(
             "wxdb command deadline elapsed while waiting for the command lock",
         ));
     }
-    run_command_with_timeout_env(cmd, remaining, &[])
+    run_command_with_timeout_env(cmd, remaining, envs)
+}
+
+fn wxdb_provider_env(wx_cli: &WxCliConfig) -> Vec<(String, String)> {
+    let mut envs = Vec::new();
+    if let Some(db_dir) = wx_cli
+        .db_dir
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        envs.push(("WXDB_DB_DIR".to_string(), db_dir.trim().to_string()));
+    }
+    if !wx_cli.cache_dir.trim().is_empty() {
+        envs.push((
+            "WXDB_CACHE_DIR".to_string(),
+            wx_cli.cache_dir.trim().to_string(),
+        ));
+    }
+    envs
 }
 
 fn lock_with_deadline<'a>(
@@ -1924,13 +1468,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_wx_cli_daemon_stop_command() {
-        let cmd = build_wx_cli_daemon_stop_command(&wx_cli_config());
-
-        assert_eq!(cmd, ["wx", "daemon", "stop"]);
-    }
-
-    #[test]
     fn history_timeout_can_fall_back_to_export() {
         let error = Wx4pyError::WxCli("wxdb history timed out after 20 seconds".into());
 
@@ -2299,53 +1836,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_query_workers_do_not_serialize_a_slow_request() {
-        let handler: BuiltinQueryHandler = Arc::new(|_config, query, _deadline| {
-            if query.chat_name == "slow" {
-                thread::sleep(StdDuration::from_millis(200));
-            }
-            Ok(wechat_summary_wxdb::HistoryResult {
-                chat: query.chat_name.clone(),
-                username: query.chat_name.clone(),
-                is_group: true,
-                count: 0,
-                messages: Vec::new(),
-                meta: Default::default(),
-            })
-        });
-        let sender = spawn_builtin_query_service(2, 2, handler);
-        let make_request = |chat_name: &str| {
-            let (response, receiver) = mpsc::channel();
-            let request = BuiltinQueryRequest {
-                wx_cli: wx_cli_config(),
-                query: wechat_summary_wxdb::HistoryQuery {
-                    chat_name: chat_name.to_string(),
-                    since: None,
-                    until: None,
-                    before_local_id: None,
-                    limit: 1,
-                    text_only: true,
-                    msg_types: vec!["text".to_string()],
-                    media_decode_limit: Some(0),
-                },
-                deadline: Instant::now() + StdDuration::from_secs(1),
-                response,
-            };
-            (request, receiver)
-        };
-        let (slow_request, _slow_receiver) = make_request("slow");
-        let (fast_request, fast_receiver) = make_request("fast");
-        sender.send(slow_request).unwrap();
-        sender.send(fast_request).unwrap();
-
-        let result = fast_receiver
-            .recv_timeout(StdDuration::from_millis(100))
-            .expect("fast query should use another bounded worker")
-            .unwrap();
-        assert_eq!(result.chat, "fast");
-    }
-
-    #[test]
     fn command_lock_wait_uses_the_same_deadline_as_command_execution() {
         let lock = Arc::new(Mutex::new(()));
         let slow_lock = Arc::clone(&lock);
@@ -2362,6 +1852,7 @@ mod tests {
             &lock,
             &["this-command-must-not-start".to_string()],
             started + StdDuration::from_millis(40),
+            &[],
         )
         .unwrap_err();
         let lock_wait_elapsed = started.elapsed();

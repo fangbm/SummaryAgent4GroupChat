@@ -6,7 +6,6 @@ members = [
     "crates/gui",
     "crates/storage",
     "crates/wx4py-client",
-    "crates/wxdb",
 ]
 resolver = "2"
 

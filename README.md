@@ -15,7 +15,7 @@ pytest
 
 ## Rust Windows-only Agent
 
-新的 Rust 单机方案位于 `rust-agent/`，与现有 Python 项目隔离。本分支使用 `wx4py` 做 Windows 微信 UI 自动化监听和图片/文本发送，并配合内置 `wxdb` 解密读取本机数据库用于历史查询；Linux / `wx-bot-cli` 链路在该方案中废弃。
+新的 Rust 单机方案位于 `rust-agent/`，与现有 Python 项目隔离。本分支使用 `wx4py` 做 Windows 微信 UI 自动化监听和图片/文本发送；历史消息由用户单独安装和配置的外部历史提供器读取。主项目不包含、链接或分发数据库解密实现；Linux / `wx-bot-cli` 链路在该方案中废弃。
 
 ```powershell
 cd rust-agent
@@ -34,7 +34,7 @@ cd rust-agent
 cargo run -p wechat-summary-app -- --config config\agent.toml
 ```
 
-注意：`wx4py` 是 UI 自动化方案，需要 Windows 微信保持登录，并且 `rust-agent/config/agent.toml` 中 `[wx4py].groups` 必须填写可搜索到的微信群显示名。历史读取默认使用内置 `wxdb`，不需要额外安装外部微信历史导出命令。
+注意：`wx4py` 是 UI 自动化方案，需要 Windows 微信保持登录，并且 `rust-agent/config/agent.toml` 中 `[wx4py].groups` 必须填写可搜索到的微信群显示名。历史读取需要单独安装兼容的外部提供器，并将其路径配置到 `[wxdb].executable`。
 
 ## 目录
 
@@ -70,7 +70,7 @@ python -m windows_worker.main --config config\worker.yaml --mode api
 python -m linux_bot.main --config config/bot.yaml
 ```
 
-真实微信依赖通过 adapter 封装：`wx4py` 负责 Windows 本机 UI 自动化监听和回发，内置 `wxdb` 负责历史记录解密读取。`wxhook` / `wcferry` 在本分支中不作为默认链路。
+真实微信依赖通过 adapter 封装：`wx4py` 负责 Windows 本机 UI 自动化监听和回发，外部历史提供器负责返回 JSON 历史记录。`wxhook` / `wcferry` 在本分支中不作为默认链路。
 
 ## 质量门禁
 

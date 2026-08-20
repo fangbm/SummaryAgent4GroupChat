@@ -14,7 +14,7 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 if (-not $SkipBuild) {
     Push-Location $RustRoot
     try {
-        cargo build --release -p wechat-summary-app -p wechat-summary-wxdb -p wechat-summary-gui
+        cargo build --release -p wechat-summary-app -p wechat-summary-gui
     }
     finally {
         Pop-Location
@@ -24,10 +24,9 @@ if (-not $SkipBuild) {
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $RustRoot "target" }
 $ReleaseDir = Join-Path $TargetDir "release"
 $AppExe = Join-Path $ReleaseDir "wechat-summary-app.exe"
-$WxdbExe = Join-Path $ReleaseDir "wxdb.exe"
 $GuiExe = Join-Path $ReleaseDir "wechat-summary-gui.exe"
 
-foreach ($required in @($AppExe, $WxdbExe, $GuiExe)) {
+foreach ($required in @($AppExe, $GuiExe)) {
     if (-not (Test-Path $required)) {
         throw "Missing build artifact: $required"
     }
@@ -54,7 +53,6 @@ New-Item -ItemType Directory -Force -Path `
     (Join-Path $PackageDir "runtime") | Out-Null
 
 Copy-Item -LiteralPath $AppExe -Destination (Join-Path $PackageDir "bin\wechat-summary-app.exe")
-Copy-Item -LiteralPath $WxdbExe -Destination (Join-Path $PackageDir "bin\wxdb.exe")
 Copy-Item -LiteralPath $GuiExe -Destination (Join-Path $PackageDir "bin\wechat-summary-gui.exe")
 Copy-Item -LiteralPath $GuiExe -Destination (Join-Path $PackageDir "SummaryAgent4GroupChat.exe")
 Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\wx4py_sidecar.py") -Destination (Join-Path $PackageDir "scripts\wx4py_sidecar.py")
@@ -68,10 +66,12 @@ $PackageConfig = Join-Path $PackageDir "config\agent.toml"
 & (Join-Path $PSScriptRoot "sanitize-agent-config.ps1") `
     -Source $SourceConfig `
     -Destination $PackageConfig
-$ConfigText = Get-Content -LiteralPath $PackageConfig -Raw
+$ConfigText = Get-Content -LiteralPath $PackageConfig -Raw -Encoding UTF8
 $ConfigText = $ConfigText -replace 'python_executable\s*=\s*".*"', 'python_executable = ".\\.venv\\Scripts\\python.exe"'
 $ConfigText = $ConfigText -replace 'sidecar_script\s*=\s*".*"', 'sidecar_script = ".\\scripts\\wx4py_sidecar.py"'
-$ConfigText | Set-Content -LiteralPath $PackageConfig -Encoding UTF8
+# Write UTF-8 without BOM so Chinese group names survive on Windows PowerShell 5.1.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($PackageConfig, $ConfigText, $utf8NoBom)
 
 @'
 param(
@@ -91,6 +91,7 @@ if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
 
 Write-Host "Runtime installed."
 Write-Host "Set LLM_API_KEY / LLM_BASE_URL / LLM_MODEL and optional IMAGE_* environment variables before running start.ps1."
+Write-Host "For multi-key concurrency, set the *_API_KEYS variables (e.g. LLM_API_KEYS) with comma/newline separated keys."
 '@ | Set-Content -LiteralPath (Join-Path $PackageDir "install.ps1") -Encoding UTF8
 
 @'
@@ -138,6 +139,13 @@ Set these environment variables before launch when the corresponding feature is 
 - `IMAGE_MODEL`
 - `DISCORD_BOT_TOKEN` when using Discord
 
+Multi-key concurrency (optional): set the `*_API_KEYS` variables
+(`LLM_API_KEYS`, `IMAGE_API_KEYS`, `IMAGE_CAPTION_API_KEYS`,
+`VIDEO_CAPTION_API_KEYS`, `VOICE_TRANSCRIPTION_API_KEYS`) to a comma/newline
+separated key list, or fill `api_keys` in `config\agent.toml`. Add
+`max_concurrent_per_key` in each section to cap per-account concurrency
+(`0` = unlimited, the default).
+
 ## Run
 
 ~~~powershell
@@ -150,7 +158,7 @@ Set these environment variables before launch when the corresponding feature is 
 .\start-gui.ps1
 ~~~
 
-The package uses the built-in `wxdb` reader by default, so it does not spawn the external `wx` CLI.
+The package does not include a database reader. Install and configure a compatible external history provider separately, then set `[wxdb].executable` to its path.
 "@ | Set-Content -LiteralPath (Join-Path $PackageDir "README.md") -Encoding UTF8
 
 Compress-Archive -Path (Join-Path $PackageDir "*") -DestinationPath $ZipPath -Force

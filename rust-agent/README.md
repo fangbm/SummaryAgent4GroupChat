@@ -92,6 +92,36 @@ splits it into whole-message chunks and sends up to
 Provider-specific chat completion request fields can be added or overridden through
 `llm.request_body_overrides`, for example `enable_thinking = false`.
 
+### Multi-key concurrency
+
+Every AI client section (`llm`, `image_gen`, `image_caption`, `video_caption`,
+`voice_transcription`) supports multiple API keys to lift the single-account
+concurrency ceiling. Requests are distributed round-robin across keys, and each
+key can be capped with `max_concurrent_per_key` (0 = unlimited, the default).
+
+Key resolution priority (first non-empty wins):
+
+1. `api_keys = ["sk-1", "sk-2"]` — explicit list in `config/agent.toml`.
+2. `api_key = "sk-1,sk-2"` — the single-key field also accepts a comma/newline
+   separated list.
+3. `api_keys_env = "LLM_API_KEYS"` — env var holding comma/newline separated
+   keys (defaults: `LLM_API_KEYS`, `IMAGE_API_KEYS`, `IMAGE_CAPTION_API_KEYS`,
+   `VIDEO_CAPTION_API_KEYS`, `VOICE_TRANSCRIPTION_API_KEYS`).
+4. `api_key_env = "LLM_API_KEY"` — the original single-key env var.
+
+```toml
+[llm]
+api_key_env = "LLM_API_KEY"
+api_keys = ["sk-account-1", "sk-account-2"]
+max_concurrent_per_key = 1   # each account serves at most 1 concurrent request
+```
+
+With two keys and `max_concurrent_per_key = 1` the effective concurrency ceiling
+is 2 across the whole process (all rooms/tasks share the key pool), instead of 1
+per single account. The per-task batch limits (`max_concurrent_chunk_requests`,
+`max_concurrent_requests`) still cap each individual summary task; the key pool
+adds a global per-account cap on top.
+
 Optional image and voice preprocessing can enrich the chat input before summarizing:
 `image_caption` describes decoded images, while `voice_transcription` sends decoded
 voice files to an OpenAI-compatible `/audio/transcriptions` endpoint and inserts
@@ -127,4 +157,5 @@ cargo run -p wechat-summary-app -- --config config\agent.toml
 ```
 
 The real wx4py runtime requires Windows WeChat to be logged in. Configure `[wx4py].groups`
-with WeChat group display names. History reads use the built-in `wxdb` reader by default.
+with WeChat group display names. Install a compatible external history provider separately and
+configure its command or absolute path in `[wxdb].executable`; this repository does not bundle it.

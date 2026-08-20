@@ -85,6 +85,9 @@ struct ConfigView {
     llm_max_concurrent_chunk_requests: u32,
     llm_max_input_chars: u32,
     llm_request_body_overrides: String,
+    llm_api_keys: String,
+    llm_api_keys_env: String,
+    llm_max_concurrent_per_key: u32,
     image_enabled: bool,
     image_provider: String,
     image_api_key_env: String,
@@ -94,6 +97,9 @@ struct ConfigView {
     image_resolution: String,
     image_timeout: u64,
     image_retry_5xx_attempts: u32,
+    image_api_keys: String,
+    image_api_keys_env: String,
+    image_max_concurrent_per_key: u32,
     image_caption_enabled: bool,
     image_caption_provider: String,
     image_caption_api_key_env: String,
@@ -106,6 +112,9 @@ struct ConfigView {
     image_caption_max_images: u32,
     image_caption_max_concurrent_requests: u32,
     image_caption_request_body_overrides: String,
+    image_caption_api_keys: String,
+    image_caption_api_keys_env: String,
+    image_caption_max_concurrent_per_key: u32,
     video_caption_enabled: bool,
     video_caption_provider: String,
     video_caption_api_key_env: String,
@@ -119,6 +128,9 @@ struct ConfigView {
     video_caption_max_concurrent_requests: u32,
     video_caption_max_video_bytes: u64,
     video_caption_request_body_overrides: String,
+    video_caption_api_keys: String,
+    video_caption_api_keys_env: String,
+    video_caption_max_concurrent_per_key: u32,
     voice_transcription_enabled: bool,
     voice_transcription_provider: String,
     voice_transcription_api_key_env: String,
@@ -136,6 +148,9 @@ struct ConfigView {
     voice_transcription_max_voices: u32,
     voice_transcription_max_concurrent_requests: u32,
     voice_transcription_request_body_overrides: String,
+    voice_transcription_api_keys: String,
+    voice_transcription_api_keys_env: String,
+    voice_transcription_max_concurrent_per_key: u32,
     runtime_output_dir: String,
     runtime_log_level: String,
     runtime_cleanup_days: u32,
@@ -364,10 +379,14 @@ impl GuiApp {
         self.status = StatusView {
             targets,
             app_ready: find_exe("wechat-summary-app").exists(),
-            wxdb_ready: find_exe("wxdb").exists(),
+            wxdb_ready: command_is_available(&self.view.wx_cli_executable),
             python_ready: resolve_working_path(&self.state, &self.view.wx_python).exists(),
-            llm_key_present: env_or_direct_value_present(&self.view.llm_api_key_env),
-            image_key_present: env_or_direct_value_present(&self.view.image_api_key_env),
+            llm_key_present: env_or_direct_value_present(&self.view.llm_api_key_env)
+                || !self.view.llm_api_keys.trim().is_empty()
+                || env_or_direct_value_present(&self.view.llm_api_keys_env),
+            image_key_present: env_or_direct_value_present(&self.view.image_api_key_env)
+                || !self.view.image_api_keys.trim().is_empty()
+                || env_or_direct_value_present(&self.view.image_api_keys_env),
             discord_token_present: env_present(&self.view.discord_token_env),
         };
     }
@@ -402,7 +421,11 @@ impl GuiApp {
             return;
         }
 
-        match start_wxdb_init(&self.state, &self.view.wxdb_cache_dir) {
+        match start_wxdb_init(
+            &self.state,
+            &self.view.wx_cli_executable,
+            &self.view.wxdb_cache_dir,
+        ) {
             Ok(process) => {
                 self.append_terminal_line(format!("[gui] wxdb init 已启动 pid={}\n", process.pid));
                 self.wxdb_init = Some(process);
@@ -614,7 +637,7 @@ impl eframe::App for GuiApp {
                 if ui.button("安装 Python Runtime").clicked() {
                     self.install_runtime();
                 }
-                if ui.button("运行 wxdb init").clicked() {
+                if ui.button("运行外部 wxdb init").clicked() {
                     self.run_wxdb_init();
                 }
                 if ui.button("启动主程序").clicked() {
@@ -767,7 +790,7 @@ fn status_cards(ui: &mut egui::Ui, app: &GuiApp) {
             card(ui, "定时", &scheduled_text);
             ui.end_row();
             card(ui, "主程序", yes_no(app.status.app_ready));
-            card(ui, "wxdb", yes_no(app.status.wxdb_ready));
+            card(ui, "历史提供器", yes_no(app.status.wxdb_ready));
             card(ui, "Python Runtime", yes_no(app.status.python_ready));
             card(ui, "LLM Key", yes_no(app.status.llm_key_present));
             ui.end_row();
@@ -911,6 +934,18 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
         ui.heading("文字总结");
         text_field(ui, "LLM Provider", &mut view.llm_provider);
         text_field(ui, "LLM API Key 环境变量/直接值", &mut view.llm_api_key_env);
+        multiline_field(
+            ui,
+            "LLM 多 Key 列表(每行一个, 留空不用)",
+            &mut view.llm_api_keys,
+            3,
+        );
+        text_field(ui, "LLM 多 Key 环境变量", &mut view.llm_api_keys_env);
+        number_u32(
+            ui,
+            "每 Key 最大并发(0=不限)",
+            &mut view.llm_max_concurrent_per_key,
+        );
         text_field(
             ui,
             "LLM Base URL 环境变量/直接值",
@@ -947,6 +982,13 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             "图片 API Key 环境变量/直接值",
             &mut view.image_api_key_env,
         );
+        multiline_field(ui, "图片多 Key 列表(每行一个)", &mut view.image_api_keys, 3);
+        text_field(ui, "图片多 Key 环境变量", &mut view.image_api_keys_env);
+        number_u32(
+            ui,
+            "每 Key 最大并发(0=不限)",
+            &mut view.image_max_concurrent_per_key,
+        );
         text_field(
             ui,
             "图片 Base URL 环境变量/直接值",
@@ -969,6 +1011,22 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             ui,
             "语音 API Key 环境变量/直接值",
             &mut view.voice_transcription_api_key_env,
+        );
+        multiline_field(
+            ui,
+            "语音多 Key 列表(每行一个)",
+            &mut view.voice_transcription_api_keys,
+            3,
+        );
+        text_field(
+            ui,
+            "语音多 Key 环境变量",
+            &mut view.voice_transcription_api_keys_env,
+        );
+        number_u32(
+            ui,
+            "每 Key 最大并发(0=不限)",
+            &mut view.voice_transcription_max_concurrent_per_key,
         );
         text_field(
             ui,
@@ -1030,6 +1088,22 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             "转述 API Key 环境变量/直接值",
             &mut view.image_caption_api_key_env,
         );
+        multiline_field(
+            ui,
+            "转述多 Key 列表(每行一个)",
+            &mut view.image_caption_api_keys,
+            3,
+        );
+        text_field(
+            ui,
+            "转述多 Key 环境变量",
+            &mut view.image_caption_api_keys_env,
+        );
+        number_u32(
+            ui,
+            "每 Key 最大并发(0=不限)",
+            &mut view.image_caption_max_concurrent_per_key,
+        );
         text_field(
             ui,
             "转述 Base URL 环境变量/直接值",
@@ -1064,6 +1138,22 @@ fn model_tab(ui: &mut egui::Ui, view: &mut ConfigView) {
             ui,
             "视频 API Key 环境变量/直接值",
             &mut view.video_caption_api_key_env,
+        );
+        multiline_field(
+            ui,
+            "视频多 Key 列表(每行一个)",
+            &mut view.video_caption_api_keys,
+            3,
+        );
+        text_field(
+            ui,
+            "视频多 Key 环境变量",
+            &mut view.video_caption_api_keys_env,
+        );
+        number_u32(
+            ui,
+            "每 Key 最大并发(0=不限)",
+            &mut view.video_caption_max_concurrent_per_key,
         );
         text_field(
             ui,
@@ -1111,14 +1201,14 @@ fn runtime_tab(
     two_columns(
         ui,
         |ui| {
-            text_field(ui, "wxdb 命令", &mut view.wx_cli_executable);
-            text_field(ui, "wxdb 账号 db_dir（留空自动）", &mut view.wxdb_db_dir);
-            number_u64(ui, "wxdb 命令超时秒数", &mut view.wx_cli_timeout);
+            text_field(ui, "外部历史命令", &mut view.wx_cli_executable);
+            text_field(ui, "提供器 db_dir（留空自动）", &mut view.wxdb_db_dir);
+            number_u64(ui, "外部命令超时秒数", &mut view.wx_cli_timeout);
             number_u64(ui, "历史查询总超时秒数", &mut view.wx_cli_history_timeout);
-            text_field(ui, "外部 wxdb 导出临时目录", &mut view.wx_cli_temp_dir);
+            text_field(ui, "外部导出临时目录", &mut view.wx_cli_temp_dir);
             directory_field(
                 ui,
-                "wxdb 缓存目录",
+                "提供器缓存目录",
                 &mut view.wxdb_cache_dir,
                 "留空使用用户目录下的默认缓存",
             );
@@ -1693,6 +1783,10 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
                 .min(u32::MAX as usize) as u32,
             llm_max_input_chars: config.privacy.max_chars_to_llm.min(u32::MAX as usize) as u32,
             llm_request_body_overrides,
+            llm_api_keys: join_lines(&config.llm.api_keys),
+            llm_api_keys_env: config.llm.api_keys_env,
+            llm_max_concurrent_per_key: config.llm.max_concurrent_per_key.min(u32::MAX as usize)
+                as u32,
             image_enabled: config.image_gen.enabled,
             image_provider: config.image_gen.provider,
             image_api_key_env: config.image_gen.api_key_env,
@@ -1703,6 +1797,12 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             image_timeout: config.image_gen.timeout_seconds,
             image_retry_5xx_attempts: config.image_gen.retry_5xx_attempts.min(u32::MAX as usize)
                 as u32,
+            image_api_keys: join_lines(&config.image_gen.api_keys),
+            image_api_keys_env: config.image_gen.api_keys_env,
+            image_max_concurrent_per_key: config
+                .image_gen
+                .max_concurrent_per_key
+                .min(u32::MAX as usize) as u32,
             image_caption_enabled: config.image_caption.enabled,
             image_caption_provider: config.image_caption.provider,
             image_caption_api_key_env: config.image_caption.api_key_env,
@@ -1724,6 +1824,12 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
                 .max_concurrent_requests
                 .min(u32::MAX as usize) as u32,
             image_caption_request_body_overrides,
+            image_caption_api_keys: join_lines(&config.image_caption.api_keys),
+            image_caption_api_keys_env: config.image_caption.api_keys_env,
+            image_caption_max_concurrent_per_key: config
+                .image_caption
+                .max_concurrent_per_key
+                .min(u32::MAX as usize) as u32,
             video_caption_enabled: config.video_caption.enabled,
             video_caption_provider: config.video_caption.provider,
             video_caption_api_key_env: config.video_caption.api_key_env,
@@ -1746,6 +1852,12 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
                 .min(u32::MAX as usize) as u32,
             video_caption_max_video_bytes: config.video_caption.max_video_bytes,
             video_caption_request_body_overrides,
+            video_caption_api_keys: join_lines(&config.video_caption.api_keys),
+            video_caption_api_keys_env: config.video_caption.api_keys_env,
+            video_caption_max_concurrent_per_key: config
+                .video_caption
+                .max_concurrent_per_key
+                .min(u32::MAX as usize) as u32,
             voice_transcription_enabled: config.voice_transcription.enabled,
             voice_transcription_provider: config.voice_transcription.provider,
             voice_transcription_api_key_env: config.voice_transcription.api_key_env,
@@ -1773,6 +1885,13 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
                 .min(u32::MAX as usize)
                 as u32,
             voice_transcription_request_body_overrides,
+            voice_transcription_api_keys: join_lines(&config.voice_transcription.api_keys),
+            voice_transcription_api_keys_env: config.voice_transcription.api_keys_env,
+            voice_transcription_max_concurrent_per_key: config
+                .voice_transcription
+                .max_concurrent_per_key
+                .min(u32::MAX as usize)
+                as u32,
             runtime_output_dir: config.runtime.output_dir,
             runtime_log_level: config.runtime.log_level,
             runtime_cleanup_days: config.runtime.cleanup_after_days,
@@ -1851,7 +1970,7 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         scheduled_send_text: get_bool(doc, "scheduled_summary", "send_text", true),
         scheduled_send_image: get_bool(doc, "scheduled_summary", "send_image", true),
         history_max_messages: get_history_max_messages(doc).min(u32::MAX as u64) as u32,
-        wx_cli_executable: get_str_alias(doc, "wxdb", "wx_cli", "executable", "builtin"),
+        wx_cli_executable: get_str_alias(doc, "wxdb", "wx_cli", "executable", "wxdb"),
         wx_cli_timeout: get_u64_alias(doc, "wxdb", "wx_cli", "timeout_seconds", 20),
         wx_cli_history_timeout: get_u64_alias(
             doc,
@@ -1877,6 +1996,10 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         llm_max_input_chars: get_u64(doc, "privacy", "max_chars_to_llm", 20_000)
             .min(u32::MAX as u64) as u32,
         llm_request_body_overrides: request_body_overrides_from_doc(doc),
+        llm_api_keys: join_lines(&get_array(doc, "llm", "api_keys")),
+        llm_api_keys_env: get_str(doc, "llm", "api_keys_env", "LLM_API_KEYS"),
+        llm_max_concurrent_per_key: get_u64(doc, "llm", "max_concurrent_per_key", 0)
+            .min(u32::MAX as u64) as u32,
         image_enabled: get_bool(doc, "image_gen", "enabled", true),
         image_provider: get_str(doc, "image_gen", "provider", "openai"),
         image_api_key_env: get_str(doc, "image_gen", "api_key_env", "IMAGE_API_KEY"),
@@ -1886,6 +2009,10 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
         image_resolution: get_str(doc, "image_gen", "resolution", "1k"),
         image_timeout: get_u64(doc, "image_gen", "timeout_seconds", 300),
         image_retry_5xx_attempts: get_u64(doc, "image_gen", "retry_5xx_attempts", 5)
+            .min(u32::MAX as u64) as u32,
+        image_api_keys: join_lines(&get_array(doc, "image_gen", "api_keys")),
+        image_api_keys_env: get_str(doc, "image_gen", "api_keys_env", "IMAGE_API_KEYS"),
+        image_max_concurrent_per_key: get_u64(doc, "image_gen", "max_concurrent_per_key", 0)
             .min(u32::MAX as u64) as u32,
         image_caption_enabled: get_bool(doc, "image_caption", "enabled", false),
         image_caption_provider: get_str(doc, "image_caption", "provider", "openai_compatible"),
@@ -1920,6 +2047,20 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             doc,
             "image_caption",
         ),
+        image_caption_api_keys: join_lines(&get_array(doc, "image_caption", "api_keys")),
+        image_caption_api_keys_env: get_str(
+            doc,
+            "image_caption",
+            "api_keys_env",
+            "IMAGE_CAPTION_API_KEYS",
+        ),
+        image_caption_max_concurrent_per_key: get_u64(
+            doc,
+            "image_caption",
+            "max_concurrent_per_key",
+            0,
+        )
+        .min(u32::MAX as u64) as u32,
         video_caption_enabled: get_bool(doc, "video_caption", "enabled", false),
         video_caption_provider: get_str(doc, "video_caption", "provider", "stepfun"),
         video_caption_api_key_env: get_str(
@@ -1959,6 +2100,20 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             doc,
             "video_caption",
         ),
+        video_caption_api_keys: join_lines(&get_array(doc, "video_caption", "api_keys")),
+        video_caption_api_keys_env: get_str(
+            doc,
+            "video_caption",
+            "api_keys_env",
+            "VIDEO_CAPTION_API_KEYS",
+        ),
+        video_caption_max_concurrent_per_key: get_u64(
+            doc,
+            "video_caption",
+            "max_concurrent_per_key",
+            0,
+        )
+        .min(u32::MAX as u64) as u32,
         voice_transcription_enabled: get_bool(doc, "voice_transcription", "enabled", false),
         voice_transcription_provider: get_str(
             doc,
@@ -2027,6 +2182,24 @@ fn config_view_from_doc(doc: &DocumentMut, text: &str) -> ConfigView {
             doc,
             "voice_transcription",
         ),
+        voice_transcription_api_keys: join_lines(&get_array(
+            doc,
+            "voice_transcription",
+            "api_keys",
+        )),
+        voice_transcription_api_keys_env: get_str(
+            doc,
+            "voice_transcription",
+            "api_keys_env",
+            "VOICE_TRANSCRIPTION_API_KEYS",
+        ),
+        voice_transcription_max_concurrent_per_key: get_u64(
+            doc,
+            "voice_transcription",
+            "max_concurrent_per_key",
+            0,
+        )
+        .min(u32::MAX as u64) as u32,
         runtime_output_dir: get_str(doc, "runtime", "output_dir", ".\\runtime\\rust-output"),
         runtime_log_level: get_str(doc, "runtime", "log_level", "info"),
         runtime_cleanup_days: get_u64(doc, "runtime", "cleanup_after_days", 7) as u32,
@@ -2173,6 +2346,13 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         "request_body_overrides",
         &update.llm_request_body_overrides,
     )?;
+    set_array(llm, "api_keys", &split_lines(&update.llm_api_keys));
+    set_str(llm, "api_keys_env", &update.llm_api_keys_env);
+    set_int(
+        llm,
+        "max_concurrent_per_key",
+        update.llm_max_concurrent_per_key as i64,
+    );
 
     let image_gen = table_mut(&mut doc, "image_gen");
     set_bool(image_gen, "enabled", update.image_enabled);
@@ -2187,6 +2367,13 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         image_gen,
         "retry_5xx_attempts",
         update.image_retry_5xx_attempts as i64,
+    );
+    set_array(image_gen, "api_keys", &split_lines(&update.image_api_keys));
+    set_str(image_gen, "api_keys_env", &update.image_api_keys_env);
+    set_int(
+        image_gen,
+        "max_concurrent_per_key",
+        update.image_max_concurrent_per_key as i64,
     );
 
     let image_caption = table_mut(&mut doc, "image_caption");
@@ -2238,6 +2425,21 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         "request_body_overrides",
         &update.image_caption_request_body_overrides,
     )?;
+    set_array(
+        image_caption,
+        "api_keys",
+        &split_lines(&update.image_caption_api_keys),
+    );
+    set_str(
+        image_caption,
+        "api_keys_env",
+        &update.image_caption_api_keys_env,
+    );
+    set_int(
+        image_caption,
+        "max_concurrent_per_key",
+        update.image_caption_max_concurrent_per_key as i64,
+    );
 
     let video_caption = table_mut(&mut doc, "video_caption");
     set_bool(video_caption, "enabled", update.video_caption_enabled);
@@ -2293,6 +2495,21 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         "request_body_overrides",
         &update.video_caption_request_body_overrides,
     )?;
+    set_array(
+        video_caption,
+        "api_keys",
+        &split_lines(&update.video_caption_api_keys),
+    );
+    set_str(
+        video_caption,
+        "api_keys_env",
+        &update.video_caption_api_keys_env,
+    );
+    set_int(
+        video_caption,
+        "max_concurrent_per_key",
+        update.video_caption_max_concurrent_per_key as i64,
+    );
 
     let voice_transcription = table_mut(&mut doc, "voice_transcription");
     set_bool(
@@ -2384,6 +2601,21 @@ fn save_config_update(state: &AppState, update: ConfigView) -> Result<()> {
         "request_body_overrides",
         &update.voice_transcription_request_body_overrides,
     )?;
+    set_array(
+        voice_transcription,
+        "api_keys",
+        &split_lines(&update.voice_transcription_api_keys),
+    );
+    set_str(
+        voice_transcription,
+        "api_keys_env",
+        &update.voice_transcription_api_keys_env,
+    );
+    set_int(
+        voice_transcription,
+        "max_concurrent_per_key",
+        update.voice_transcription_max_concurrent_per_key as i64,
+    );
 
     let runtime = table_mut(&mut doc, "runtime");
     set_str(runtime, "output_dir", &update.runtime_output_dir);
@@ -2750,13 +2982,13 @@ fn start_agent(state: &AppState) -> Result<AgentProcess> {
     Ok(AgentProcess { child, output, pid })
 }
 
-fn start_wxdb_init(state: &AppState, cache_dir: &str) -> Result<WxdbInitProcess> {
-    let wxdb = find_exe("wxdb");
-    if !wxdb.exists() {
-        return Err(anyhow!("wxdb 不存在: {}", wxdb.display()));
+fn start_wxdb_init(state: &AppState, executable: &str, cache_dir: &str) -> Result<WxdbInitProcess> {
+    let executable = executable.trim();
+    if executable.is_empty() {
+        return Err(anyhow!("请先在接入平台页配置外部 wxdb 命令路径"));
     }
 
-    let mut command = Command::new(wxdb);
+    let mut command = Command::new(executable);
     command
         .arg("init")
         .current_dir(&state.working_dir)
@@ -3015,6 +3247,24 @@ fn find_exe(name: &str) -> PathBuf {
     PathBuf::from(exe_name)
 }
 
+fn command_is_available(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    let configured_path = Path::new(command);
+    if configured_path.components().count() > 1 || configured_path.extension().is_some() {
+        return configured_path.is_file();
+    }
+    let executable = if cfg!(windows) && configured_path.extension().is_none() {
+        format!("{command}.exe")
+    } else {
+        command.to_string()
+    };
+    env::var_os("PATH")
+        .is_some_and(|paths| env::split_paths(&paths).any(|dir| dir.join(&executable).is_file()))
+}
+
 fn tail_file(path: &Path, max_bytes: u64) -> Result<String> {
     let file = fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -3132,5 +3382,98 @@ mod tests {
             terminal_line_color(&strip_ansi_sgr(line)),
             Some(egui::Color32::from_rgb(22, 163, 74))
         );
+    }
+
+    #[test]
+    fn config_view_loads_multi_key_fields() {
+        let text = r#"
+[llm]
+provider = "openai_compatible"
+api_key_env = "LLM_API_KEY"
+api_keys = ["sk-1", "sk-2"]
+api_keys_env = "LLM_API_KEYS"
+max_concurrent_per_key = 2
+
+[image_gen]
+provider = "openai"
+api_key_env = "IMAGE_API_KEY"
+size = "2:3"
+max_concurrent_per_key = 1
+"#;
+        let doc: DocumentMut = text.parse().unwrap();
+        let view = config_view_from_doc(&doc, text);
+
+        assert_eq!(view.llm_api_keys, "sk-1\nsk-2");
+        assert_eq!(view.llm_api_keys_env, "LLM_API_KEYS");
+        assert_eq!(view.llm_max_concurrent_per_key, 2);
+        assert!(view.image_api_keys.is_empty());
+        assert_eq!(view.image_max_concurrent_per_key, 1);
+    }
+
+    #[test]
+    fn save_config_update_round_trips_multi_key_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "gui-multikey-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        let base = r#"
+[wx4py]
+groups = ["测试群"]
+
+[listen]
+triggers = ["/总结"]
+
+[time_range]
+
+[rate_limit]
+
+[storage]
+sqlite_path = ":memory:"
+
+[llm]
+provider = "openai_compatible"
+api_key_env = "LLM_API_KEY"
+
+[image_gen]
+enabled = false
+provider = "openai"
+api_key_env = "IMAGE_API_KEY"
+size = "2:3"
+
+[runtime]
+output_dir = ".\\runtime\\test"
+"#;
+        std::fs::write(&path, base).unwrap();
+        let state = AppState {
+            config_path: path.clone(),
+            working_dir: dir.clone(),
+        };
+
+        let mut view = config_view_from_doc(&base.parse::<DocumentMut>().unwrap(), base);
+        view.llm_api_keys = "sk-a\nsk-b".to_string();
+        view.llm_api_keys_env = "LLM_API_KEYS".to_string();
+        view.llm_max_concurrent_per_key = 3;
+        view.image_api_keys = "img-key".to_string();
+        view.image_max_concurrent_per_key = 1;
+        save_config_update(&state, view).unwrap();
+
+        let reloaded_text = std::fs::read_to_string(&path).unwrap();
+        let reloaded = config_view_from_doc(
+            &reloaded_text.parse::<DocumentMut>().unwrap(),
+            &reloaded_text,
+        );
+        assert_eq!(reloaded.llm_api_keys, "sk-a\nsk-b");
+        assert_eq!(reloaded.llm_api_keys_env, "LLM_API_KEYS");
+        assert_eq!(reloaded.llm_max_concurrent_per_key, 3);
+        assert_eq!(reloaded.image_api_keys, "img-key");
+        assert_eq!(reloaded.image_max_concurrent_per_key, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

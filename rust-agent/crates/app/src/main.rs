@@ -391,7 +391,6 @@ async fn run_agent(config_path: &str) -> Result<()> {
 
     append_runtime_log(config, "agent startup started");
     cleanup_runtime_artifacts(config);
-    refresh_wxdb_keys_on_start(config);
 
     let store = SqliteStateStore::open(&config.storage.sqlite_path)
         .with_context(|| format!("opening state store {}", config.storage.sqlite_path))?;
@@ -746,16 +745,7 @@ impl Drop for WxdbCommandWatcher {
 }
 
 fn wxdb_command_watcher_enabled(config: &AgentConfig) -> bool {
-    config.platform.kind == PlatformKindConfig::Wx4py
-        && matches!(
-            config
-                .wx_cli
-                .executable
-                .trim()
-                .to_ascii_lowercase()
-                .as_str(),
-            "builtin" | "internal" | "wxdb-builtin"
-        )
+    config.platform.kind == PlatformKindConfig::Wx4py && !config.wx_cli.executable.trim().is_empty()
 }
 
 fn configured_wx_rooms(config: &AgentConfig) -> Vec<String> {
@@ -1006,20 +996,15 @@ fn poll_wxdb_command_room(
         .map(String::as_str)
         .unwrap_or(room);
     let query_page = |before_local_id| {
-        wx4py_client::query_builtin_wxdb_history_controlled(
+        wx4py_client::query_external_history_page(
             &config.wx_cli,
-            wechat_summary_wxdb::HistoryQuery {
-                chat_name: chat_name.to_string(),
-                since: Some(since),
-                until: Some(until),
-                before_local_id,
-                limit: WXDB_COMMAND_WATCH_LIMIT,
-                text_only: true,
-                msg_types: vec!["text".to_string()],
-                media_decode_limit: Some(0),
-            },
+            chat_name,
+            since,
+            until,
+            WXDB_COMMAND_WATCH_LIMIT as u32,
+            Some(0),
+            before_local_id,
         )
-        .map(|result| result.messages)
         .with_context(|| format!("querying wxdb command watcher history for {chat_name}"))
     };
 
@@ -1054,14 +1039,12 @@ fn poll_wxdb_command_room(
         {
             continue;
         }
-        let Some(timestamp) = Utc.timestamp_opt(message.timestamp, 0).single() else {
-            continue;
-        };
+        let timestamp = message.timestamp;
         let delayed_new_message = state
             .last_seen_local_id
             .zip(message.local_id)
             .is_some_and(|(last_seen, local_id)| local_id > last_seen);
-        if message.timestamp < state.startup_baseline && !delayed_new_message {
+        if timestamp.timestamp() < state.startup_baseline && !delayed_new_message {
             continue;
         }
         let content = message.content.trim().to_string();
@@ -1072,16 +1055,12 @@ fn poll_wxdb_command_room(
             room_id: room.to_string(),
             room_name: Some(chat_name.to_string()),
             stable_id: Some(key.clone()),
-            sender_id: message
-                .sender_username
-                .clone()
-                .filter(|sender| !sender.is_empty())
-                .unwrap_or_else(|| message.sender.clone()),
-            sender_name: (!message.sender.is_empty()).then_some(message.sender.clone()),
+            sender_id: message.sender_id.clone(),
+            sender_name: message.sender_name.clone(),
             content: content.clone(),
             msg_type: "text".to_string(),
             timestamp,
-            is_self: false,
+            is_self: message.is_self,
         };
         if matcher.match_message(&incoming).is_none() {
             continue;
@@ -1127,9 +1106,9 @@ fn paginate_wxdb_history<F>(
     limit: usize,
     last_seen_local_id: Option<i64>,
     mut query_page: F,
-) -> Result<Vec<wechat_summary_wxdb::HistoryMessage>>
+) -> Result<Vec<wx4py_client::Wx4pyHistoryMessage>>
 where
-    F: FnMut(Option<i64>) -> Result<Vec<wechat_summary_wxdb::HistoryMessage>>,
+    F: FnMut(Option<i64>) -> Result<Vec<wx4py_client::Wx4pyHistoryMessage>>,
 {
     let mut before_local_id = None;
     let mut messages = Vec::new();
@@ -1312,7 +1291,7 @@ fn effective_wxdb_cache_dir(config: &AgentConfig) -> String {
 
 fn wxdb_seen_message_key(
     chat_name: &str,
-    message: &wechat_summary_wxdb::HistoryMessage,
+    message: &wx4py_client::Wx4pyHistoryMessage,
 ) -> Option<String> {
     message
         .local_id
@@ -1439,76 +1418,6 @@ fn extend_unique_rooms(target: &mut Vec<String>, rooms: &[String]) {
     }
 }
 
-fn refresh_wxdb_keys_on_start(config: &AgentConfig) {
-    match wx4py_client::refresh_builtin_wxdb_keys_on_start(&config.wx_cli) {
-        Ok(Some(reports)) => {
-            let total_before: usize = reports.iter().map(|report| report.before_keys).sum();
-            let total_scanned: usize = reports.iter().map(|report| report.scanned_keys).sum();
-            let total_after: usize = reports.iter().map(|report| report.after_keys).sum();
-            info!(
-                stores = reports.len(),
-                before_keys = total_before,
-                scanned_keys = total_scanned,
-                after_keys = total_after,
-                "startup wxdb init completed"
-            );
-            append_runtime_log(
-                config,
-                &format!(
-                    "startup wxdb init completed stores={} before_keys={} scanned_keys={} after_keys={}",
-                    reports.len(),
-                    total_before,
-                    total_scanned,
-                    total_after
-                ),
-            );
-            for report in reports {
-                if let Some(error) = report.scan_error {
-                    warn!(
-                        db_dir = %report.db_dir,
-                        error = %error,
-                        "startup wxdb init scan warning"
-                    );
-                    append_runtime_log(
-                        config,
-                        &format!(
-                            "startup wxdb init scan warning db_dir={} error={}",
-                            report.db_dir, error
-                        ),
-                    );
-                } else {
-                    append_runtime_log(
-                        config,
-                        &format!(
-                            "startup wxdb init store db_dir={} before_keys={} imported_legacy_keys={} scanned_keys={} after_keys={}",
-                            report.db_dir,
-                            report.before_keys,
-                            report.imported_legacy_keys,
-                            report.scanned_keys,
-                            report.after_keys
-                        ),
-                    );
-                }
-            }
-        }
-        Ok(None) => {
-            info!("startup wxdb init skipped because external wxdb executable is configured");
-            append_runtime_log(
-                config,
-                "startup wxdb init skipped external wxdb executable configured",
-            );
-        }
-        Err(error) => {
-            let error_message = format_error_chain(&anyhow::Error::new(error));
-            warn!(error = %error_message, "startup wxdb init failed");
-            append_runtime_log(
-                config,
-                &format!("startup wxdb init failed error={error_message}"),
-            );
-        }
-    }
-}
-
 fn config_path_from_args() -> String {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1527,7 +1436,7 @@ fn runtime_env_filter(log_level: &str) -> EnvFilter {
     let filter = if level.contains(',') || level.eq_ignore_ascii_case("debug") {
         level.to_string()
     } else {
-        format!("{level},wechat_summary_wxdb::query=warn,wx4py_client=warn")
+        format!("{level},wx4py_client=warn")
     };
     EnvFilter::new(filter)
 }
@@ -7221,24 +7130,19 @@ mod tests {
     fn test_wxdb_history_message(
         local_id: i64,
         timestamp: i64,
-    ) -> wechat_summary_wxdb::HistoryMessage {
-        wechat_summary_wxdb::HistoryMessage {
-            timestamp,
-            time: timestamp.to_string(),
-            sender: "sender".to_string(),
+    ) -> wx4py_client::Wx4pyHistoryMessage {
+        wx4py_client::Wx4pyHistoryMessage {
+            timestamp: Utc.timestamp_opt(timestamp, 0).unwrap(),
+            sender_id: "sender".to_string(),
+            sender_name: Some("sender".to_string()),
             content: "/总结".to_string(),
             msg_type: "text".to_string(),
-            sender_username: None,
-            sender_contact_display: None,
-            sender_group_nickname: None,
             local_id: Some(local_id),
-            image_md5: None,
             media_path: None,
             thumbnail_path: None,
-            media_candidates: Vec::new(),
             decoded_media_path: None,
-            media_decoder: None,
             media_decode_error: None,
+            is_self: false,
         }
     }
 
