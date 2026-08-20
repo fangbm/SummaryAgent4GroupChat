@@ -196,7 +196,7 @@ GUI 使用 Windows UAC manifest；本地 `cargo test -p wechat-summary-gui` 在�
 
 ```toml
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 ```
 
 发布工作流只关注版本变化；仅修改 README、GUI 或配置不会生成 Release。这样可以避免每次普通提交都制造安装包版本。

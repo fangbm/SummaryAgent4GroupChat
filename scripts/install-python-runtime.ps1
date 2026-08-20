@@ -8,6 +8,19 @@
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+# Windows PowerShell 5.1 otherwise writes Chinese status and error text using
+# the active ANSI code page when its output is captured by the Rust GUI.
+$Utf8OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $Utf8OutputEncoding
+[Console]::OutputEncoding = $Utf8OutputEncoding
+$OutputEncoding = $Utf8OutputEncoding
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
+$WxdbReleaseRepository = "fangbm/wxdb"
+# Keep a known-good direct asset URL as a fallback. GitHub's unauthenticated
+# REST API is shared per public IP and can return 403 after its rate limit.
+$FallbackWxdbDownloadUrl = "https://github.com/fangbm/wxdb/releases/download/v0.1.0/wxdb-v0.1.0-windows-x64.zip"
 
 function Write-Step {
     param([string]$Message)
@@ -109,6 +122,28 @@ function Get-RelativeConfigPath {
     return ".\\$relative"
 }
 
+function Get-LatestWxdbDownloadUrl {
+    try {
+        # The releases page does not consume the REST API rate limit. It redirects
+        # to /releases/tag/<tag>, from which the versioned Windows asset name is stable.
+        $latest = Invoke-WebRequest `
+            -Uri "https://github.com/$WxdbReleaseRepository/releases/latest" `
+            -Headers @{ "User-Agent" = "SummaryAgent4GroupChat runtime installer" } `
+            -UseBasicParsing
+        $path = $latest.BaseResponse.ResponseUri.AbsolutePath
+        $match = [regex]::Match($path, '/releases/tag/(?<tag>[^/]+)$')
+        if ($match.Success) {
+            $tag = [uri]::UnescapeDataString($match.Groups['tag'].Value)
+            return "https://github.com/$WxdbReleaseRepository/releases/download/$tag/wxdb-$tag-windows-x64.zip"
+        }
+        Write-Warning "未能识别 wxdb 最新版本标签，改用已验证的下载地址。"
+    }
+    catch {
+        Write-Warning "读取 wxdb 最新版本失败，改用已验证的下载地址：$($_.Exception.Message)"
+    }
+    return $FallbackWxdbDownloadUrl
+}
+
 function Get-WxdbExecutable {
     param(
         [string]$InstallRoot,
@@ -142,17 +177,14 @@ function Get-WxdbExecutable {
 
     try {
         if ([string]::IsNullOrWhiteSpace($DownloadUrl)) {
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/fangbm/wxdb/releases/latest"
-            $asset = @($release.assets) | Where-Object {
-                $_.name -match '^wxdb-v.+-windows-x64\.zip$'
-            } | Select-Object -First 1
-            if (-not $asset) {
-                throw "最新 wxdb Release 中没有 Windows x64 压缩包"
-            }
-            $DownloadUrl = $asset.browser_download_url
+            $DownloadUrl = Get-LatestWxdbDownloadUrl
         }
         Write-Step "正在从独立 wxdb Release 下载运行时..."
-        Invoke-WebRequest -Uri $DownloadUrl -OutFile $archive -UseBasicParsing
+        Invoke-WebRequest `
+            -Uri $DownloadUrl `
+            -OutFile $archive `
+            -Headers @{ "User-Agent" = "SummaryAgent4GroupChat runtime installer" } `
+            -UseBasicParsing
         Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
         $downloaded = Get-ChildItem -LiteralPath $extractDir -Filter "wxdb.exe" -Recurse | Select-Object -First 1
         if (-not $downloaded) {
@@ -163,7 +195,7 @@ function Get-WxdbExecutable {
         return $target
     }
     catch {
-        throw "无法安装独立 wxdb 运行时：$($_.Exception.Message)。请在 wxdb 项目发布 Windows Release 后重试，或将 wxdb.exe 加入 PATH 后再次运行安装。"
+        throw "无法安装独立 wxdb 运行时：$($_.Exception.Message)。下载地址：$DownloadUrl。请检查网络访问 GitHub Release；也可在接入平台页填写 wxdb.exe 的本地绝对路径后再次运行安装。"
     }
     finally {
         Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -210,12 +242,12 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     }
 }
 
-Write-Step "升级 pip..."
-& $venvPython -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) { throw "升级 pip 失败，退出码 $LASTEXITCODE" }
+Write-Step "检查 pip..."
+& $venvPython -m pip --version
+if ($LASTEXITCODE -ne 0) { throw "pip 不可用，退出码 $LASTEXITCODE" }
 
 Write-Step "安装 wx4py..."
-& $venvPython -m pip install --upgrade wx4py
+& $venvPython -m pip install --disable-pip-version-check wx4py
 if ($LASTEXITCODE -ne 0) { throw "安装 wx4py 失败，退出码 $LASTEXITCODE" }
 
 $wxdb = Get-WxdbExecutable `
@@ -240,7 +272,7 @@ if (-not $SkipWxdbInit) {
     Write-Step "正在初始化 wxdb 密钥缓存..."
     & $wxdb init
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "wxdb init 未完成（退出码 $LASTEXITCODE）。请确认微信已登录，然后在 GUI 中点击“运行外部 wxdb init”重试。"
+        Write-Warning "wxdb init 未完成（退出码 $LASTEXITCODE）。请确认微信已登录，然后在 GUI 中点击运行外部 wxdb init 重试。"
     }
 }
 
