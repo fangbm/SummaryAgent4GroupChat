@@ -58,12 +58,18 @@ jobs:
           }
           # /CURRENTUSER skips elevation: the runner shell is non-elevated and
           # a silent admin install would exit immediately without installing.
+          # Start-Process -Wait is required: PowerShell does not wait for
+          # GUI-subsystem executables invoked with &, so $LASTEXITCODE would
+          # still hold choco's code while the installer runs in background.
           $installLog = Join-Path $env:TEMP 'summary-agent-smoke-install.log'
-          & $installer.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS `
-            /CURRENTUSER /LOG="$installLog"
-          if ($LASTEXITCODE -ne 0) {
+          Remove-Item $installLog -ErrorAction SilentlyContinue
+          $proc = Start-Process -FilePath $installer.FullName -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS',
+            '/CURRENTUSER', "/LOG=$installLog"
+          )
+          if ($proc.ExitCode -ne 0) {
             if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
-            throw "Silent installer smoke test failed with exit code $LASTEXITCODE."
+            throw "Silent installer smoke test failed with exit code $($proc.ExitCode)."
           }
           $installedExe = Join-Path $env:LOCALAPPDATA 'SummaryAgent4GroupChat\SummaryAgent4GroupChat.exe'
           if (-not (Test-Path -LiteralPath $installedExe)) {
