@@ -1,8 +1,10 @@
 name: CI
 
+# Lightweight checks for pull requests. Full packaging + installer smoke test
+# lives in package-smoke.yml and runs on main.
 on:
-  push:
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +18,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
@@ -23,6 +27,9 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-agent
       - name: Install Python checks
         shell: pwsh
         run: |
@@ -40,43 +47,9 @@ jobs:
         run: |
           cargo test --workspace --exclude wechat-summary-gui
           cargo check -p wechat-summary-gui
-      - name: WinUI build and tests
+      - name: WinUI tests
         shell: pwsh
-        run: |
-          dotnet test .\windows-ui\SummaryAgent4GroupChat.WinUI.sln -c Release -p:Platform=x64
-          dotnet publish .\windows-ui\src\SummaryAgent4GroupChat.WinUI\SummaryAgent4GroupChat.WinUI.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64
-      - name: Inno installer build and smoke check
-        shell: pwsh
-        run: |
-          choco install innosetup --yes --no-progress
-          .\scripts\package-windows-installer.ps1
-          $installer = Get-ChildItem .\dist -File -Filter 'SummaryAgent4GroupChat-Inno-Setup-windows-x64-*.exe' |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $installer -or $installer.Length -lt 1MB) {
-            throw 'Inno installer was not produced or is unexpectedly small.'
-          }
-          # /CURRENTUSER skips elevation: the runner shell is non-elevated and
-          # a silent admin install would exit immediately without installing.
-          # Start-Process -Wait is required: PowerShell does not wait for
-          # GUI-subsystem executables invoked with &, so $LASTEXITCODE would
-          # still hold choco's code while the installer runs in background.
-          $installLog = Join-Path $env:TEMP 'summary-agent-smoke-install.log'
-          Remove-Item $installLog -ErrorAction SilentlyContinue
-          $proc = Start-Process -FilePath $installer.FullName -Wait -PassThru -ArgumentList @(
-            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS',
-            '/CURRENTUSER', "/LOG=$installLog"
-          )
-          if ($proc.ExitCode -ne 0) {
-            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
-            throw "Silent installer smoke test failed with exit code $($proc.ExitCode)."
-          }
-          $installedExe = Join-Path $env:LOCALAPPDATA 'SummaryAgent4GroupChat\SummaryAgent4GroupChat.exe'
-          if (-not (Test-Path -LiteralPath $installedExe)) {
-            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
-            throw "Installer did not place the WinUI executable at $installedExe."
-          }
-          Write-Host "Installer smoke check passed: $($installer.FullName)"
+        run: dotnet test .\windows-ui\SummaryAgent4GroupChat.WinUI.sln -c Release -p:Platform=x64
       - name: Python lint and tests
         shell: pwsh
         run: |
