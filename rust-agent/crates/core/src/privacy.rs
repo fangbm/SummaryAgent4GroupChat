@@ -1,6 +1,24 @@
+use std::sync::OnceLock;
+
 use regex::Regex;
 
 use crate::config::PrivacyConfig;
+
+fn wxid_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"\b(wxid_|gh_)[A-Za-z0-9_-]+\b").unwrap())
+}
+
+fn phone_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"\b1[3-9]\d{9}\b").unwrap())
+}
+
+fn email_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN
+        .get_or_init(|| Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").unwrap())
+}
 
 pub struct PrivacyFilter {
     config: PrivacyConfig,
@@ -16,13 +34,11 @@ impl PrivacyFilter {
             return input.to_string();
         }
 
-        let wxid = Regex::new(r"\b(wxid_|gh_)[A-Za-z0-9_-]+\b").unwrap();
-        let phone = Regex::new(r"\b1[3-9]\d{9}\b").unwrap();
-        let email = Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").unwrap();
-
-        let redacted = wxid.replace_all(input, "[REDACTED_WXID]");
-        let redacted = phone.replace_all(&redacted, "[REDACTED_PHONE]");
-        email.replace_all(&redacted, "[REDACTED_EMAIL]").to_string()
+        let redacted = wxid_pattern().replace_all(input, "[REDACTED_WXID]");
+        let redacted = phone_pattern().replace_all(&redacted, "[REDACTED_PHONE]");
+        email_pattern()
+            .replace_all(&redacted, "[REDACTED_EMAIL]")
+            .to_string()
     }
 }
 

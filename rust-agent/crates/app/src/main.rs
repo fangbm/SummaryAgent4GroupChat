@@ -1,10 +1,9 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
-    env,
-    fs::{self, OpenOptions},
+    env, fs,
     future::Future,
-    io::{self, Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     pin::Pin,
     process::{Command, Stdio},
@@ -20,15 +19,17 @@ use std::{
 use std::os::windows::process::CommandExt;
 
 mod platform;
+mod runtime_log;
+
+use runtime_log::*;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
-use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
 use wechat_summary_ai::{
-    AiError, AiRetryNotice, AiTraceContext, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm,
+    AiError, AiTraceContext, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm,
     OpenAiImageClient, OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
 };
 use wechat_summary_core::{
@@ -419,7 +420,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
     if let Some(run_at) = next_scheduled_run {
         info!(
             run_at_utc = %run_at,
-            run_at_beijing = %format_beijing_time(run_at),
+            run_at_local = %format_local_time(run_at),
             "scheduled summary enabled"
         );
         append_runtime_log(
@@ -427,7 +428,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
             &format!(
                 "scheduled summary enabled next_run_utc={} next_run_beijing={}",
                 run_at,
-                format_beijing_time(run_at)
+                format_local_time(run_at)
             ),
         );
     }
@@ -459,7 +460,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
             if let Some(run_at) = next_scheduled_run {
                 info!(
                     run_at_utc = %run_at,
-                    run_at_beijing = %format_beijing_time(run_at),
+                    run_at_local = %format_local_time(run_at),
                     "scheduled summary replanned after config reload"
                 );
             }
@@ -490,7 +491,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
             if let Some(run_at) = next_scheduled_run {
                 info!(
                     run_at_utc = %run_at,
-                    run_at_beijing = %format_beijing_time(run_at),
+                    run_at_local = %format_local_time(run_at),
                     "next scheduled summary planned"
                 );
             }
@@ -1428,252 +1429,6 @@ fn config_path_from_args() -> String {
         }
     }
     "config/agent.toml".to_string()
-}
-
-fn runtime_env_filter(log_level: &str) -> EnvFilter {
-    let trimmed = log_level.trim();
-    let level = if trimmed.is_empty() { "info" } else { trimmed };
-    let filter = if level.contains(',') || level.eq_ignore_ascii_case("debug") {
-        level.to_string()
-    } else {
-        format!("{level},wx4py_client=warn")
-    };
-    EnvFilter::new(filter)
-}
-
-fn append_runtime_log(config: &AgentConfig, message: &str) {
-    let output_dir = std::path::Path::new(&config.runtime.output_dir);
-    if fs::create_dir_all(output_dir).is_err() {
-        return;
-    }
-    let path = output_dir.join("wechat-summary-app.log");
-    enforce_runtime_log_limit(&path, config.runtime.max_log_mb);
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{} {}", Utc::now().to_rfc3339(), message);
-    }
-}
-
-fn enforce_runtime_log_limit(path: &Path, max_log_mb: u64) {
-    if max_log_mb == 0 {
-        return;
-    }
-    let max_bytes = max_log_mb.saturating_mul(1024).saturating_mul(1024);
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
-    };
-    if metadata.len() < max_bytes {
-        return;
-    }
-
-    let rotated_message = format!(
-        "{} log truncated because size reached {} bytes (limit={}MB)",
-        Utc::now().to_rfc3339(),
-        metadata.len(),
-        max_log_mb
-    );
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{rotated_message}");
-    }
-}
-
-fn retry_log_notifier(config: &AgentConfig, room_id: String) -> RetryNotifier {
-    let config = config.clone();
-    Arc::new(move |notice: AiRetryNotice| {
-        let config = config.clone();
-        let room_id = room_id.clone();
-        Box::pin(async move {
-            let reason = retry_notice_reason(&notice.reason, 160);
-            info!(
-                room_id = %room_id,
-                operation = notice.operation,
-                attempt = notice.attempt,
-                max_attempts = notice.max_attempts,
-                retry_after_ms = notice.retry_after_ms,
-                reason = %reason,
-                "AI request retry scheduled"
-            );
-            append_runtime_log(&config, &format_retry_log_entry(&room_id, &notice));
-        })
-    })
-}
-
-fn format_retry_log_entry(room_id: &str, notice: &AiRetryNotice) -> String {
-    format!(
-        "ai retry scheduled room={} operation={} retry={}/{} wait_ms={} reason={}",
-        room_id,
-        notice.operation,
-        retry_notice_retry_index(notice),
-        retry_notice_max_retries(notice),
-        notice.retry_after_ms,
-        retry_notice_reason(&notice.reason, 160)
-    )
-}
-
-fn retry_notice_max_retries(notice: &AiRetryNotice) -> usize {
-    notice.max_attempts.saturating_sub(1).max(1)
-}
-
-fn retry_notice_retry_index(notice: &AiRetryNotice) -> usize {
-    notice.attempt.min(retry_notice_max_retries(notice)).max(1)
-}
-
-fn retry_notice_reason(reason: &str, max_chars: usize) -> String {
-    let compact = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    let redacted = redact_secret_like_tokens(&compact);
-    let mut output = redacted.chars().take(max_chars).collect::<String>();
-    if redacted.chars().count() > max_chars {
-        output.push_str("...");
-    }
-    if output.is_empty() {
-        "unknown".to_string()
-    } else {
-        output
-    }
-}
-
-fn compact_ai_error_for_runtime(error: &AiError) -> String {
-    retry_notice_reason(&error.to_string(), 700)
-}
-
-fn compact_error_for_runtime(error_message: &str, max_chars: usize) -> String {
-    let compact = error_message
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let redacted = redact_secret_like_tokens(&compact);
-    let char_count = redacted.chars().count();
-    let mut output = redacted.chars().take(max_chars).collect::<String>();
-    if char_count > max_chars {
-        output.push_str("...");
-    }
-    if output.is_empty() {
-        "unknown".to_string()
-    } else {
-        output
-    }
-}
-
-fn format_failure_message_for_chat(label: &str, error_message: &str) -> String {
-    let reason = compact_error_for_chat(error_message, 700);
-    format!("{label}：{reason}")
-}
-
-fn compact_error_for_chat(error_message: &str, max_chars: usize) -> String {
-    let compact = error_message
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let redacted = redact_secret_like_tokens(&compact);
-    let char_count = redacted.chars().count();
-    let mut output = redacted.chars().take(max_chars).collect::<String>();
-    if char_count > max_chars {
-        output.push_str("...（完整错误见终端/日志）");
-    }
-    if output.is_empty() {
-        "unknown".to_string()
-    } else {
-        output
-    }
-}
-
-fn redact_secret_like_tokens(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut index = 0;
-    while let Some(relative) = input[index..].find("sk-") {
-        let start = index + relative;
-        output.push_str(&input[index..start]);
-        let mut end = start + 3;
-        for (offset, ch) in input[end..].char_indices() {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                end = start + 3 + offset + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if end - start >= 12 {
-            output.push_str("<redacted-secret>");
-        } else {
-            output.push_str(&input[start..end]);
-        }
-        index = end;
-    }
-    output.push_str(&input[index..]);
-    output
-}
-
-#[derive(Clone)]
-struct RuntimeTraceWriter {
-    path: PathBuf,
-    max_log_mb: u64,
-}
-
-impl RuntimeTraceWriter {
-    fn new(config: &AgentConfig) -> Self {
-        let output_dir = std::path::Path::new(&config.runtime.output_dir);
-        let _ = fs::create_dir_all(output_dir);
-        Self {
-            path: output_dir.join("wechat-summary-app.log"),
-            max_log_mb: config.runtime.max_log_mb,
-        }
-    }
-}
-
-impl<'a> MakeWriter<'a> for RuntimeTraceWriter {
-    type Writer = RuntimeTraceGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        enforce_runtime_log_limit(&self.path, self.max_log_mb);
-        RuntimeTraceGuard {
-            file: OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .ok(),
-        }
-    }
-}
-
-struct RuntimeTraceGuard {
-    file: Option<fs::File>,
-}
-
-impl Write for RuntimeTraceGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let _ = io::stdout().write_all(buf);
-        if let Some(file) = &mut self.file {
-            let _ = file.write_all(buf);
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        let _ = io::stdout().flush();
-        if let Some(file) = &mut self.file {
-            let _ = file.flush();
-        }
-        Ok(())
-    }
-}
-
-fn append_startup_error(config_path: &str, message: &str) {
-    if let Ok(config) = AgentConfig::from_path(config_path) {
-        append_runtime_log(&config, message);
-        return;
-    }
-
-    let output_dir = std::path::Path::new("runtime").join("rust-output");
-    if fs::create_dir_all(&output_dir).is_err() {
-        return;
-    }
-    let path = output_dir.join("wechat-summary-app.log");
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{} {}", Utc::now().to_rfc3339(), message);
-    }
 }
 
 fn cleanup_runtime_artifacts(config: &AgentConfig) {
@@ -4338,7 +4093,7 @@ fn private_formatted_chat_input(messages: &[ChatMessage], privacy: &PrivacyFilte
 fn formatted_chat_line_chars(message: &ChatMessage) -> usize {
     format!(
         "[{}] {}: {}",
-        format_beijing_time(message.timestamp),
+        format_local_time(message.timestamp),
         message.display_sender(),
         message.content.trim()
     )
@@ -4708,13 +4463,16 @@ fn next_scheduled_run_after(now: DateTime<Utc>, config: &AgentConfig) -> Option<
         return None;
     }
 
-    let local_now = now + Duration::hours(8);
+    let local_now = now.with_timezone(&Local);
     let local_run_time = local_now.date_naive().and_hms_opt(
         config.scheduled_summary.local_hour,
         config.scheduled_summary.local_minute,
         0,
     )?;
-    let run_at = Utc.from_utc_datetime(&local_run_time) - Duration::hours(8);
+    let run_at: DateTime<Utc> = Local
+        .from_local_datetime(&local_run_time)
+        .earliest()
+        .map(|local| local.with_timezone(&Utc))?;
     if run_at >= now {
         Some(run_at)
     } else {
@@ -4980,15 +4738,16 @@ fn is_agent_status_content(content: &str) -> bool {
 fn format_summary_reply(summary: &str, range: &ResolvedTimeRange, total_messages: usize) -> String {
     format!(
         "群聊总结（{} - {}，{} 条）\n\n{}",
-        format_beijing_time(range.since),
-        format_beijing_time(range.until),
+        format_local_time(range.since),
+        format_local_time(range.until),
         total_messages,
         summary.trim()
     )
 }
 
-fn format_beijing_time(value: DateTime<Utc>) -> String {
-    (value + Duration::hours(8))
+fn format_local_time(value: DateTime<Utc>) -> String {
+    value
+        .with_timezone(&Local)
         .format("%m-%d %H:%M")
         .to_string()
 }
@@ -6010,8 +5769,9 @@ fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{Local, TimeZone, Timelike, Utc};
     use std::time::Duration as TestDuration;
+    use wechat_summary_ai::AiRetryNotice;
 
     use super::*;
 
@@ -6898,30 +6658,53 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_run_defaults_to_next_22_00_beijing() {
+    fn scheduled_run_defaults_to_next_configured_local_time() {
         let config = test_config();
         let now = Utc.with_ymd_and_hms(2026, 5, 25, 13, 30, 0).unwrap();
         let run_at = next_scheduled_run_after(now, &config).unwrap();
 
-        assert_eq!(run_at, Utc.with_ymd_and_hms(2026, 5, 25, 14, 0, 0).unwrap());
+        let expected_today: DateTime<Utc> = Local
+            .from_local_datetime(
+                &now.with_timezone(&Local)
+                    .date_naive()
+                    .and_hms_opt(22, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap()
+            .into();
+        let expected = if expected_today >= now {
+            expected_today
+        } else {
+            expected_today + Duration::days(1)
+        };
+        assert_eq!(run_at, expected);
     }
 
     #[test]
     fn scheduled_run_rolls_to_tomorrow_after_local_time_passes() {
         let config = test_config();
-        let now = Utc.with_ymd_and_hms(2026, 5, 25, 14, 1, 0).unwrap();
+        let now = Utc::now();
         let run_at = next_scheduled_run_after(now, &config).unwrap();
 
-        assert_eq!(run_at, Utc.with_ymd_and_hms(2026, 5, 26, 14, 0, 0).unwrap());
+        assert!(run_at > now);
+        assert!(run_at - now <= Duration::hours(24));
+        let local_run = run_at.with_timezone(&Local);
+        assert_eq!(local_run.hour(), 22);
+        assert_eq!(local_run.minute(), 0);
     }
 
     #[test]
     fn scheduled_run_can_fire_at_exact_local_time() {
         let config = test_config();
-        let now = Utc.with_ymd_and_hms(2026, 5, 25, 14, 0, 0).unwrap();
-        let run_at = next_scheduled_run_after(now, &config).unwrap();
+        let today_run: DateTime<Utc> = Local
+            .from_local_datetime(&Local::now().date_naive().and_hms_opt(22, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .into();
+        let run_at = next_scheduled_run_after(today_run, &config).unwrap();
 
-        assert_eq!(run_at, now);
+        assert_eq!(run_at, today_run);
     }
 
     #[test]
@@ -7274,7 +7057,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_log_limit_truncates_oversized_log() {
+    fn runtime_log_limit_rotates_oversized_log() {
         let config_path = unique_config_path();
         let log_path = config_path.parent().unwrap().join("wechat-summary-app.log");
         std::fs::write(&log_path, vec![b'x'; 1024 * 1024 + 16]).unwrap();
@@ -7282,12 +7065,14 @@ mod tests {
         enforce_runtime_log_limit(&log_path, 1);
 
         let text = std::fs::read_to_string(&log_path).unwrap();
-        assert!(text.contains("log truncated because size reached"));
+        assert!(text.contains("log rotated because size reached"));
         assert!(std::fs::metadata(&log_path).unwrap().len() < 1024 * 1024);
+        let rotated = log_path.with_extension("log.1");
+        assert_eq!(std::fs::metadata(&rotated).unwrap().len(), 1024 * 1024 + 16);
     }
 
     #[test]
-    fn runtime_log_limit_zero_disables_truncation() {
+    fn runtime_log_limit_zero_disables_rotation() {
         let config_path = unique_config_path();
         let log_path = config_path.parent().unwrap().join("wechat-summary-app.log");
         std::fs::write(&log_path, vec![b'x'; 1024 * 1024 + 16]).unwrap();
@@ -7295,6 +7080,7 @@ mod tests {
         enforce_runtime_log_limit(&log_path, 0);
 
         assert!(std::fs::metadata(&log_path).unwrap().len() > 1024 * 1024);
+        assert!(!log_path.with_extension("log.1").exists());
     }
 
     fn test_config() -> AgentConfig {

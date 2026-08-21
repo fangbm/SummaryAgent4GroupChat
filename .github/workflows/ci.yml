@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -66,4 +70,5 @@ jobs:
         run: |
           .\.venv\Scripts\python.exe -m ruff check .
           .\.venv\Scripts\python.exe -m mypy src
-          .\.venv\Scripts\python.exe -m pytest -q
+          .\.venv\Scripts\python.exe -m coverage run -m pytest -q
+          .\.venv\Scripts\python.exe -m coverage report --fail-under=60

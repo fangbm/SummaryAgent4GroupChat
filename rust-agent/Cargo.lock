@@ -4878,6 +4878,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "toml_edit 0.22.27",
  "uuid",
  "wechat-summary-core",
  "windows-sys 0.59.0",

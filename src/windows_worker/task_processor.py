@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -26,6 +27,8 @@ from windows_worker.config import WorkerConfig
 from windows_worker.providers.image_gen import ImageGenClient
 from windows_worker.providers.llm import LLMClient
 from windows_worker.wx_cli_adapter import WxCliAdapter
+
+logger = logging.getLogger(__name__)
 
 ProgressSender = Callable[[SignalMessage], Awaitable[None]]
 
@@ -150,10 +153,15 @@ class TaskProcessor:
                         ),
                         checksum_sha256=generated.sha256,
                     )
-                except Exception as exc:
+                except Exception:
                     if TASK_ERRORS_TOTAL is not None:
                         TASK_ERRORS_TOTAL.labels(code=ErrorCode.IMAGE_GEN_FAILED.value).inc()
-                    summary += f"\n\n[图片生成失败，已降级为文字摘要：{exc}]"
+                    # Keep internal details (URLs, provider errors) out of the
+                    # group chat; the full exception goes to the log only.
+                    logger.exception(
+                        "image generation failed for request=%s", trigger.request_id
+                    )
+                    summary += "\n\n[图片生成失败，已降级为文字摘要]"
 
             completed_payload = TaskCompletedPayload(
                 request_id=trigger.request_id,

@@ -198,6 +198,13 @@ cargo clippy --workspace -- -D warnings
 
 WinUI GUI 使用普通权限 manifest；本地可用 `dotnet build .\windows-ui\SummaryAgent4GroupChat.WinUI.sln -p:Platform=x64` 验证界面工程。
 
+### 代码库结构说明
+
+- `rust-agent/crates/`：产品本体。`app` 是主程序，`control` 是 WinUI 前端依赖的本地控制服务，`core`/`ai`/`storage` 为共享库，`gui` 是旧版 egui 界面（保留但不再是默认前端）。
+- `windows-ui/`：WinUI 3 前端（当前默认界面）。
+- `scripts/wx4py_sidecar.py`：微信 UI 自动化 sidecar，随产品分发。
+- `src/linux_bot`、`src/windows_worker`、`src/pipeline_core`：旧 Python 双机/API 部署管线，仅作可选方案维护，不属于安装包默认路径；相关部署见 `docs/deploy-guide.md`。
+
 ## 发布
 
 更新 [`rust-agent/Cargo.toml`](rust-agent/Cargo.toml) 的 `[workspace.package].version` 并推送到 `main` 后，GitHub Actions 会自动构建 Windows zip 和 Inno Setup 安装程序，创建 `v<version>` Release，并生成 GitHub Release Notes。

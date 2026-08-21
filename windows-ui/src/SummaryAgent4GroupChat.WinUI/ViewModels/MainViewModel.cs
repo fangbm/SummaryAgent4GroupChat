@@ -1,6 +1,5 @@
 using System.Collections.ObjectModel;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using CommunityToolkit.Mvvm.ComponentModel;
 using Microsoft.UI.Dispatching;
 using SummaryAgent4GroupChat.WinUI.Models;
@@ -14,6 +13,10 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly DispatcherQueue _dispatcher = DispatcherQueue.GetForCurrentThread();
     private ControlClient? _client;
     private bool _initialized;
+    // Structured (redacted) view of the current config returned by config.read.
+    // The form reads from this and saves through config.patch; it never edits
+    // TOML text itself.
+    private JsonElement _parsedConfig;
 
     [ObservableProperty] private string _configText = string.Empty;
     [ObservableProperty] private string _validationMessage = "正在连接控制服务…";
@@ -110,6 +113,14 @@ public sealed partial class MainViewModel : ObservableObject
             configReply.ThrowIfError();
             var config = configReply.Result!.Value;
             ConfigText = config.GetProperty("toml").GetString() ?? string.Empty;
+            if (config.TryGetProperty("parsed", out var parsed) && parsed.ValueKind == JsonValueKind.Object)
+            {
+                _parsedConfig = parsed.Clone();
+            }
+            else
+            {
+                _parsedConfig = default;
+            }
             LoadFormFromConfig();
             ValidationMessage = config.GetProperty("validation").GetString() is { Length: > 0 } validation ? validation : "配置有效";
 
@@ -143,13 +154,35 @@ public sealed partial class MainViewModel : ObservableObject
 
     public async Task SaveAsync()
     {
-        ApplyFormToConfig();
-        await SaveConfigTextAsync();
+        var operations = BuildFormOperations();
+        if (operations.Count == 0)
+        {
+            Notice = "配置无变更";
+            return;
+        }
+        await PatchConfigAsync(operations);
     }
 
     public async Task SaveRawConfigAsync()
     {
         await SaveConfigTextAsync();
+    }
+
+    private async Task PatchConfigAsync(List<Dictionary<string, object?>> operations)
+    {
+        if (_client is null) return;
+        try
+        {
+            var reply = await _client.CallAsync("config.patch", new { operations }, _lifetime.Token);
+            reply.ThrowIfError();
+            ValidationMessage = "配置已保存，主程序会自动热重载。";
+            Notice = "配置已保存";
+            await RefreshAsync();
+        }
+        catch (Exception error)
+        {
+            ValidationMessage = $"保存失败：{error.Message}";
+        }
     }
 
     private async Task SaveConfigTextAsync()
@@ -311,51 +344,6 @@ public sealed partial class MainViewModel : ObservableObject
         ImageCaptionEnabled = ReadBool("image_caption", "enabled", false);
         VideoCaptionEnabled = ReadBool("video_caption", "enabled", false);
         VoiceTranscriptionEnabled = ReadBool("voice_transcription", "enabled", false);
-    }
-
-    private void ApplyFormToConfig()
-    {
-        WriteString("platform", "kind", PlatformKind);
-        WriteList("wx4py", "groups", WeChatGroups);
-        WriteList("discord", "channels", DiscordChannels);
-        WriteString("wxdb", "executable", WxdbExecutable);
-        WriteString("wxdb", "cache_dir", WxdbCacheDirectory);
-        WriteNumber("history", "max_messages", HistoryPageSize, 10000);
-        WriteDisabledImageRooms(DisabledImageRooms);
-
-        WriteList("listen", "triggers", TriggerCommands);
-        WriteList("listen", "whitelist_rooms", WhitelistRooms);
-        WriteBool("listen", "ignore_self", IgnoreSelf);
-        WriteNumber("rate_limit", "successful_request_cooldown_seconds", RequestCooldownSeconds, 300);
-        WriteNumber("rate_limit", "successful_image_cooldown_seconds", ImageCooldownSeconds, 0);
-        WriteBool("manual_summary", "image_by_default", ManualImagesByDefault);
-
-        WriteBool("scheduled_summary", "enabled", ScheduleEnabled);
-        var scheduleParts = ScheduleTime.Split(':', StringSplitOptions.TrimEntries);
-        WriteNumber("scheduled_summary", "local_hour", scheduleParts.ElementAtOrDefault(0), 22);
-        WriteNumber("scheduled_summary", "local_minute", scheduleParts.ElementAtOrDefault(1), 0);
-        WriteNumber("scheduled_summary", "range_hours", ScheduleRangeHours, 24);
-        WriteList("scheduled_summary", "rooms", ScheduleRooms);
-        WriteBool("scheduled_summary", "send_text", ScheduleSendText);
-        WriteBool("scheduled_summary", "send_image", ScheduleSendImage);
-
-        WriteString("llm", "api_key_env", LlmApiKeyEnvironment);
-        WriteOptionalString("llm", "base_url", LlmBaseUrl);
-        WriteOptionalString("llm", "model", LlmModel);
-        WriteNumber("llm", "timeout_seconds", LlmTimeoutSeconds, 120);
-        WriteBool("llm", "stream", LlmStreamingEnabled);
-        WriteNumber("llm", "stream_first_event_timeout_seconds", LlmStreamFirstEventTimeoutSeconds, 30);
-        WriteNumber("llm", "stream_idle_timeout_seconds", LlmStreamIdleTimeoutSeconds, 30);
-        WriteNumber("llm", "max_output_tokens", LlmMaxOutputTokens, 2000);
-        WriteNumber("llm", "max_concurrent_chunk_requests", LlmChunkConcurrency, 4);
-        WriteBool("image_gen", "enabled", ImageGenerationEnabled);
-        WriteString("image_gen", "api_key_env", ImageApiKeyEnvironment);
-        WriteOptionalString("image_gen", "base_url", ImageBaseUrl);
-        WriteOptionalString("image_gen", "model", ImageModel);
-        WriteNumber("image_gen", "timeout_seconds", ImageTimeoutSeconds, 300);
-        WriteBool("image_caption", "enabled", ImageCaptionEnabled);
-        WriteBool("video_caption", "enabled", VideoCaptionEnabled);
-        WriteBool("voice_transcription", "enabled", VoiceTranscriptionEnabled);
     }
 
     private async Task AgentCommandAsync(string method, string success, object? parameters = null)
@@ -553,108 +541,228 @@ public sealed partial class MainViewModel : ObservableObject
         _ => "未知",
     };
 
-    private string ReadString(string section, string key, string fallback)
+    private JsonElement Section(string name) =>
+        _parsedConfig.ValueKind == JsonValueKind.Object && _parsedConfig.TryGetProperty(name, out var value)
+            ? value
+            : default;
+
+    private static string ReadString(JsonElement section, string key, string fallback)
     {
-        var value = ReadValue(section, key);
-        if (string.IsNullOrWhiteSpace(value)) return fallback;
-        var quoted = Regex.Match(value, "^\\s*\\\"(?<value>(?:\\\\.|[^\\\"])*)\\\"\\s*$");
-        return quoted.Success ? quoted.Groups["value"].Value.Replace("\\\"", "\"").Replace("\\\\", "\\") : value.Trim();
-    }
-
-    private bool ReadBool(string section, string key, bool fallback) =>
-        bool.TryParse(ReadValue(section, key), out var value) ? value : fallback;
-
-    private string ReadList(string section, string key)
-    {
-        var value = ReadValue(section, key);
-        return string.Join(", ", Regex.Matches(value, "\\\"(?<value>(?:\\\\.|[^\\\"])*)\\\"")
-            .Select(match => match.Groups["value"].Value.Replace("\\\"", "\"").Replace("\\\\", "\\")));
-    }
-
-    private IEnumerable<string> ReadDisabledImageRooms()
-    {
-        var body = ReadSection("room_capabilities");
-        return Regex.Matches(body, "(?m)^\\s*\\\"?(?<room>[^\\\"=]+?)\\\"?\\s*=\\s*\\{\\s*image_summary_enabled\\s*=\\s*false\\s*\\}\\s*(?:#.*)?$")
-            .Select(match => match.Groups["room"].Value.Trim());
-    }
-
-    private string ReadValue(string section, string key)
-    {
-        var match = Regex.Match(ReadSection(section), $"(?m)^\\s*{Regex.Escape(key)}\\s*=\\s*(?<value>[^\\r\\n#]*)(?:#.*)?$");
-        return match.Success ? match.Groups["value"].Value.Trim() : string.Empty;
-    }
-
-    private string ReadSection(string section)
-    {
-        var match = Regex.Match(ConfigText, $"(?ms)^\\[{Regex.Escape(section)}\\]\\s*\\r?\\n(?<body>.*?)(?=^\\[|\\z)");
-        return match.Success ? match.Groups["body"].Value : string.Empty;
-    }
-
-    private void WriteString(string section, string key, string value) =>
-        WriteValue(section, key, $"\\\"{value.Trim().Replace("\\", "\\\\").Replace("\"", "\\\"")}\\\"");
-
-    private void WriteOptionalString(string section, string key, string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
+        if (section.ValueKind != JsonValueKind.Object || !section.TryGetProperty(key, out var value))
         {
-            return;
+            return fallback;
         }
-        WriteString(section, key, value);
+        return value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString() ?? fallback,
+            JsonValueKind.Number => value.GetRawText(),
+            JsonValueKind.True => "true",
+            JsonValueKind.False => "false",
+            _ => fallback,
+        };
     }
 
-    private void WriteBool(string section, string key, bool value) =>
-        WriteValue(section, key, value ? "true" : "false");
+    private string ReadString(string section, string key, string fallback) =>
+        ReadString(Section(section), key, fallback);
 
-    private void WriteNumber(string section, string key, string? value, int fallback) =>
-        WriteValue(section, key, ParseInt(value, fallback).ToString());
-
-    private void WriteList(string section, string key, string value)
+    private bool ReadBool(string section, string key, bool fallback)
     {
-        var values = value.Split([',', '\n', '\r'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-            .Select(item => $"\\\"{item.Replace("\\", "\\\\").Replace("\"", "\\\"")}\\\"");
-        WriteValue(section, key, $"[{string.Join(", ", values)}]");
+        var container = Section(section);
+        if (container.ValueKind != JsonValueKind.Object || !container.TryGetProperty(key, out var value))
+        {
+            return fallback;
+        }
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String => bool.TryParse(value.GetString(), out var parsed) && parsed,
+            _ => fallback,
+        };
     }
 
-    private void WriteDisabledImageRooms(string value)
+    private List<string> ReadListValues(string section, string key)
     {
-        var desired = value.Split([',', '\n', '\r'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-            .ToHashSet(StringComparer.Ordinal);
-        var knownRooms = WeChatGroups.Split([',', '\n', '\r'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-            .Concat(DiscordChannels.Split([',', '\n', '\r'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
-            .ToHashSet(StringComparer.Ordinal);
-        var existing = ReadSection("room_capabilities");
-        var lines = existing.Split(["\r\n", "\n"], StringSplitOptions.None)
-            .Where(line => !Regex.IsMatch(line, "^\\s*\\\"?[^\\\"=]+?\\\"?\\s*=\\s*\\{\\s*image_summary_enabled\\s*=\\s*false\\s*\\}\\s*(?:#.*)?$"))
+        var container = Section(section);
+        if (container.ValueKind != JsonValueKind.Object || !container.TryGetProperty(key, out var value))
+        {
+            return [];
+        }
+        return value.ValueKind switch
+        {
+            JsonValueKind.Array => value.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.String)
+                .Select(item => item.GetString() ?? string.Empty)
+                .ToList(),
+            JsonValueKind.String => [value.GetString() ?? string.Empty],
+            _ => [],
+        };
+    }
+
+    private string ReadList(string section, string key) =>
+        string.Join(", ", ReadListValues(section, key));
+
+    private List<string> ReadDisabledImageRooms()
+    {
+        var rooms = Section("room_capabilities");
+        if (rooms.ValueKind != JsonValueKind.Object)
+        {
+            return [];
+        }
+        return rooms.EnumerateObject()
+            .Where(room => room.Value.ValueKind == JsonValueKind.Object
+                && room.Value.TryGetProperty("image_summary_enabled", out var enabled)
+                && enabled.ValueKind == JsonValueKind.False)
+            .Select(room => room.Name)
             .ToList();
-        foreach (var room in desired)
+    }
+
+    private HashSet<string> KnownRooms()
+    {
+        var rooms = ReadListValues("wx4py", "groups")
+            .Concat(ReadListValues("discord", "channels"))
+            .ToHashSet(StringComparer.Ordinal);
+        return rooms;
+    }
+
+    private void AddOperation(
+        List<Dictionary<string, object?>> operations,
+        string[] section,
+        string key,
+        object? value) =>
+        operations.Add(new Dictionary<string, object?>
         {
-            if (!knownRooms.Contains(room)) continue;
-            lines.Add($"\\\"{room.Replace("\\", "\\\\").Replace("\"", "\\\"")}\\\" = {{ image_summary_enabled = false }}");
+            ["section"] = section,
+            ["key"] = key,
+            ["value"] = value,
+        });
+
+    /// Builds config.patch operations by diffing form fields against the loaded
+    /// configuration, so unrelated manual edits in the raw editor survive.
+    private List<Dictionary<string, object?>> BuildFormOperations()
+    {
+        var operations = new List<Dictionary<string, object?>>();
+
+        AddIfChanged(operations, "platform", "kind", PlatformKind);
+        AddListIfChanged(operations, "wx4py", "groups", WeChatGroups);
+        AddListIfChanged(operations, "discord", "channels", DiscordChannels);
+        AddIfChanged(operations, "wxdb", "executable", WxdbExecutable);
+        AddOptionalIfChanged(operations, "wxdb", "cache_dir", WxdbCacheDirectory);
+        AddNumberIfChanged(operations, "history", "max_messages", HistoryPageSize, 10000);
+
+        AddListIfChanged(operations, "listen", "triggers", TriggerCommands);
+        AddListIfChanged(operations, "listen", "whitelist_rooms", WhitelistRooms);
+        AddBoolIfChanged(operations, "listen", "ignore_self", IgnoreSelf);
+        AddNumberIfChanged(operations, "rate_limit", "successful_request_cooldown_seconds", RequestCooldownSeconds, 300);
+        AddNumberIfChanged(operations, "rate_limit", "successful_image_cooldown_seconds", ImageCooldownSeconds, 0);
+        AddBoolIfChanged(operations, "manual_summary", "image_by_default", ManualImagesByDefault);
+
+        AddBoolIfChanged(operations, "scheduled_summary", "enabled", ScheduleEnabled);
+        var scheduleParts = ScheduleTime.Split(':', StringSplitOptions.TrimEntries);
+        AddNumberIfChanged(operations, "scheduled_summary", "local_hour", scheduleParts.ElementAtOrDefault(0), 22);
+        AddNumberIfChanged(operations, "scheduled_summary", "local_minute", scheduleParts.ElementAtOrDefault(1), 0);
+        AddNumberIfChanged(operations, "scheduled_summary", "range_hours", ScheduleRangeHours, 24);
+        AddListIfChanged(operations, "scheduled_summary", "rooms", ScheduleRooms);
+        AddBoolIfChanged(operations, "scheduled_summary", "send_text", ScheduleSendText);
+        AddBoolIfChanged(operations, "scheduled_summary", "send_image", ScheduleSendImage);
+
+        AddIfChanged(operations, "llm", "api_key_env", LlmApiKeyEnvironment);
+        AddOptionalIfChanged(operations, "llm", "base_url", LlmBaseUrl);
+        AddOptionalIfChanged(operations, "llm", "model", LlmModel);
+        AddNumberIfChanged(operations, "llm", "timeout_seconds", LlmTimeoutSeconds, 120);
+        AddBoolIfChanged(operations, "llm", "stream", LlmStreamingEnabled);
+        AddNumberIfChanged(operations, "llm", "stream_first_event_timeout_seconds", LlmStreamFirstEventTimeoutSeconds, 30);
+        AddNumberIfChanged(operations, "llm", "stream_idle_timeout_seconds", LlmStreamIdleTimeoutSeconds, 30);
+        AddNumberIfChanged(operations, "llm", "max_output_tokens", LlmMaxOutputTokens, 2000);
+        AddNumberIfChanged(operations, "llm", "max_concurrent_chunk_requests", LlmChunkConcurrency, 4);
+        AddBoolIfChanged(operations, "image_gen", "enabled", ImageGenerationEnabled);
+        AddIfChanged(operations, "image_gen", "api_key_env", ImageApiKeyEnvironment);
+        AddOptionalIfChanged(operations, "image_gen", "base_url", ImageBaseUrl);
+        AddOptionalIfChanged(operations, "image_gen", "model", ImageModel);
+        AddNumberIfChanged(operations, "image_gen", "timeout_seconds", ImageTimeoutSeconds, 300);
+        AddBoolIfChanged(operations, "image_caption", "enabled", ImageCaptionEnabled);
+        AddBoolIfChanged(operations, "video_caption", "enabled", VideoCaptionEnabled);
+        AddBoolIfChanged(operations, "voice_transcription", "enabled", VoiceTranscriptionEnabled);
+
+        AddRoomCapabilityOperations(operations);
+        return operations;
+    }
+
+    private void AddRoomCapabilityOperations(List<Dictionary<string, object?>> operations)
+    {
+        var desired = DisabledImageRooms
+            .Split([',', '\n', '\r'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Where(room => KnownRooms().Contains(room))
+            .ToHashSet(StringComparer.Ordinal);
+        var existing = ReadDisabledImageRooms().ToHashSet(StringComparer.Ordinal);
+
+        foreach (var room in existing.Where(room => !desired.Contains(room)))
+        {
+            AddOperation(operations, ["room_capabilities"], room, null);
         }
-        ReplaceSection("room_capabilities", string.Join(Environment.NewLine, lines).TrimEnd() + Environment.NewLine);
-    }
-
-    private void WriteValue(string section, string key, string value)
-    {
-        var body = ReadSection(section);
-        var line = $"{key} = {value}";
-        var expression = new Regex($"(?m)^\\s*{Regex.Escape(key)}\\s*=.*$");
-        var updated = expression.IsMatch(body)
-            ? expression.Replace(body, line, 1)
-            : body.TrimEnd() + Environment.NewLine + line + Environment.NewLine;
-        ReplaceSection(section, updated);
-    }
-
-    private void ReplaceSection(string section, string body)
-    {
-        var expression = new Regex($"(?ms)^\\[{Regex.Escape(section)}\\]\\s*\\r?\\n.*?(?=^\\[|\\z)");
-        var replacement = $"[{section}]{Environment.NewLine}{body.TrimEnd()}{Environment.NewLine}{Environment.NewLine}";
-        if (expression.IsMatch(ConfigText))
+        foreach (var room in desired.Where(room => !existing.Contains(room)))
         {
-            ConfigText = expression.Replace(ConfigText, replacement, 1);
+            AddOperation(operations, ["room_capabilities"], room, new Dictionary<string, object?>
+            {
+                ["image_summary_enabled"] = false,
+            });
+        }
+    }
+
+    private void AddIfChanged(List<Dictionary<string, object?>> operations, string section, string key, string current)
+    {
+        var original = ReadString(section, key, string.Empty);
+        if (current != original)
+        {
+            AddOperation(operations, [section], key, current);
+        }
+    }
+
+    private void AddOptionalIfChanged(List<Dictionary<string, object?>> operations, string section, string key, string current)
+    {
+        var original = ReadString(section, key, string.Empty);
+        if (string.IsNullOrWhiteSpace(current))
+        {
+            if (!string.IsNullOrWhiteSpace(original))
+            {
+                // Cleared in the form: remove the key entirely.
+                AddOperation(operations, [section], key, null);
+            }
             return;
         }
-        ConfigText = ConfigText.TrimEnd() + Environment.NewLine + Environment.NewLine + replacement;
+        if (current != original)
+        {
+            AddOperation(operations, [section], key, current.Trim());
+        }
+    }
+
+    private void AddBoolIfChanged(List<Dictionary<string, object?>> operations, string section, string key, bool current)
+    {
+        if (current != ReadBool(section, key, current))
+        {
+            AddOperation(operations, [section], key, current);
+        }
+    }
+
+    private void AddNumberIfChanged(List<Dictionary<string, object?>> operations, string section, string key, string? current, int fallback)
+    {
+        var parsed = ParseInt(current, fallback);
+        if (parsed != ParseInt(ReadString(section, key, fallback.ToString()), fallback))
+        {
+            AddOperation(operations, [section], key, parsed);
+        }
+    }
+
+    private void AddListIfChanged(List<Dictionary<string, object?>> operations, string section, string key, string current)
+    {
+        var values = current.Split([',', '\n', '\r'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var original = ReadListValues(section, key);
+        var changed = values.Length != original.Count
+            || !values.Zip(original, (left, right) => string.Equals(left, right, StringComparison.Ordinal)).All(equal => equal);
+        if (changed)
+        {
+            AddOperation(operations, [section], key, values);
+        }
     }
 
     private static int ParseInt(string? value, int fallback) =>

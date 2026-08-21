@@ -32,6 +32,17 @@ use wechat_summary_core::AgentConfig;
 const PROTOCOL_VERSION: u32 = 1;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+/// How long to wait for the user to accept the UAC prompt before reporting a
+/// failed operation. Once the elevated process reports "running", there is no
+/// upper bound: long installs are legitimate.
+const ELEVATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(300);
+
+// Elevated operations must never execute scripts or binaries resolved from the
+// (user-writable) install directory. The runtime installer is compiled into this
+// binary so an attacker with write access to the install root cannot swap it for
+// a payload that would run as administrator.
+const EMBEDDED_RUNTIME_INSTALL_SCRIPT: &str =
+    include_str!("../../../../scripts/install-python-runtime.ps1");
 
 #[derive(Debug, Parser)]
 #[command(name = "wechat-summary-control")]
@@ -39,6 +50,9 @@ const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 struct Args {
     #[arg(long, default_value = r"\\.\pipe\SummaryAgent4GroupChat.Control.v1")]
     pipe: String,
+    /// Shared secret for authorizing control requests. Prefer passing it via
+    /// the SUMMARY_AGENT_CONTROL_TOKEN environment variable: command lines are
+    /// visible to every local process through Win32 process introspection.
     #[arg(long)]
     token: Option<String>,
     #[arg(long)]
@@ -192,8 +206,15 @@ async fn main() -> Result<()> {
 
     let token = args
         .token
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| anyhow!("--token is required for control service"))?;
+        .or_else(|| env::var("SUMMARY_AGENT_CONTROL_TOKEN").ok())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "--token or the SUMMARY_AGENT_CONTROL_TOKEN environment variable is required \
+                 for the control service"
+            )
+        })?;
     let (events, _) = broadcast::channel(512);
     let state = ControlState {
         paths,
@@ -344,7 +365,7 @@ async fn serve_connection(
         }
     };
     let mut pipe = reader.into_inner();
-    if request.version != PROTOCOL_VERSION || request.token != token {
+    if request.version != PROTOCOL_VERSION || !tokens_match(&request.token, &token) {
         write_response(
             &mut pipe,
             Response {
@@ -437,6 +458,7 @@ async fn dispatch(
         "config.read" => config_read(state),
         "config.validate" => config_validate(params),
         "config.write" => config_write(state, params),
+        "config.patch" => config_patch(state, params),
         "agent.start" => agent_start(state),
         "agent.stop" => agent_stop(state),
         "runtime.install" => start_elevated_operation(state, ElevatedOperation::RuntimeInstall),
@@ -497,8 +519,16 @@ fn config_read(state: &ControlState) -> Result<Value> {
     let validation = AgentConfig::from_toml_str(&raw)
         .map(|_| String::new())
         .unwrap_or_else(|error| error.to_string());
+    // Structured view derived from the REDACTED document so secrets never
+    // reach the UI; clients edit through config.patch, which applies values
+    // server-side without ever echoing secrets back.
+    let parsed = redact_toml_secrets(&raw)?
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|value| serde_json::to_value(value).ok())
+        .unwrap_or(Value::Null);
     Ok(
-        json!({ "toml": redact_toml_secrets(&raw)?, "validation": validation, "path": state.paths.config_path }),
+        json!({ "toml": redact_toml_secrets(&raw)?, "validation": validation, "path": state.paths.config_path, "parsed": parsed }),
     )
 }
 
@@ -533,6 +563,153 @@ fn required_toml(params: &Value) -> Result<&str> {
         .get("toml")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("params.toml must be a string"))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ConfigPatchOperation {
+    /// Table path, e.g. ["llm"] or ["room_capabilities"].
+    section: Vec<String>,
+    key: String,
+    /// JSON value to set; null removes the key.
+    value: Value,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ConfigPatchParams {
+    operations: Vec<ConfigPatchOperation>,
+}
+
+fn config_patch(state: &ControlState, params: &Value) -> Result<Value> {
+    let params: ConfigPatchParams =
+        serde_json::from_value(params.clone()).context("invalid config.patch parameters")?;
+    let raw = fs::read_to_string(&state.paths.config_path)?;
+    let patched = apply_config_patch(&raw, &params)?;
+    AgentConfig::from_toml_str(&patched).context("patched configuration failed validation")?;
+    atomic_write(&state.paths.config_path, patched.as_bytes())?;
+    emit(
+        state,
+        "config.reloaded",
+        json!({ "path": state.paths.config_path }),
+    );
+    emit(state, "status.changed", status_payload(state)?);
+    Ok(json!({ "patched": true, "operations": params.operations.len() }))
+}
+
+/// Format-preserving TOML edit driven by key-level operations. Pure so it can
+/// be unit tested without a ControlState.
+fn apply_config_patch(raw: &str, params: &ConfigPatchParams) -> Result<String> {
+    let mut document = raw
+        .parse::<toml_edit::DocumentMut>()
+        .context("parsing current config TOML")?;
+    for operation in &params.operations {
+        if operation.section.is_empty() {
+            bail!("patch operation section must not be empty");
+        }
+        if operation.key.trim().is_empty() {
+            bail!("patch operation key must not be empty");
+        }
+        let table = navigate_to_table(document.as_table_mut(), &operation.section)?;
+        if operation.value.is_null() {
+            table.remove(&operation.key);
+        } else if let Some(toml_edit::Item::Value(existing)) = table.get_mut(&operation.key) {
+            // Update in place so trailing comments and surrounding whitespace
+            // (the item's decor) survive the edit.
+            let prefix = existing
+                .decor()
+                .prefix()
+                .and_then(toml_edit::RawString::as_str)
+                .map(std::string::ToString::to_string);
+            let suffix = existing
+                .decor()
+                .suffix()
+                .and_then(toml_edit::RawString::as_str)
+                .map(std::string::ToString::to_string);
+            let mut replacement = json_to_toml_value(&operation.value)?;
+            if let Some(prefix) = prefix {
+                replacement.decor_mut().set_prefix(prefix);
+            }
+            if let Some(suffix) = suffix {
+                replacement.decor_mut().set_suffix(suffix);
+            }
+            *existing = replacement;
+        } else {
+            table.insert(&operation.key, json_to_toml_item(&operation.value)?);
+        }
+    }
+    Ok(document.to_string())
+}
+
+fn navigate_to_table<'a>(
+    root: &'a mut toml_edit::Table,
+    section: &[String],
+) -> Result<&'a mut toml_edit::Table> {
+    let mut cursor = root;
+    for part in section {
+        cursor = cursor
+            .entry(part)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("config [{}] conflicts with a non-table value", part))?;
+    }
+    Ok(cursor)
+}
+
+fn json_to_toml_item(value: &Value) -> Result<toml_edit::Item> {
+    Ok(toml_edit::Item::Value(json_to_toml_value(value)?))
+}
+
+fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value> {
+    let item = match value {
+        Value::String(text) => toml_edit::Value::from(text.clone()),
+        Value::Bool(flag) => toml_edit::Value::from(*flag),
+        Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                toml_edit::Value::from(integer)
+            } else {
+                toml_edit::Value::from(number.as_f64().context("unsupported number value")?)
+            }
+        }
+        Value::Array(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                match item {
+                    Value::String(text) => array.push(text.clone()),
+                    Value::Number(_) | Value::Bool(_) => {
+                        array.push(json_scalar_to_toml(item)?);
+                    }
+                    other => bail!("unsupported array element in patch value: {other}"),
+                }
+            }
+            toml_edit::Value::Array(array)
+        }
+        Value::Object(fields) => {
+            let mut inline = toml_edit::InlineTable::new();
+            for (name, field) in fields {
+                inline.insert(name, json_scalar_to_toml(field)?);
+            }
+            toml_edit::Value::InlineTable(inline)
+        }
+        other => bail!("unsupported patch value: {other}"),
+    };
+    Ok(item)
+}
+
+fn json_scalar_to_toml(value: &Value) -> Result<toml_edit::Value> {
+    match value {
+        Value::String(text) => Ok(toml_edit::Value::from(text.clone())),
+        Value::Bool(flag) => Ok(toml_edit::Value::from(*flag)),
+        Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                Ok(toml_edit::Value::from(integer))
+            } else {
+                number
+                    .as_f64()
+                    .map(toml_edit::Value::from)
+                    .context("unsupported number value")
+            }
+        }
+        other => bail!("unsupported scalar in patch value: {other}"),
+    }
 }
 
 fn preserve_redacted_secrets(
@@ -591,7 +768,15 @@ fn redact_value_secrets(value: &mut toml::Value, key: Option<&str>) {
 
 fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    key == "token" || key.contains("api_key") || key.contains("secret") || key.contains("password")
+    // Environment variable *names* (e.g. api_key_env) are not secrets.
+    if key.ends_with("_env") {
+        return false;
+    }
+    key == "token"
+        || key == "api_key"
+        || key == "api_keys"
+        || key.contains("secret")
+        || key.contains("password")
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -800,20 +985,12 @@ fn run_elevated(
     )?;
     let result = match operation {
         ElevatedOperation::RuntimeInstall => {
-            let script = if paths.working_dir.join("install.ps1").exists() {
-                paths.working_dir.join("install.ps1")
-            } else {
-                paths
-                    .working_dir
-                    .parent()
-                    .unwrap_or(&paths.working_dir)
-                    .join("scripts")
-                    .join("install-python-runtime.ps1")
-            };
+            let script =
+                materialize_embedded_script("runtime-install", EMBEDDED_RUNTIME_INSTALL_SCRIPT)?;
             run_logged(
                 Command::new("powershell.exe")
                     .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-                    .arg(script)
+                    .arg(&script)
                     .arg("-RootPath")
                     .arg(&paths.working_dir)
                     .arg("-ConfigPath")
@@ -911,20 +1088,11 @@ fn run_logged(command: &mut Command, log_path: &Path) -> Result<()> {
 }
 
 fn run_wxdb_update(paths: &AppPaths, log_path: &Path) -> Result<()> {
-    let script = if paths.working_dir.join("install.ps1").exists() {
-        paths.working_dir.join("install.ps1")
-    } else {
-        paths
-            .working_dir
-            .parent()
-            .unwrap_or(&paths.working_dir)
-            .join("scripts")
-            .join("install-python-runtime.ps1")
-    };
+    let script = materialize_embedded_script("wxdb-update", EMBEDDED_RUNTIME_INSTALL_SCRIPT)?;
     run_logged(
         Command::new("powershell.exe")
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(script)
+            .arg(&script)
             .arg("-RootPath")
             .arg(&paths.working_dir)
             .arg("-ConfigPath")
@@ -932,6 +1100,14 @@ fn run_wxdb_update(paths: &AppPaths, log_path: &Path) -> Result<()> {
             .arg("-ForceWxdbUpdate"),
         log_path,
     )
+}
+
+fn materialize_embedded_script(name: &str, contents: &str) -> Result<PathBuf> {
+    let directory = std::env::temp_dir().join("SummaryAgent4GroupChat-elevated");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{}-{name}.ps1", Uuid::new_v4()));
+    fs::write(&path, contents)?;
+    Ok(path)
 }
 
 fn run_pip_update(paths: &AppPaths, log_path: &Path, update_package: Option<&str>) -> Result<()> {
@@ -963,14 +1139,30 @@ fn run_application_update(paths: &AppPaths, id: &str, log_path: &Path) -> Result
         r#"param([Parameter(Mandatory = $true)][string]$Destination)
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$release = Invoke-RestMethod -Uri "https://api.github.com/repos/fangbm/SummaryAgent4GroupChat/releases/latest" -Headers @{ "User-Agent" = "SummaryAgent4GroupChat updater" }
+$headers = @{ "User-Agent" = "SummaryAgent4GroupChat updater" }
+$release = Invoke-RestMethod -Uri "https://api.github.com/repos/fangbm/SummaryAgent4GroupChat/releases/latest" -Headers $headers
 $asset = @($release.assets | Where-Object { $_.name -like "SummaryAgent4GroupChat-Inno-Setup-windows-x64-*.exe" } | Select-Object -First 1)
 if (-not $asset) { throw "最新 Release 未包含 Windows x64 Inno 安装包。" }
 New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 $installer = Join-Path $Destination $asset.name
 Write-Output "[update] 正在下载 $($asset.name)..."
-Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -Headers @{ "User-Agent" = "SummaryAgent4GroupChat updater" }
-Write-Output "[update] 下载完成，正在启动安装程序。"
+Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -Headers $headers
+$sumsAsset = @($release.assets | Where-Object { $_.name -eq "SHA256SUMS.txt" } | Select-Object -First 1)
+if (-not $sumsAsset) { throw "最新 Release 缺少 SHA256SUMS.txt，拒绝安装未校验的更新。" }
+$sumsPath = Join-Path $Destination "SHA256SUMS.txt"
+Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsPath -Headers $headers
+$expected = $null
+foreach ($line in Get-Content -LiteralPath $sumsPath) {
+    $parts = $line.Trim() -split '\s+', 2
+    if ($parts.Count -eq 2 -and $parts[1] -eq $asset.name) { $expected = $parts[0].ToLowerInvariant(); break }
+}
+if (-not $expected) { throw "SHA256SUMS.txt 中没有 $($asset.name) 的校验值，拒绝安装。" }
+$actual = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) {
+    Remove-Item -LiteralPath $installer -Force
+    throw "安装包 SHA256 校验失败（期望 $expected，实际 $actual），已删除下载文件。"
+}
+Write-Output "[update] SHA256 校验通过，正在启动安装程序。"
 Start-Process -FilePath $installer
 "#,
     )?;
@@ -1058,6 +1250,9 @@ fn spawn_operation_monitor(
         let started = Instant::now();
         let mut offset = 0;
         let mut previous_state = String::new();
+        // The monitor writes "pending" before spawning the elevated process, so
+        // an unknown state is treated as still waiting for elevation.
+        let mut last_known_state = String::from("pending");
         loop {
             if let Ok(mut file) = fs::OpenOptions::new().read(true).open(&log_path) {
                 if file.seek(SeekFrom::Start(offset)).is_ok() {
@@ -1088,6 +1283,7 @@ fn spawn_operation_monitor(
 
             if let Ok(text) = fs::read_to_string(&status_path) {
                 if let Ok(status) = serde_json::from_str::<OperationStatus>(&text) {
+                    last_known_state = status.state.clone();
                     if status.state != previous_state {
                         previous_state = status.state.clone();
                         emit(
@@ -1107,7 +1303,10 @@ fn spawn_operation_monitor(
                 }
             }
 
-            if started.elapsed() > Duration::from_secs(300) {
+            // Only give up while still waiting for the UAC prompt; a running
+            // elevated operation may legitimately take longer than the wait.
+            let waiting_for_elevation = matches!(last_known_state.as_str(), "pending" | "");
+            if waiting_for_elevation && started.elapsed() > ELEVATION_CONFIRM_TIMEOUT {
                 emit(
                     &state,
                     "operation.completed",
@@ -1652,6 +1851,23 @@ fn ps_quote(input: &str) -> String {
     input.replace('\'', "''")
 }
 
+/// Constant-time token comparison. The length check leaks only the length,
+/// which is fixed for the GUID-hex tokens this service generates.
+fn tokens_match(provided: &str, expected: &str) -> bool {
+    let provided = provided.as_bytes();
+    let expected = expected.as_bytes();
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |accumulator, (left, right)| {
+            accumulator | (left ^ right)
+        })
+        == 0
+}
+
 fn redact_secret_like_tokens(input: &str) -> String {
     let mut result = input.to_string();
     for marker in ["sk-", "Bearer "] {
@@ -1773,6 +1989,89 @@ mod tests {
         assert!(is_safe_pip_package_name("my-package_2.0"));
         assert!(!is_safe_pip_package_name("package; whoami"));
         assert!(!is_safe_pip_package_name("../package"));
+    }
+
+    #[test]
+    fn token_comparison_is_exact_and_length_safe() {
+        let token = "a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8";
+        assert!(tokens_match(token, token));
+        assert!(tokens_match("", ""));
+        assert!(!tokens_match("short", "shorter"));
+        assert!(!tokens_match("a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b9", token));
+        assert!(!tokens_match("", token));
+    }
+
+    #[test]
+    fn config_patch_sets_updates_and_removes_keys() {
+        let raw = "# header comment\n[llm]\nmodel = \"old\" # keep\nstream = true\n\n[listen]\ntriggers = [\"/总结\"]\n";
+
+        let params: ConfigPatchParams = serde_json::from_value(json!({
+            "operations": [
+                { "section": ["llm"], "key": "model", "value": "gpt-new" },
+                { "section": ["llm"], "key": "timeout_seconds", "value": 90 },
+                { "section": ["listen"], "key": "ignore_self", "value": false },
+                { "section": ["llm"], "key": "stream", "value": null }
+            ]
+        }))
+        .unwrap();
+        let patched = apply_config_patch(raw, &params).unwrap();
+
+        assert!(patched.contains("model = \"gpt-new\""));
+        assert!(patched.contains("timeout_seconds = 90"));
+        assert!(patched.contains("ignore_self = false"));
+        assert!(!patched.contains("stream"));
+        // Format preservation: comments and untouched keys survive.
+        assert!(patched.contains("# header comment"));
+        assert!(patched.contains("# keep"));
+        assert!(patched.contains("triggers = [\"/总结\"]"));
+    }
+
+    #[test]
+    fn config_patch_supports_inline_tables_and_room_capabilities() {
+        let raw = "[wx4py]\ngroups = [\"群A\"]\n\n[room_capabilities]\n\"旧群\" = { image_summary_enabled = false }\n";
+
+        let params: ConfigPatchParams = serde_json::from_value(json!({
+            "operations": [
+                { "section": ["room_capabilities"], "key": "旧群", "value": null },
+                { "section": ["room_capabilities"], "key": "新群", "value": { "image_summary_enabled": false } }
+            ]
+        }))
+        .unwrap();
+        let patched = apply_config_patch(raw, &params).unwrap();
+
+        assert!(!patched.contains("旧群"));
+        assert!(patched.contains("image_summary_enabled = false"));
+        let value: toml::Value = patched.parse().unwrap();
+        assert_eq!(
+            value["room_capabilities"]["新群"]["image_summary_enabled"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn config_patch_rejects_bad_operations() {
+        let raw = "[llm]\nmodel = \"x\"\n";
+        let params: ConfigPatchParams = serde_json::from_value(json!({
+            "operations": [ { "section": [], "key": "model", "value": "y" } ]
+        }))
+        .unwrap();
+        assert!(apply_config_patch(raw, &params).is_err());
+
+        let params: ConfigPatchParams = serde_json::from_value(json!({
+            "operations": [ { "section": ["llm"], "key": "", "value": "y" } ]
+        }))
+        .unwrap();
+        assert!(apply_config_patch(raw, &params).is_err());
+    }
+
+    #[test]
+    fn env_var_name_keys_are_not_redacted() {
+        assert!(!is_secret_key("api_key_env"));
+        assert!(!is_secret_key("token_env"));
+        assert!(is_secret_key("api_key"));
+        assert!(is_secret_key("api_keys"));
+        assert!(is_secret_key("token"));
+        assert!(is_secret_key("download_secret"));
     }
 
     #[cfg(windows)]
