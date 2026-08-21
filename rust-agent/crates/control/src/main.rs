@@ -49,12 +49,17 @@ struct Args {
     elevated: Option<ElevatedOperation>,
     #[arg(long)]
     operation_id: Option<String>,
+    #[arg(long)]
+    update_package: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ElevatedOperation {
     RuntimeInstall,
     WxdbInit,
+    WxdbUpdate,
+    PipUpdate,
+    ApplicationUpdate,
 }
 
 impl ElevatedOperation {
@@ -62,6 +67,9 @@ impl ElevatedOperation {
         match self {
             Self::RuntimeInstall => "runtime.install",
             Self::WxdbInit => "wxdb.init",
+            Self::WxdbUpdate => "wxdb.update",
+            Self::PipUpdate => "pip.update",
+            Self::ApplicationUpdate => "application.update",
         }
     }
 }
@@ -174,7 +182,12 @@ async fn main() -> Result<()> {
     let paths = resolve_paths(args.config.as_deref(), args.working_dir.as_deref())?;
 
     if let Some(operation) = args.elevated {
-        return run_elevated(operation, &paths, args.operation_id.as_deref());
+        return run_elevated(
+            operation,
+            &paths,
+            args.operation_id.as_deref(),
+            args.update_package.as_deref(),
+        );
     }
 
     let token = args
@@ -428,6 +441,7 @@ async fn dispatch(
         "agent.stop" => agent_stop(state),
         "runtime.install" => start_elevated_operation(state, ElevatedOperation::RuntimeInstall),
         "wxdb.init" => start_elevated_operation(state, ElevatedOperation::WxdbInit),
+        "update.install" => start_update_install(state, params),
         "runtime.check" => runtime_check(state).await,
         "path.open" => path_open(state, params),
         "logs.tail" => logs_tail(state),
@@ -663,6 +677,43 @@ fn agent_stop(state: &ControlState) -> Result<Value> {
 }
 
 fn start_elevated_operation(state: &ControlState, operation: ElevatedOperation) -> Result<Value> {
+    start_elevated_operation_with_package(state, operation, None)
+}
+
+fn start_update_install(state: &ControlState, params: &Value) -> Result<Value> {
+    let target = params
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match target {
+        "application" => {
+            start_elevated_operation_with_package(state, ElevatedOperation::ApplicationUpdate, None)
+        }
+        "wxdb" => start_elevated_operation_with_package(state, ElevatedOperation::WxdbUpdate, None),
+        "pip" => {
+            let package = params
+                .get("package")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("pip update requires a package name"))?
+                .trim();
+            if !is_safe_pip_package_name(package) {
+                bail!("invalid pip package name");
+            }
+            start_elevated_operation_with_package(
+                state,
+                ElevatedOperation::PipUpdate,
+                Some(package),
+            )
+        }
+        _ => bail!("unsupported update target"),
+    }
+}
+
+fn start_elevated_operation_with_package(
+    state: &ControlState,
+    operation: ElevatedOperation,
+    update_package: Option<&str>,
+) -> Result<Value> {
     let id = Uuid::new_v4().to_string();
     let (log_path, status_path) = operation_paths(&state.paths, &id)?;
     fs::File::create(&log_path)?;
@@ -683,13 +734,16 @@ fn start_elevated_operation(state: &ControlState, operation: ElevatedOperation) 
         status_path,
     );
     let executable = env::current_exe()?;
-    let arguments = format!(
+    let mut arguments = format!(
         "--elevated {} --config \"{}\" --working-dir \"{}\" --operation-id {}",
         operation.to_possible_value().expect("value").get_name(),
         state.paths.config_path.display(),
         state.paths.working_dir.display(),
         id
     );
+    if let Some(package) = update_package {
+        arguments.push_str(&format!(" --update-package {package}"));
+    }
     let mut command = Command::new("powershell.exe");
     command.args([
         "-NoProfile",
@@ -731,6 +785,7 @@ fn run_elevated(
     operation: ElevatedOperation,
     paths: &AppPaths,
     operation_id: Option<&str>,
+    update_package: Option<&str>,
 ) -> Result<()> {
     let id = operation_id.unwrap_or("manual");
     let (log_path, status_path) = operation_paths(paths, id)?;
@@ -776,6 +831,9 @@ fn run_elevated(
             command.arg("init").current_dir(&paths.working_dir);
             run_logged(&mut command, &log_path)
         }
+        ElevatedOperation::WxdbUpdate => run_wxdb_update(paths, &log_path),
+        ElevatedOperation::PipUpdate => run_pip_update(paths, &log_path, update_package),
+        ElevatedOperation::ApplicationUpdate => run_application_update(paths, id, &log_path),
     };
     match result {
         Ok(()) => {
@@ -850,6 +908,88 @@ fn run_logged(command: &mut Command, log_path: &Path) -> Result<()> {
         bail!("operation exited with {status}");
     }
     Ok(())
+}
+
+fn run_wxdb_update(paths: &AppPaths, log_path: &Path) -> Result<()> {
+    let script = if paths.working_dir.join("install.ps1").exists() {
+        paths.working_dir.join("install.ps1")
+    } else {
+        paths
+            .working_dir
+            .parent()
+            .unwrap_or(&paths.working_dir)
+            .join("scripts")
+            .join("install-python-runtime.ps1")
+    };
+    run_logged(
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(script)
+            .arg("-RootPath")
+            .arg(&paths.working_dir)
+            .arg("-ConfigPath")
+            .arg(&paths.config_path)
+            .arg("-ForceWxdbUpdate"),
+        log_path,
+    )
+}
+
+fn run_pip_update(paths: &AppPaths, log_path: &Path, update_package: Option<&str>) -> Result<()> {
+    let package = update_package
+        .filter(|package| is_safe_pip_package_name(package))
+        .ok_or_else(|| anyhow!("pip update requires a valid package name"))?;
+    let config = AgentConfig::from_path(&paths.config_path)?;
+    let python = configured_program(paths, &config.wx4py.python_executable);
+    let mut command = Command::new(python);
+    command
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--upgrade",
+            package,
+        ])
+        .current_dir(&paths.working_dir);
+    run_logged(&mut command, log_path)
+}
+
+fn run_application_update(paths: &AppPaths, id: &str, log_path: &Path) -> Result<()> {
+    let update_dir = paths.working_dir.join("runtime").join("updates");
+    fs::create_dir_all(&update_dir)?;
+    let script_path = update_dir.join(format!("{id}-application-update.ps1"));
+    fs::write(
+        &script_path,
+        r#"param([Parameter(Mandatory = $true)][string]$Destination)
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+$release = Invoke-RestMethod -Uri "https://api.github.com/repos/fangbm/SummaryAgent4GroupChat/releases/latest" -Headers @{ "User-Agent" = "SummaryAgent4GroupChat updater" }
+$asset = @($release.assets | Where-Object { $_.name -like "SummaryAgent4GroupChat-Inno-Setup-windows-x64-*.exe" } | Select-Object -First 1)
+if (-not $asset) { throw "最新 Release 未包含 Windows x64 Inno 安装包。" }
+New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+$installer = Join-Path $Destination $asset.name
+Write-Output "[update] 正在下载 $($asset.name)..."
+Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -Headers @{ "User-Agent" = "SummaryAgent4GroupChat updater" }
+Write-Output "[update] 下载完成，正在启动安装程序。"
+Start-Process -FilePath $installer
+"#,
+    )?;
+    run_logged(
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(script_path)
+            .arg("-Destination")
+            .arg(update_dir),
+        log_path,
+    )
+}
+
+fn is_safe_pip_package_name(package: &str) -> bool {
+    !package.is_empty()
+        && package.len() <= 128
+        && package.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
 }
 
 fn spawn_operation_output_reader<R>(
@@ -1625,6 +1765,14 @@ mod tests {
             version_from_text("Python 3.12.2").as_deref(),
             Some("3.12.2")
         );
+    }
+
+    #[test]
+    fn pip_update_package_names_are_strictly_validated() {
+        assert!(is_safe_pip_package_name("beautifulsoup4"));
+        assert!(is_safe_pip_package_name("my-package_2.0"));
+        assert!(!is_safe_pip_package_name("package; whoami"));
+        assert!(!is_safe_pip_package_name("../package"));
     }
 
     #[cfg(windows)]

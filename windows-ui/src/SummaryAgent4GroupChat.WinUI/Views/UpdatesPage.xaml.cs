@@ -1,5 +1,6 @@
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Navigation;
+using SummaryAgent4GroupChat.WinUI.Models;
 using SummaryAgent4GroupChat.WinUI.ViewModels;
 
 namespace SummaryAgent4GroupChat.WinUI.Views;
@@ -35,5 +36,13 @@ public sealed partial class UpdatesPage : Page
     private async void OpenOutput_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
     {
         if (ViewModel is not null) await ViewModel.OpenPathAsync("output");
+    }
+
+    private async void InstallUpdate_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+    {
+        if (ViewModel is not null && sender is Button { DataContext: UpdateCheckItem item })
+        {
+            await ViewModel.InstallUpdateAsync(item);
+        }
     }
 }

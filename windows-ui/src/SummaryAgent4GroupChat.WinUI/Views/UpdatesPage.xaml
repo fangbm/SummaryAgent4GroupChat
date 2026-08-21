@@ -6,7 +6,7 @@
         <StackPanel Spacing="18">
             <StackPanel Spacing="4">
                 <TextBlock Text="更新与依赖" Style="{ThemeResource TitleTextBlockStyle}" />
-                <TextBlock Text="启动后会静默检查应用本体、独立 wxdb 和当前 Python 虚拟环境中的全部 pip 依赖。检查不会自动安装或修改任何组件。" Opacity="0.72" TextWrapping="Wrap" />
+                <TextBlock Text="启动后会静默检查应用本体、独立 wxdb 和当前 Python 虚拟环境中的全部 pip 依赖。点击可更新项的“更新”按钮后才会下载或修改组件。" Opacity="0.72" TextWrapping="Wrap" />
             </StackPanel>
 
             <Border Style="{StaticResource StatusCard}">
@@ -30,7 +30,7 @@
                         <ProgressRing Width="20" Height="20" IsActive="{Binding IsCheckingUpdates}" />
                         <TextBlock Text="{Binding UpdateCheckStatus}" VerticalAlignment="Center" TextWrapping="Wrap" />
                     </StackPanel>
-                    <TextBlock Text="系统自行安装的软件只会报告检测结果，不会被此页面自动升级。" Opacity="0.72" TextWrapping="Wrap" />
+                    <TextBlock Text="更新需要逐项确认：wxdb 与 pip 更新会在后台执行，主程序更新会下载并启动新版 Inno 安装器。" Opacity="0.72" TextWrapping="Wrap" />
                 </StackPanel>
             </Border>
 
@@ -44,7 +44,10 @@
                                 <TextBlock Text="{Binding Name}" Style="{ThemeResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
                                 <StackPanel Grid.Column="1" Spacing="2"><TextBlock Text="当前版本" Opacity="0.58" /><TextBlock Text="{Binding CurrentVersion}" TextWrapping="Wrap" /></StackPanel>
                                 <StackPanel Grid.Column="2" Spacing="2"><TextBlock Text="最新版本" Opacity="0.58" /><TextBlock Text="{Binding LatestVersion}" TextWrapping="Wrap" /></StackPanel>
-                                <TextBlock Grid.Column="3" Text="{Binding Status}" Foreground="{ThemeResource SystemControlHighlightAccentBrush}" />
+                                <StackPanel Grid.Column="3" Spacing="6">
+                                    <TextBlock Text="{Binding Status}" Foreground="{ThemeResource SystemControlHighlightAccentBrush}" />
+                                    <Button Content="更新" Click="InstallUpdate_Click" IsEnabled="{Binding CanInstall}" />
+                                </StackPanel>
                                 <TextBlock Grid.Row="1" Grid.ColumnSpan="4" Text="{Binding Detail}" Opacity="0.72" TextWrapping="Wrap" />
                             </Grid>
                         </Border>

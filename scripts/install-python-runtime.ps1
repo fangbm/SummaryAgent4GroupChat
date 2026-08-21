@@ -3,6 +3,7 @@
     [string]$ConfigPath,
     [string]$ExistingWxdbExecutable = "",
     [string]$WxdbDownloadUrl = "",
+    [switch]$ForceWxdbUpdate,
     [switch]$SkipWxdbInit
 )
 
@@ -148,22 +149,23 @@ function Get-WxdbExecutable {
     param(
         [string]$InstallRoot,
         [string]$ExistingExecutable,
-        [string]$DownloadUrl
+        [string]$DownloadUrl,
+        [switch]$ForceUpdate
     )
 
-    if (-not [string]::IsNullOrWhiteSpace($ExistingExecutable) -and (Test-Path -LiteralPath $ExistingExecutable)) {
+    if (-not $ForceUpdate -and -not [string]::IsNullOrWhiteSpace($ExistingExecutable) -and (Test-Path -LiteralPath $ExistingExecutable)) {
         $existingPath = (Resolve-Path -LiteralPath $ExistingExecutable).Path
         Write-Step "已检测到配置的 wxdb：$existingPath"
         return $existingPath
     }
 
     $target = Join-Path $InstallRoot "tools\wxdb\wxdb.exe"
-    if (Test-Path -LiteralPath $target) {
+    if (-not $ForceUpdate -and (Test-Path -LiteralPath $target)) {
         Write-Step "已检测到 wxdb：$target"
         return $target
     }
 
-    $existing = Get-Command wxdb.exe -ErrorAction SilentlyContinue
+    $existing = if ($ForceUpdate) { $null } else { Get-Command wxdb.exe -ErrorAction SilentlyContinue }
     if ($existing) {
         Write-Step "检测到 PATH 中的 wxdb：$($existing.Source)"
         return $existing.Source
@@ -253,7 +255,8 @@ if ($LASTEXITCODE -ne 0) { throw "安装 wx4py 失败，退出码 $LASTEXITCODE"
 $wxdb = Get-WxdbExecutable `
     -InstallRoot $RootPath `
     -ExistingExecutable $ExistingWxdbExecutable `
-    -DownloadUrl $WxdbDownloadUrl
+    -DownloadUrl $WxdbDownloadUrl `
+    -ForceUpdate:$ForceWxdbUpdate
 $cacheDir = Join-Path $ConfigBasePath "runtime\wxdb-cache"
 $configPythonPath = Get-RelativeConfigPath -FromDirectory $ConfigBasePath -ToPath $venvPython
 $configSidecarPath = Get-RelativeConfigPath -FromDirectory $ConfigBasePath -ToPath (Join-Path $RootPath "scripts\wx4py_sidecar.py")

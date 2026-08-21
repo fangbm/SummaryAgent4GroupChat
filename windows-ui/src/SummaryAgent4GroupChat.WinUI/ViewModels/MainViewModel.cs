@@ -173,6 +173,14 @@ public sealed partial class MainViewModel : ObservableObject
     public async Task StopAgentAsync() => await AgentCommandAsync("agent.stop", "主程序已停止");
     public async Task InstallRuntimeAsync() => await StartMaintenanceOperationAsync("runtime.install", "安装微信运行环境");
     public async Task RunWxdbInitAsync() => await StartMaintenanceOperationAsync("wxdb.init", "运行 wxdb init");
+    public async Task InstallUpdateAsync(UpdateCheckItem item)
+    {
+        if (!item.CanInstall || string.IsNullOrWhiteSpace(item.Target)) return;
+        object parameters = item.Target == "pip"
+            ? new { target = item.Target, package = item.PackageName }
+            : new { target = item.Target };
+        await StartMaintenanceOperationAsync("update.install", $"更新 {item.Name}", parameters);
+    }
     public async Task OpenPathAsync(string kind) => await AgentCommandAsync("path.open", "已打开路径", new { kind });
 
     public async Task<bool> CheckRuntimeDependenciesAsync()
@@ -211,13 +219,26 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 var status = ReadUpdateValue(entry, "status", "unknown");
                 var updateAvailable = entry.TryGetProperty("update_available", out var available) && available.ValueKind == JsonValueKind.True;
+                var name = ReadUpdateValue(entry, "name", "未知组件");
+                var target = name switch
+                {
+                    "SummaryAgent4GroupChat" => "application",
+                    "wxdb" => "wxdb",
+                    _ when name.StartsWith("Python: ", StringComparison.Ordinal) => "pip",
+                    _ => string.Empty,
+                };
+                var packageName = target == "pip" ? name["Python: ".Length..] : null;
+                var canInstall = updateAvailable || target == "wxdb";
                 UpdateItems.Add(new UpdateCheckItem(
-                    ReadUpdateValue(entry, "name", "未知组件"),
+                    name,
                     ReadUpdateValue(entry, "current_version", "未检测"),
                     ReadUpdateValue(entry, "latest_version", "无"),
                     UpdateStatusText(status),
                     ReadUpdateValue(entry, "detail", string.Empty),
-                    updateAvailable));
+                    updateAvailable,
+                    canInstall,
+                    target,
+                    packageName));
             }
             var updateCount = result.GetProperty("update_count").GetInt32();
             UpdateCheckStatus = updateCount > 0
@@ -355,7 +376,7 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    private async Task StartMaintenanceOperationAsync(string method, string title)
+    private async Task StartMaintenanceOperationAsync(string method, string title, object? parameters = null)
     {
         if (_client is null) return;
         if (IsMaintenanceOperationRunning)
@@ -370,7 +391,7 @@ public sealed partial class MainViewModel : ObservableObject
         MaintenanceDialogRequested?.Invoke(title);
         try
         {
-            var reply = await _client.CallAsync(method, cancellationToken: _lifetime.Token);
+            var reply = await _client.CallAsync(method, parameters, _lifetime.Token);
             reply.ThrowIfError();
             Notice = $"{title}已在后台启动";
         }
@@ -509,6 +530,9 @@ public sealed partial class MainViewModel : ObservableObject
     {
         "runtime.install" => "安装微信运行环境",
         "wxdb.init" => "运行 wxdb init",
+        "wxdb.update" => "更新 wxdb",
+        "pip.update" => "更新 Python 依赖",
+        "application.update" => "更新 SummaryAgent4GroupChat",
         _ => operation,
     };
 

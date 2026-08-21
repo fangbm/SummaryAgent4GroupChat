@@ -97,7 +97,7 @@ winget install --id JRSoftware.InnoSetup -e --scope user --accept-package-agreem
 
 ### 更新检查
 
-GUI 启动后会后台检查一次；也可在左侧“更新与依赖”页手动检查。检查范围包括应用 Release、独立 wxdb Release 与当前 `.venv` 中所有可升级的 pip 依赖。检查只读取版本信息，不会自动下载安装或修改你的 Python、wxdb、ffmpeg 等环境。
+GUI 启动后会后台检查一次；也可在左侧“更新与依赖”页手动检查。检查范围包括应用 Release、独立 wxdb Release 与当前 `.venv` 中所有可升级的 pip 依赖。检查本身只读取版本信息；每个可更新项都有单独的“更新”按钮。wxdb 会从独立 Release 下载替换，pip 会在当前虚拟环境升级对应包，主程序会下载并启动新版 Inno 安装器。
 
 微信模式首次启动还会检测 Python、`wx4py` 与外部 wxdb 是否可用；缺少时会显示原生确认弹窗，可直接启动“安装微信运行环境”。“运行 wxdb init”和输出目录等维护操作也位于“更新与依赖”页；维护任务在后台执行，进度和错误会显示在操作弹窗中。
 

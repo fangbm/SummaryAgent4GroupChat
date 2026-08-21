@@ -25,4 +25,7 @@ public sealed record UpdateCheckItem(
     string LatestVersion,
     string Status,
     string Detail,
-    bool UpdateAvailable);
+    bool UpdateAvailable,
+    bool CanInstall,
+    string Target,
+    string? PackageName);
