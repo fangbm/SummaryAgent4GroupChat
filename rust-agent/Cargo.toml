@@ -14,7 +14,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 publish = false
-version = "0.1.4"
+version = "0.2.0"
 # usize::is_multiple_of and other std APIs used by the workspace require 1.87.
 rust-version = "1.87"
 
