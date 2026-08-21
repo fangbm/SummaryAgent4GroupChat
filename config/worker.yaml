@@ -1,5 +1,6 @@
 server:
-  host: "0.0.0.0"
+  # Loopback by default; only widen after setting strong IPC credentials.
+  host: "127.0.0.1"
   port: 8765
   websocket_path: "/ws"
   metrics_enabled: true
@@ -32,8 +33,9 @@ wechat:
   receiver_map: {}
 
 security:
-  ipc_token: "${WECHAT_PIPELINE_IPC_TOKEN:-change-me}"
-  download_secret: "${WECHAT_PIPELINE_DOWNLOAD_SECRET:-change-me-download}"
+  # No insecure fallback: startup fails unless the env vars provide strong values.
+  ipc_token: "${WECHAT_PIPELINE_IPC_TOKEN:-}"
+  download_secret: "${WECHAT_PIPELINE_DOWNLOAD_SECRET:-}"
   download_url_ttl_seconds: 900
 
 storage:

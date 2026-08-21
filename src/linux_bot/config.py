@@ -3,9 +3,9 @@ from __future__ import annotations
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
-from pipeline_core.config import load_settings
+from pipeline_core.config import load_settings, validate_secret
 
 
 class MatchMode(StrEnum):
@@ -60,6 +60,11 @@ class WindowsBridgeSettings(BaseModel):
     token: str
     reconnect_seconds: int = 5
     file_transfer: FileTransferSettings = Field(default_factory=FileTransferSettings)
+
+    @field_validator("token")
+    @classmethod
+    def _reject_insecure_defaults(cls, value: str, info: ValidationInfo) -> str:
+        return validate_secret(value, field=info.field_name or "windows_bridge.token")
 
     @property
     def websocket_url(self) -> str:

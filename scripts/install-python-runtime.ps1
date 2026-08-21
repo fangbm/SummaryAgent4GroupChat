@@ -3,6 +3,7 @@
     [string]$ConfigPath,
     [string]$ExistingWxdbExecutable = "",
     [string]$WxdbDownloadUrl = "",
+    [string]$WxdbExpectedSha256 = "",
     [switch]$ForceWxdbUpdate,
     [switch]$SkipWxdbInit
 )
@@ -145,11 +146,43 @@ function Get-LatestWxdbDownloadUrl {
     return $FallbackWxdbDownloadUrl
 }
 
+function Get-ExpectedWxdbSha256 {
+    param(
+        [string]$DownloadUrl,
+        [string]$ExpectedSha256,
+        [string]$DownloadDir
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        return $ExpectedSha256.Trim().ToLowerInvariant()
+    }
+
+    # Optional sidecar published next to the asset: <url>.sha256 containing
+    # either the bare digest or "<digest>  <filename>".
+    $sidecarPath = Join-Path $DownloadDir "wxdb.zip.sha256"
+    try {
+        Invoke-WebRequest `
+            -Uri "$DownloadUrl.sha256" `
+            -OutFile $sidecarPath `
+            -Headers @{ "User-Agent" = "SummaryAgent4GroupChat runtime installer" } `
+            -UseBasicParsing
+        $text = (Get-Content -LiteralPath $sidecarPath -Raw).Trim()
+        if ($text -match '\b[0-9a-fA-F]{64}\b') {
+            return $Matches[0].ToLowerInvariant()
+        }
+    }
+    catch {
+        # Sidecar may not exist yet; caller falls back to a warning.
+    }
+    return $null
+}
+
 function Get-WxdbExecutable {
     param(
         [string]$InstallRoot,
         [string]$ExistingExecutable,
         [string]$DownloadUrl,
+        [string]$ExpectedSha256 = "",
         [switch]$ForceUpdate
     )
 
@@ -187,6 +220,20 @@ function Get-WxdbExecutable {
             -OutFile $archive `
             -Headers @{ "User-Agent" = "SummaryAgent4GroupChat runtime installer" } `
             -UseBasicParsing
+        $expectedHash = Get-ExpectedWxdbSha256 `
+            -DownloadUrl $DownloadUrl `
+            -ExpectedSha256 $ExpectedSha256 `
+            -DownloadDir $downloadDir
+        if ($expectedHash) {
+            $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
+                throw "wxdb 压缩包 SHA256 校验失败（期望 $expectedHash，实际 $actualHash），已中止安装。"
+            }
+            Write-Step "wxdb 压缩包 SHA256 校验通过。"
+        }
+        else {
+            Write-Warning "wxdb Release 未提供 SHA256 校验值，本次下载跳过完整性校验。建议在 wxdb Release 中附带 .sha256 文件。"
+        }
         Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
         $downloaded = Get-ChildItem -LiteralPath $extractDir -Filter "wxdb.exe" -Recurse | Select-Object -First 1
         if (-not $downloaded) {
@@ -256,6 +303,7 @@ $wxdb = Get-WxdbExecutable `
     -InstallRoot $RootPath `
     -ExistingExecutable $ExistingWxdbExecutable `
     -DownloadUrl $WxdbDownloadUrl `
+    -ExpectedSha256 $WxdbExpectedSha256 `
     -ForceUpdate:$ForceWxdbUpdate
 $cacheDir = Join-Path $ConfigBasePath "runtime\wxdb-cache"
 $configPythonPath = Get-RelativeConfigPath -FromDirectory $ConfigBasePath -ToPath $venvPython

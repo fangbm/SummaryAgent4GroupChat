@@ -90,6 +90,23 @@ jobs:
           "installer=$($installer.FullName)" >> $env:GITHUB_OUTPUT
           "archive=$($archive.FullName)" >> $env:GITHUB_OUTPUT
 
+      - name: Generate SHA256 checksums
+        if: steps.version.outputs.changed == 'true'
+        id: checksums
+        shell: pwsh
+        env:
+          INSTALLER: ${{ steps.assets.outputs.installer }}
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
+        run: |
+          $lines = @($env:INSTALLER, $env:ARCHIVE) | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash $(Split-Path -Leaf $_)"
+          }
+          $sums = Join-Path (Split-Path -Parent $env:INSTALLER) 'SHA256SUMS.txt'
+          Set-Content -LiteralPath $sums -Value $lines -Encoding ascii
+          "checksums=$sums" >> $env:GITHUB_OUTPUT
+          Get-Content -LiteralPath $sums
+
       - name: Create GitHub release
         if: steps.version.outputs.changed == 'true'
         shell: pwsh
@@ -99,9 +116,13 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
           INSTALLER: ${{ steps.assets.outputs.installer }}
           ARCHIVE: ${{ steps.assets.outputs.archive }}
+          CHECKSUMS: ${{ steps.checksums.outputs.checksums }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHECKSUMS)) {
+            throw 'SHA256SUMS.txt was not generated.'
+          }
           $header = "Automated release for workspace version $env:RELEASE_VERSION."
-          gh release create $env:RELEASE_TAG $env:INSTALLER $env:ARCHIVE `
+          gh release create $env:RELEASE_TAG $env:INSTALLER $env:ARCHIVE $env:CHECKSUMS `
             --title "SummaryAgent4GroupChat $env:RELEASE_TAG" `
             --notes $header `
             --generate-notes

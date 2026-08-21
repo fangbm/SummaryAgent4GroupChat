@@ -21,7 +21,7 @@ windows_bridge:
   port: 8765
   protocol: "websocket"
   path: "/ws"
-  token: "${WECHAT_PIPELINE_IPC_TOKEN:-change-me}"
+  token: "${WECHAT_PIPELINE_IPC_TOKEN:-}"
   reconnect_seconds: 5
   file_transfer:
     download_dir: "./runtime/linux-images"

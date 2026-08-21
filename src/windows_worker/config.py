@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
-from pipeline_core.config import load_settings
+from pipeline_core.config import load_settings, validate_secret
 
 
 class ServerSettings(BaseModel):
@@ -46,6 +46,11 @@ class SecuritySettings(BaseModel):
     ipc_token: str
     download_secret: str
     download_url_ttl_seconds: int = 900
+
+    @field_validator("ipc_token", "download_secret")
+    @classmethod
+    def _reject_insecure_defaults(cls, value: str, info: ValidationInfo) -> str:
+        return validate_secret(value, field=info.field_name or "security secret")
 
 
 class StorageSettings(BaseModel):
