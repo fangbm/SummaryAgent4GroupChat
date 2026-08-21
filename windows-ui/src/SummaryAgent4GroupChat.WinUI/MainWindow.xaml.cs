@@ -75,7 +75,6 @@ public sealed partial class MainWindow : Window
             CloseButtonText = "暂不安装",
             DefaultButton = ContentDialogButton.Primary,
         };
-        EnableExplicitClose(dialog);
         if (await dialog.ShowAsync() == ContentDialogResult.Primary)
         {
             await ViewModel.InstallRuntimeAsync();
@@ -126,7 +125,6 @@ public sealed partial class MainWindow : Window
             CloseButtonText = "关闭",
             DefaultButton = ContentDialogButton.Close,
         };
-        EnableExplicitClose(dialog);
         var closed = false;
 
         void RefreshOperationDialog()
@@ -156,14 +154,5 @@ public sealed partial class MainWindow : Window
         {
             ViewModel.PropertyChanged -= propertyChanged;
         }
-    }
-
-    private void EnableExplicitClose(ContentDialog dialog)
-    {
-        dialog.CloseButtonClick += (_, args) =>
-        {
-            args.Cancel = true;
-            DispatcherQueue.TryEnqueue(dialog.Hide);
-        };
     }
 }
