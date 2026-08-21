@@ -11,17 +11,6 @@
 
             <Border Style="{StaticResource StatusCard}">
                 <StackPanel Spacing="12">
-                    <StackPanel Orientation="Horizontal" Spacing="12">
-                        <Button Content="检查更新" Click="CheckUpdates_Click" Style="{StaticResource AccentButtonStyle}" />
-                        <ProgressRing Width="20" Height="20" IsActive="{Binding IsCheckingUpdates}" />
-                        <TextBlock Text="{Binding UpdateCheckStatus}" VerticalAlignment="Center" TextWrapping="Wrap" />
-                    </StackPanel>
-                    <TextBlock Text="系统自行安装的软件只会报告检测结果，不会被此页面自动升级。" Opacity="0.72" TextWrapping="Wrap" />
-                </StackPanel>
-            </Border>
-
-            <Border Style="{StaticResource StatusCard}">
-                <StackPanel Spacing="12">
                     <TextBlock Text="运行依赖" Style="{ThemeResource SubtitleTextBlockStyle}" />
                     <TextBlock Text="{Binding DependencyStatus}" TextWrapping="Wrap" />
                     <StackPanel Orientation="Horizontal" Spacing="10">
@@ -31,6 +20,17 @@
                         <Button Content="重新检测" Click="CheckDependencies_Click" />
                     </StackPanel>
                     <TextBlock Text="点击后会打开进度弹窗并在后台执行；安装运行环境和 wxdb init 会单独申请管理员权限，日常 GUI 与主程序保持普通权限。" Opacity="0.72" TextWrapping="Wrap" />
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource StatusCard}">
+                <StackPanel Spacing="12">
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <Button Content="检查更新" Click="CheckUpdates_Click" Style="{StaticResource AccentButtonStyle}" />
+                        <ProgressRing Width="20" Height="20" IsActive="{Binding IsCheckingUpdates}" />
+                        <TextBlock Text="{Binding UpdateCheckStatus}" VerticalAlignment="Center" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <TextBlock Text="系统自行安装的软件只会报告检测结果，不会被此页面自动升级。" Opacity="0.72" TextWrapping="Wrap" />
                 </StackPanel>
             </Border>
 
