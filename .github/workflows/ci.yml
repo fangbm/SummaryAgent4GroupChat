@@ -56,12 +56,18 @@ jobs:
           if (-not $installer -or $installer.Length -lt 1MB) {
             throw 'Inno installer was not produced or is unexpectedly small.'
           }
-          & $installer.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS
+          # /CURRENTUSER skips elevation: the runner shell is non-elevated and
+          # a silent admin install would exit immediately without installing.
+          $installLog = Join-Path $env:TEMP 'summary-agent-smoke-install.log'
+          & $installer.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS `
+            /CURRENTUSER /LOG="$installLog"
           if ($LASTEXITCODE -ne 0) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
             throw "Silent installer smoke test failed with exit code $LASTEXITCODE."
           }
           $installedExe = Join-Path $env:LOCALAPPDATA 'SummaryAgent4GroupChat\SummaryAgent4GroupChat.exe'
           if (-not (Test-Path -LiteralPath $installedExe)) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
             throw "Installer did not place the WinUI executable at $installedExe."
           }
           Write-Host "Installer smoke check passed: $($installer.FullName)"
