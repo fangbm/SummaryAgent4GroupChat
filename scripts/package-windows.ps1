@@ -9,9 +9,18 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $RustRoot = Join-Path $RepoRoot "rust-agent"
 $WinUiProject = Join-Path $RepoRoot "windows-ui\src\SummaryAgent4GroupChat.WinUI\SummaryAgent4GroupChat.WinUI.csproj"
 $WinUiPublishDir = Join-Path $RepoRoot ".artifacts\winui-publish"
+$BuildCacheDir = Join-Path $RepoRoot ".artifacts\build-cache"
 if ([string]::IsNullOrWhiteSpace($OutDir)) {
     $OutDir = Join-Path $RepoRoot "dist"
 }
+
+# Self-contained .NET publish can download several hundred MB of runtime packs.
+# Keep transient restore data beside the project rather than filling the system drive.
+New-Item -ItemType Directory -Force -Path $BuildCacheDir | Out-Null
+$env:NUGET_PACKAGES = Join-Path $BuildCacheDir "nuget-packages"
+$env:TEMP = Join-Path $BuildCacheDir "temp"
+$env:TMP = $env:TEMP
+New-Item -ItemType Directory -Force -Path $env:NUGET_PACKAGES, $env:TEMP | Out-Null
 
 if (-not $SkipBuild) {
     Push-Location $RustRoot
