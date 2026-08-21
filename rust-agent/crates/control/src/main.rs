@@ -5,12 +5,12 @@
 
 use std::{
     env, fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -108,6 +108,15 @@ struct Event {
     version: u32,
     event: String,
     data: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OperationStatus {
+    operation: String,
+    state: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    success: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,7 +351,7 @@ async fn serve_connection(
     }
     let is_subscription = matches!(
         request.method.as_str(),
-        "output.subscribe" | "logs.subscribe" | "status.subscribe"
+        "output.subscribe" | "logs.subscribe" | "status.subscribe" | "operation.subscribe"
     );
     let response = match dispatch(&state, &request.method, &request.params).await {
         Ok(result) => Response {
@@ -367,9 +376,10 @@ async fn serve_connection(
     loop {
         match receiver.recv().await {
             Ok(event)
-                if topic == "output" && event.event == "output"
-                    || topic == "logs" && event.event == "log"
-                    || topic == "status" && event.event == "status.changed" =>
+                if (topic == "output" && event.event == "output")
+                    || (topic == "logs" && event.event == "log")
+                    || (topic == "status" && event.event == "status.changed")
+                    || (topic == "operation" && event.event.starts_with("operation.")) =>
             {
                 write_event(&mut pipe, event).await?;
             }
@@ -422,7 +432,7 @@ async fn dispatch(
         "path.open" => path_open(state, params),
         "logs.tail" => logs_tail(state),
         "update.check" => update_check(state).await,
-        "output.subscribe" | "logs.subscribe" | "status.subscribe" => {
+        "output.subscribe" | "logs.subscribe" | "status.subscribe" | "operation.subscribe" => {
             Ok(json!({ "subscribed": true }))
         }
         _ => {
@@ -654,6 +664,24 @@ fn agent_stop(state: &ControlState) -> Result<Value> {
 
 fn start_elevated_operation(state: &ControlState, operation: ElevatedOperation) -> Result<Value> {
     let id = Uuid::new_v4().to_string();
+    let (log_path, status_path) = operation_paths(&state.paths, &id)?;
+    fs::File::create(&log_path)?;
+    write_operation_status(
+        &status_path,
+        OperationStatus {
+            operation: operation.name().into(),
+            state: "pending".into(),
+            message: "已请求管理员权限，等待确认。".into(),
+            success: None,
+        },
+    )?;
+    spawn_operation_monitor(
+        state.clone(),
+        id.clone(),
+        operation.name().into(),
+        log_path,
+        status_path,
+    );
     let executable = env::current_exe()?;
     let arguments = format!(
         "--elevated {} --config \"{}\" --working-dir \"{}\" --operation-id {}",
@@ -674,13 +702,27 @@ fn start_elevated_operation(state: &ControlState, operation: ElevatedOperation) 
         ),
     ]);
     hide_window(&mut command);
-    command
+    if let Err(error) = command
         .spawn()
-        .context("requesting elevation for approved operation")?;
+        .context("requesting elevation for approved operation")
+    {
+        let (_, status_path) = operation_paths(&state.paths, &id)?;
+        let message = redact_secret_like_tokens(&error.to_string());
+        let _ = write_operation_status(
+            &status_path,
+            OperationStatus {
+                operation: operation.name().into(),
+                state: "failed".into(),
+                message: message.clone(),
+                success: Some(false),
+            },
+        );
+        return Err(anyhow!(message));
+    }
     emit(
         state,
         "operation.progress",
-        json!({ "id": id, "operation": operation.name(), "message": "已请求管理员权限" }),
+        json!({ "id": id, "operation": operation.name(), "message": "已请求管理员权限，等待确认。" }),
     );
     Ok(json!({ "operation_id": id, "operation": operation.name(), "elevation_requested": true }))
 }
@@ -691,9 +733,16 @@ fn run_elevated(
     operation_id: Option<&str>,
 ) -> Result<()> {
     let id = operation_id.unwrap_or("manual");
-    let log_dir = paths.working_dir.join("runtime").join("control-operations");
-    fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join(format!("{id}.log"));
+    let (log_path, status_path) = operation_paths(paths, id)?;
+    write_operation_status(
+        &status_path,
+        OperationStatus {
+            operation: operation.name().into(),
+            state: "running".into(),
+            message: "管理员权限已确认，正在执行。".into(),
+            success: None,
+        },
+    )?;
     let result = match operation {
         ElevatedOperation::RuntimeInstall => {
             let script = if paths.working_dir.join("install.ps1").exists() {
@@ -728,13 +777,37 @@ fn run_elevated(
             run_logged(&mut command, &log_path)
         }
     };
-    result.map_err(|error| {
-        anyhow!(
-            "{} failed; log: {}; {error:#}",
-            operation.name(),
-            log_path.display()
-        )
-    })
+    match result {
+        Ok(()) => {
+            write_operation_status(
+                &status_path,
+                OperationStatus {
+                    operation: operation.name().into(),
+                    state: "succeeded".into(),
+                    message: "操作已完成。".into(),
+                    success: Some(true),
+                },
+            )?;
+            Ok(())
+        }
+        Err(error) => {
+            let message = redact_secret_like_tokens(&format!("{error:#}"));
+            let _ = write_operation_status(
+                &status_path,
+                OperationStatus {
+                    operation: operation.name().into(),
+                    state: "failed".into(),
+                    message: message.clone(),
+                    success: Some(false),
+                },
+            );
+            Err(anyhow!(
+                "{} failed; log: {}; {message}",
+                operation.name(),
+                log_path.display()
+            ))
+        }
+    }
 }
 
 fn run_logged(command: &mut Command, log_path: &Path) -> Result<()> {
@@ -742,17 +815,168 @@ fn run_logged(command: &mut Command, log_path: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command.output()?;
-    let text = format!(
-        "[stdout]\n{}\n[stderr]\n{}\n",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    fs::write(log_path, redact_secret_like_tokens(&text))?;
-    if !output.status.success() {
-        bail!("operation exited with {}", output.status);
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("operation stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("operation stderr was not captured"))?;
+    let (sender, receiver) = mpsc::channel();
+    let stdout_reader = spawn_operation_output_reader("stdout", stdout, sender.clone());
+    let stderr_reader = spawn_operation_output_reader("stderr", stderr, sender);
+    let mut log_file = fs::File::create(log_path)?;
+
+    let status = loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok((source, line)) => write_operation_log_line(&mut log_file, &source, &line)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+    };
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    for (source, line) in receiver.try_iter() {
+        write_operation_log_line(&mut log_file, &source, &line)?;
+    }
+    log_file.flush()?;
+    if !status.success() {
+        bail!("operation exited with {status}");
     }
     Ok(())
+}
+
+fn spawn_operation_output_reader<R>(
+    source: &'static str,
+    input: R,
+    sender: mpsc::Sender<(String, String)>,
+) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(input);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&bytes)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned();
+                    if !line.is_empty() && sender.send((source.into(), line)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn write_operation_log_line(log_file: &mut fs::File, source: &str, line: &str) -> Result<()> {
+    writeln!(log_file, "[{source}] {}", redact_secret_like_tokens(line))?;
+    log_file.flush()?;
+    Ok(())
+}
+
+fn operation_paths(paths: &AppPaths, id: &str) -> Result<(PathBuf, PathBuf)> {
+    let safe_id: String = id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .collect();
+    if safe_id.is_empty() {
+        bail!("invalid operation id");
+    }
+    let directory = paths.working_dir.join("runtime").join("control-operations");
+    fs::create_dir_all(&directory)?;
+    Ok((
+        directory.join(format!("{safe_id}.log")),
+        directory.join(format!("{safe_id}.status.json")),
+    ))
+}
+
+fn write_operation_status(path: &Path, status: OperationStatus) -> Result<()> {
+    fs::write(path, serde_json::to_vec(&status)?)?;
+    Ok(())
+}
+
+fn spawn_operation_monitor(
+    state: ControlState,
+    id: String,
+    operation: String,
+    log_path: PathBuf,
+    status_path: PathBuf,
+) {
+    thread::spawn(move || {
+        let started = Instant::now();
+        let mut offset = 0;
+        let mut previous_state = String::new();
+        loop {
+            if let Ok(mut file) = fs::OpenOptions::new().read(true).open(&log_path) {
+                if file.seek(SeekFrom::Start(offset)).is_ok() {
+                    let mut bytes = Vec::new();
+                    if file.read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                        offset += bytes.len() as u64;
+                        for line in String::from_utf8_lossy(&bytes).lines() {
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let (source, message) = line
+                                .strip_prefix("[stdout] ")
+                                .map(|value| ("stdout", value))
+                                .or_else(|| {
+                                    line.strip_prefix("[stderr] ")
+                                        .map(|value| ("stderr", value))
+                                })
+                                .unwrap_or(("output", line));
+                            emit(
+                                &state,
+                                "operation.progress",
+                                json!({ "id": id, "operation": operation, "source": source, "message": message }),
+                            );
+                        }
+                    }
+                }
+            }
+
+            if let Ok(text) = fs::read_to_string(&status_path) {
+                if let Ok(status) = serde_json::from_str::<OperationStatus>(&text) {
+                    if status.state != previous_state {
+                        previous_state = status.state.clone();
+                        emit(
+                            &state,
+                            "operation.progress",
+                            json!({ "id": id, "operation": operation, "state": status.state, "message": status.message }),
+                        );
+                    }
+                    if matches!(status.state.as_str(), "succeeded" | "failed") {
+                        emit(
+                            &state,
+                            "operation.completed",
+                            json!({ "id": id, "operation": operation, "success": status.success.unwrap_or(false), "message": status.message }),
+                        );
+                        return;
+                    }
+                }
+            }
+
+            if started.elapsed() > Duration::from_secs(300) {
+                emit(
+                    &state,
+                    "operation.completed",
+                    json!({ "id": id, "operation": operation, "success": false, "message": "等待管理员权限确认超过 5 分钟，操作未启动。" }),
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
 }
 
 fn path_open(state: &ControlState, params: &Value) -> Result<Value> {
@@ -1400,5 +1624,19 @@ mod tests {
             version_from_text("Python 3.12.2").as_deref(),
             Some("3.12.2")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn logged_operation_keeps_stdout_and_stderr() {
+        let log_path =
+            std::env::temp_dir().join(format!("control-operation-{}.log", Uuid::new_v4()));
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "echo standard-output & echo standard-error 1>&2"]);
+        run_logged(&mut command, &log_path).unwrap();
+        let text = fs::read_to_string(&log_path).unwrap();
+        let _ = fs::remove_file(&log_path);
+        assert!(text.contains("[stdout] standard-output"));
+        assert!(text.contains("[stderr] standard-error"));
     }
 }

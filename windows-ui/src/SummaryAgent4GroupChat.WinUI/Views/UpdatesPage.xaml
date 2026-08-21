@@ -30,7 +30,7 @@
                         <Button Content="打开输出目录" Click="OpenOutput_Click" />
                         <Button Content="重新检测" Click="CheckDependencies_Click" />
                     </StackPanel>
-                    <TextBlock Text="安装运行环境和 wxdb init 会单独申请管理员权限；日常 GUI 与主程序保持普通权限。" Opacity="0.72" TextWrapping="Wrap" />
+                    <TextBlock Text="点击后会打开进度弹窗并在后台执行；安装运行环境和 wxdb init 会单独申请管理员权限，日常 GUI 与主程序保持普通权限。" Opacity="0.72" TextWrapping="Wrap" />
                 </StackPanel>
             </Border>
 

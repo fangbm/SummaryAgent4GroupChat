@@ -1,6 +1,7 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using System.ComponentModel;
 using SummaryAgent4GroupChat.WinUI.Models;
 using SummaryAgent4GroupChat.WinUI.ViewModels;
 using SummaryAgent4GroupChat.WinUI.Views;
@@ -18,6 +19,7 @@ public sealed partial class MainWindow : Window
         SystemBackdrop = new MicaBackdrop();
         ExtendsContentIntoTitleBar = true;
         ContentFrame.Navigate(typeof(DashboardPage), ViewModel);
+        ViewModel.MaintenanceDialogRequested += ShowMaintenanceDialog;
         Activated += async (_, _) => await InitializeAndCheckDependenciesAsync();
     }
 
@@ -76,6 +78,79 @@ public sealed partial class MainWindow : Window
         if (await dialog.ShowAsync() == ContentDialogResult.Primary)
         {
             await ViewModel.InstallRuntimeAsync();
+        }
+    }
+
+    private async void ShowMaintenanceDialog(string title)
+    {
+        var xamlRoot = Navigation.XamlRoot;
+        if (xamlRoot is null) return;
+
+        var activity = new ProgressRing
+        {
+            Width = 20,
+            Height = 20,
+            IsActive = ViewModel.IsMaintenanceOperationRunning,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var status = new TextBlock
+        {
+            Text = ViewModel.MaintenanceStatus,
+            TextWrapping = TextWrapping.Wrap,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var output = new TextBox
+        {
+            Text = ViewModel.MaintenanceOutput,
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            FontFamily = new FontFamily("Cascadia Mono"),
+            MinHeight = 220,
+            MaxHeight = 420,
+        };
+        ScrollViewer.SetVerticalScrollBarVisibility(output, ScrollBarVisibility.Auto);
+        ScrollViewer.SetHorizontalScrollBarVisibility(output, ScrollBarVisibility.Disabled);
+        var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+        header.Children.Add(activity);
+        header.Children.Add(status);
+        var body = new StackPanel { Spacing = 12 };
+        body.Children.Add(header);
+        body.Children.Add(output);
+        var dialog = new ContentDialog
+        {
+            XamlRoot = xamlRoot,
+            Title = title,
+            Content = body,
+            CloseButtonText = "关闭",
+            DefaultButton = ContentDialogButton.Close,
+        };
+
+        void RefreshOperationDialog()
+        {
+            activity.IsActive = ViewModel.IsMaintenanceOperationRunning;
+            status.Text = ViewModel.MaintenanceStatus;
+            output.Text = ViewModel.MaintenanceOutput;
+            output.SelectionStart = output.Text.Length;
+        }
+
+        PropertyChangedEventHandler propertyChanged = (_, args) =>
+        {
+            if (args.PropertyName is nameof(MainViewModel.MaintenanceStatus)
+                or nameof(MainViewModel.MaintenanceOutput)
+                or nameof(MainViewModel.IsMaintenanceOperationRunning))
+            {
+                DispatcherQueue.TryEnqueue(RefreshOperationDialog);
+            }
+        };
+        ViewModel.PropertyChanged += propertyChanged;
+        try
+        {
+            await dialog.ShowAsync();
+        }
+        finally
+        {
+            ViewModel.PropertyChanged -= propertyChanged;
         }
     }
 }

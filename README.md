@@ -39,7 +39,7 @@ LLM 文本总结 -> 可选图片提示词 -> 图片生成
 
 从本仓库的 [Releases](https://github.com/fangbm/SummaryAgent4GroupChat/releases) 下载 Inno Setup 安装程序并安装。安装完成后从开始菜单或桌面快捷方式打开 `SummaryAgent4GroupChat`。
 
-GUI 与主程序默认以普通权限运行，不会额外弹出命令行窗口。只有“安装微信运行环境”和“运行 wxdb init”两个维护操作会单独请求管理员权限。
+GUI 与主程序默认以普通权限运行，不会额外弹出命令行窗口。只有“安装微信运行环境”和“运行 wxdb init”两个维护操作会单独请求管理员权限；点击后会打开原生进度弹窗，实时显示后台输出、成功状态或完整的脱敏错误信息。
 
 在 GUI 左侧点击“安装微信运行环境”，安装器会：
 
@@ -99,7 +99,7 @@ winget install --id JRSoftware.InnoSetup -e --scope user --accept-package-agreem
 
 GUI 启动后会后台检查一次；也可在左侧“更新与依赖”页手动检查。检查范围包括应用 Release、独立 wxdb Release 与当前 `.venv` 中所有可升级的 pip 依赖。检查只读取版本信息，不会自动下载安装或修改你的 Python、wxdb、ffmpeg 等环境。
 
-微信模式首次启动还会检测 Python、`wx4py` 与外部 wxdb 是否可用；缺少时会显示原生确认弹窗，可直接启动“安装微信运行环境”。“运行 wxdb init”和输出目录等维护操作也位于“更新与依赖”页。
+微信模式首次启动还会检测 Python、`wx4py` 与外部 wxdb 是否可用；缺少时会显示原生确认弹窗，可直接启动“安装微信运行环境”。“运行 wxdb init”和输出目录等维护操作也位于“更新与依赖”页；维护任务在后台执行，进度和错误会显示在操作弹窗中。
 
 ### 最小 LLM 配置
 

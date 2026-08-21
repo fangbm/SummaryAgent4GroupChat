@@ -28,7 +28,11 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _updateCheckStatus = "启动后会自动检查应用与受管理依赖的更新。";
     [ObservableProperty] private bool _dependenciesNeedInstall;
     [ObservableProperty] private string _dependencyStatus = "正在检测运行依赖…";
+    [ObservableProperty] private bool _isMaintenanceOperationRunning;
+    [ObservableProperty] private string _maintenanceStatus = "尚未运行维护操作。";
+    [ObservableProperty] private string _maintenanceOutput = string.Empty;
     public ObservableCollection<UpdateCheckItem> UpdateItems { get; } = [];
+    public event Action<string>? MaintenanceDialogRequested;
 
     [ObservableProperty] private string _platformKind = "wx";
     [ObservableProperty] private string _weChatGroups = string.Empty;
@@ -82,6 +86,7 @@ public sealed partial class MainViewModel : ObservableObject
             _client = await ControlBootstrap.ConnectAsync(_lifetime.Token);
             await RefreshAsync();
             _ = SubscribeOutputAsync(_lifetime.Token);
+            _ = SubscribeOperationsAsync(_lifetime.Token);
             _ = PollLogsAsync(_lifetime.Token);
             await CheckRuntimeDependenciesAsync();
             _ = CheckForUpdatesAsync(silent: true);
@@ -166,8 +171,8 @@ public sealed partial class MainViewModel : ObservableObject
 
     public async Task StartAgentAsync() => await AgentCommandAsync("agent.start", "主程序已启动");
     public async Task StopAgentAsync() => await AgentCommandAsync("agent.stop", "主程序已停止");
-    public async Task InstallRuntimeAsync() => await AgentCommandAsync("runtime.install", "已请求管理员权限安装微信运行环境");
-    public async Task RunWxdbInitAsync() => await AgentCommandAsync("wxdb.init", "已请求管理员权限运行 wxdb init");
+    public async Task InstallRuntimeAsync() => await StartMaintenanceOperationAsync("runtime.install", "安装微信运行环境");
+    public async Task RunWxdbInitAsync() => await StartMaintenanceOperationAsync("wxdb.init", "运行 wxdb init");
     public async Task OpenPathAsync(string kind) => await AgentCommandAsync("path.open", "已打开路径", new { kind });
 
     public async Task<bool> CheckRuntimeDependenciesAsync()
@@ -350,6 +355,34 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    private async Task StartMaintenanceOperationAsync(string method, string title)
+    {
+        if (_client is null) return;
+        if (IsMaintenanceOperationRunning)
+        {
+            Notice = "已有维护操作正在运行，请等待完成。";
+            return;
+        }
+
+        IsMaintenanceOperationRunning = true;
+        MaintenanceStatus = $"正在请求管理员权限：{title}…";
+        MaintenanceOutput = $"[{DateTime.Now:HH:mm:ss}] 已创建后台任务，等待管理员权限确认。\n";
+        MaintenanceDialogRequested?.Invoke(title);
+        try
+        {
+            var reply = await _client.CallAsync(method, cancellationToken: _lifetime.Token);
+            reply.ThrowIfError();
+            Notice = $"{title}已在后台启动";
+        }
+        catch (Exception error)
+        {
+            IsMaintenanceOperationRunning = false;
+            MaintenanceStatus = $"{title}启动失败：{error.Message}";
+            AppendMaintenanceOutput($"[错误] {error.Message}\n");
+            Notice = MaintenanceStatus;
+        }
+    }
+
     private async Task SubscribeOutputAsync(CancellationToken cancellationToken)
     {
         if (_client is null) return;
@@ -367,6 +400,25 @@ public sealed partial class MainViewModel : ObservableObject
         catch (Exception error) when (!cancellationToken.IsCancellationRequested)
         {
             _dispatcher.TryEnqueue(() => AppendTerminal($"[gui] 终端订阅已断开：{error.Message}\n"));
+        }
+    }
+
+    private async Task SubscribeOperationsAsync(CancellationToken cancellationToken)
+    {
+        if (_client is null) return;
+        try
+        {
+            await _client.SubscribeAsync("operation.subscribe", eventData =>
+            {
+                var eventName = eventData.GetProperty("event").GetString() ?? string.Empty;
+                var data = eventData.GetProperty("data").Clone();
+                _dispatcher.TryEnqueue(() => ApplyMaintenanceEvent(eventName, data));
+                return Task.CompletedTask;
+            }, cancellationToken);
+        }
+        catch (Exception error) when (!cancellationToken.IsCancellationRequested)
+        {
+            _dispatcher.TryEnqueue(() => AppendMaintenanceOutput($"[连接错误] 维护任务订阅已断开：{error.Message}\n"));
         }
     }
 
@@ -409,6 +461,56 @@ public sealed partial class MainViewModel : ObservableObject
         var combined = TerminalText + text;
         TerminalText = combined.Length > maxChars ? combined[^maxChars..] : combined;
     }
+
+    private void ApplyMaintenanceEvent(string eventName, JsonElement data)
+    {
+        var operation = data.TryGetProperty("operation", out var operationElement)
+            ? operationElement.GetString() ?? "维护操作"
+            : "维护操作";
+        var message = data.TryGetProperty("message", out var messageElement)
+            ? messageElement.GetString() ?? string.Empty
+            : string.Empty;
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            var source = data.TryGetProperty("source", out var sourceElement)
+                ? sourceElement.GetString()
+                : null;
+            var prefix = source is "stdout" or "stderr" ? $"[{source}] " : string.Empty;
+            AppendMaintenanceOutput($"{prefix}{message}\n");
+        }
+
+        if (eventName == "operation.completed")
+        {
+            var success = data.TryGetProperty("success", out var successElement) && successElement.ValueKind == JsonValueKind.True;
+            IsMaintenanceOperationRunning = false;
+            MaintenanceStatus = success
+                ? $"{OperationDisplayName(operation)}已成功完成。"
+                : $"{OperationDisplayName(operation)}失败：{message}";
+            Notice = MaintenanceStatus;
+            if (success)
+            {
+                _ = CheckRuntimeDependenciesAsync();
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(message))
+        {
+            MaintenanceStatus = message;
+        }
+    }
+
+    private void AppendMaintenanceOutput(string text)
+    {
+        const int maxChars = 256 * 1024;
+        var combined = MaintenanceOutput + text;
+        MaintenanceOutput = combined.Length > maxChars ? combined[^maxChars..] : combined;
+    }
+
+    private static string OperationDisplayName(string operation) => operation switch
+    {
+        "runtime.install" => "安装微信运行环境",
+        "wxdb.init" => "运行 wxdb init",
+        _ => operation,
+    };
 
     private static string ReadUpdateValue(JsonElement entry, string property, string fallback) =>
         entry.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(value.GetString())
