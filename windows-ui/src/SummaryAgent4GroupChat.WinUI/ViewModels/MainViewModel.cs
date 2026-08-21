@@ -1,8 +1,9 @@
-using System.Text;
+using System.Collections.ObjectModel;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using CommunityToolkit.Mvvm.ComponentModel;
 using Microsoft.UI.Dispatching;
+using SummaryAgent4GroupChat.WinUI.Models;
 using SummaryAgent4GroupChat.WinUI.Services;
 
 namespace SummaryAgent4GroupChat.WinUI.ViewModels;
@@ -23,6 +24,9 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private bool _isAgentRunning;
     [ObservableProperty] private bool _followTerminal = true;
     [ObservableProperty] private bool _followLogs = true;
+    [ObservableProperty] private bool _isCheckingUpdates;
+    [ObservableProperty] private string _updateCheckStatus = "启动后会自动检查应用与受管理依赖的更新。";
+    public ObservableCollection<UpdateCheckItem> UpdateItems { get; } = [];
 
     [ObservableProperty] private string _platformKind = "wx";
     [ObservableProperty] private string _weChatGroups = string.Empty;
@@ -77,6 +81,7 @@ public sealed partial class MainViewModel : ObservableObject
             await RefreshAsync();
             _ = SubscribeOutputAsync(_lifetime.Token);
             _ = PollLogsAsync(_lifetime.Token);
+            _ = CheckForUpdatesAsync(silent: true);
         }
         catch (Exception error)
         {
@@ -161,6 +166,53 @@ public sealed partial class MainViewModel : ObservableObject
     public async Task InstallRuntimeAsync() => await AgentCommandAsync("runtime.install", "已请求管理员权限安装微信运行环境");
     public async Task RunWxdbInitAsync() => await AgentCommandAsync("wxdb.init", "已请求管理员权限运行 wxdb init");
     public async Task OpenPathAsync(string kind) => await AgentCommandAsync("path.open", "已打开路径", new { kind });
+
+    public async Task CheckForUpdatesAsync(bool silent = false)
+    {
+        if (_client is null || IsCheckingUpdates) return;
+        IsCheckingUpdates = true;
+        UpdateCheckStatus = "正在检查应用与依赖更新…";
+        try
+        {
+            var reply = await _client.CallAsync("update.check", cancellationToken: _lifetime.Token);
+            reply.ThrowIfError();
+            var result = reply.Result!.Value;
+            UpdateItems.Clear();
+            foreach (var entry in result.GetProperty("entries").EnumerateArray())
+            {
+                var status = ReadUpdateValue(entry, "status", "unknown");
+                var updateAvailable = entry.TryGetProperty("update_available", out var available) && available.ValueKind == JsonValueKind.True;
+                UpdateItems.Add(new UpdateCheckItem(
+                    ReadUpdateValue(entry, "name", "未知组件"),
+                    ReadUpdateValue(entry, "current_version", "未检测"),
+                    ReadUpdateValue(entry, "latest_version", "无"),
+                    UpdateStatusText(status),
+                    ReadUpdateValue(entry, "detail", string.Empty),
+                    updateAvailable));
+            }
+            var updateCount = result.GetProperty("update_count").GetInt32();
+            UpdateCheckStatus = updateCount > 0
+                ? $"发现 {updateCount} 个可更新组件。"
+                : "已检查，受管理组件均为最新或没有可用更新。";
+            if (updateCount > 0)
+            {
+                Notice = UpdateCheckStatus;
+            }
+            else if (!silent)
+            {
+                Notice = "更新检查已完成";
+            }
+        }
+        catch (Exception error)
+        {
+            UpdateCheckStatus = $"更新检查失败：{error.Message}";
+            if (!silent) Notice = UpdateCheckStatus;
+        }
+        finally
+        {
+            IsCheckingUpdates = false;
+        }
+    }
 
     public void ClearTerminal() => TerminalText = string.Empty;
     public void ClearLogs() => LogText = string.Empty;
@@ -332,6 +384,23 @@ public sealed partial class MainViewModel : ObservableObject
         var combined = TerminalText + text;
         TerminalText = combined.Length > maxChars ? combined[^maxChars..] : combined;
     }
+
+    private static string ReadUpdateValue(JsonElement entry, string property, string fallback) =>
+        entry.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(value.GetString())
+            ? value.GetString()!
+            : fallback;
+
+    private static string UpdateStatusText(string status) => status switch
+    {
+        "update_available" => "可更新",
+        "up_to_date" => "已是最新",
+        "installed" => "已安装",
+        "not_managed" => "无需检查",
+        "not_detected" => "未检测到",
+        "available_unknown_current" => "已发现版本",
+        "unavailable" => "暂不可用",
+        _ => "未知",
+    };
 
     private string ReadString(string section, string key, string fallback)
     {

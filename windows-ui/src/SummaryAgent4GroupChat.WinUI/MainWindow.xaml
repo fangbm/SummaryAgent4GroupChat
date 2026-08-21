@@ -15,6 +15,7 @@
             <NavigationViewItem Content="定时总结" Tag="schedule" />
             <NavigationViewItem Content="模型与媒体" Tag="models" />
             <NavigationViewItem Content="运行信息" Tag="runtime" />
+            <NavigationViewItem Content="更新与依赖" Tag="updates" />
         </NavigationView.MenuItems>
         <NavigationView.FooterMenuItems>
             <NavigationViewItem Content="刷新" Tag="refresh" />

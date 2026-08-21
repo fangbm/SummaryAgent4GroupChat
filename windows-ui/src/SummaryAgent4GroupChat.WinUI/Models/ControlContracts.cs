@@ -18,3 +18,11 @@ public sealed record ControlReply(JsonElement? Result, ControlError? Error)
 public sealed record ControlError(string Code, string Message, string? Detail, bool Retryable);
 
 public sealed record EditorPageContext(ViewModels.MainViewModel ViewModel, string Section);
+
+public sealed record UpdateCheckItem(
+    string Name,
+    string CurrentVersion,
+    string LatestVersion,
+    string Status,
+    string Detail,
+    bool UpdateAvailable);

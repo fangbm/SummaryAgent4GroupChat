@@ -95,6 +95,10 @@ winget install --id JRSoftware.InnoSetup -e --scope user --accept-package-agreem
 
 默认配置文件为 [`rust-agent/config/agent.toml`](rust-agent/config/agent.toml)。安装版使用安装目录下的 `config\agent.toml`。GUI 保存后主程序会自动重载配置，无需重启。
 
+### 更新检查
+
+GUI 启动后会后台检查一次；也可在左侧“更新与依赖”页手动检查。检查范围包括应用 Release、独立 wxdb Release 与当前 `.venv` 中所有可升级的 pip 依赖。检查只读取版本信息，不会自动下载安装或修改你的 Python、wxdb、ffmpeg 等环境。
+
 ### 最小 LLM 配置
 
 以下为 OpenAI 兼容服务的最小环境变量示例：

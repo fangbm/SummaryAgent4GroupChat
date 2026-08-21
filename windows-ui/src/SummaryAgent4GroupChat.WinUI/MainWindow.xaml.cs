@@ -39,6 +39,12 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        if (tag == "updates")
+        {
+            ContentFrame.Navigate(typeof(UpdatesPage), ViewModel);
+            return;
+        }
+
         if (tag == "dashboard")
         {
             ContentFrame.Navigate(typeof(DashboardPage), ViewModel);

@@ -10,6 +10,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
+    time::Duration,
 };
 
 #[cfg(windows)]
@@ -21,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
+    process::Command as AsyncCommand,
     sync::broadcast,
+    time::timeout,
 };
 use uuid::Uuid;
 use wechat_summary_core::AgentConfig;
@@ -417,6 +420,7 @@ async fn dispatch(
         "wxdb.init" => start_elevated_operation(state, ElevatedOperation::WxdbInit),
         "path.open" => path_open(state, params),
         "logs.tail" => logs_tail(state),
+        "update.check" => update_check(state).await,
         "output.subscribe" | "logs.subscribe" | "status.subscribe" => {
             Ok(json!({ "subscribed": true }))
         }
@@ -783,6 +787,353 @@ fn logs_tail(state: &ControlState) -> Result<Value> {
     Ok(json!({ "path": path, "text": text }))
 }
 
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+const APPLICATION_RELEASE_REPOSITORY: &str = "fangbm/SummaryAgent4GroupChat";
+const WXDB_RELEASE_REPOSITORY: &str = "fangbm/wxdb";
+
+async fn update_check(state: &ControlState) -> Result<Value> {
+    let config = AgentConfig::from_path(&state.paths.config_path)
+        .context("reading configuration for update check")?;
+    let mut client_builder = reqwest::Client::builder()
+        .timeout(UPDATE_CHECK_TIMEOUT)
+        .user_agent("SummaryAgent4GroupChat/update-check");
+    if config.proxy.enabled {
+        if let Some(proxy_url) = config.proxy.https.as_ref().or(config.proxy.http.as_ref()) {
+            client_builder = client_builder
+                .proxy(reqwest::Proxy::all(proxy_url).context("configuring update check proxy")?);
+        }
+    }
+    let client = client_builder
+        .build()
+        .context("creating update check HTTP client")?;
+
+    let application = check_github_release(
+        &client,
+        "SummaryAgent4GroupChat",
+        APPLICATION_RELEASE_REPOSITORY,
+        Some(env!("CARGO_PKG_VERSION")),
+    );
+    let wxdb = check_wxdb_release(&client, &state.paths, &config.wx_cli.executable);
+    let python = check_python_dependencies(&state.paths, &config.wx4py.python_executable);
+    let (application, wxdb, mut python_dependencies) = tokio::join!(application, wxdb, python);
+
+    let mut entries = vec![application, wxdb];
+    entries.append(&mut python_dependencies);
+    let update_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("update_available")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    Ok(json!({
+        "entries": entries,
+        "update_count": update_count,
+        "managed_scope": "应用本体、独立 wxdb 和当前 Python 虚拟环境中的 pip 依赖",
+    }))
+}
+
+async fn check_github_release(
+    client: &reqwest::Client,
+    name: &str,
+    repository: &str,
+    current_version: Option<&str>,
+) -> Value {
+    let endpoint = format!("https://api.github.com/repos/{repository}/releases/latest");
+    let response = match client.get(&endpoint).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return update_entry(
+                name,
+                current_version,
+                None,
+                "unavailable",
+                format!("无法检查 Release：{error}"),
+            )
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return update_entry(
+            name,
+            current_version,
+            None,
+            "unavailable",
+            format!("Release 服务返回 HTTP {status}"),
+        );
+    }
+    let release = match response.json::<Value>().await {
+        Ok(release) => release,
+        Err(error) => {
+            return update_entry(
+                name,
+                current_version,
+                None,
+                "unavailable",
+                format!("Release 响应格式无效：{error}"),
+            )
+        }
+    };
+    let latest = release
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let detail = release
+        .get("html_url")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "已获取最新 Release 信息".to_string());
+    let Some(latest) = latest else {
+        return update_entry(
+            name,
+            current_version,
+            None,
+            "unavailable",
+            "Release 未包含版本标签",
+        );
+    };
+
+    let status = match current_version {
+        Some(current) if version_is_newer(latest, current) => "update_available",
+        Some(_) => "up_to_date",
+        None => "available_unknown_current",
+    };
+    update_entry(name, current_version, Some(latest), status, detail)
+}
+
+async fn check_wxdb_release(client: &reqwest::Client, paths: &AppPaths, configured: &str) -> Value {
+    if configured.trim().eq_ignore_ascii_case("builtin") {
+        return update_entry(
+            "wxdb",
+            Some("内置读取器"),
+            None,
+            "not_managed",
+            "当前使用内置读取器，不依赖外部 wxdb Release",
+        );
+    }
+
+    let executable = configured_program(paths, configured);
+    let current = match run_hidden_command(&executable, &["--version"], &paths.working_dir).await {
+        Ok(output) => version_from_text(&output).or_else(|| non_empty_line(&output)),
+        Err(_) => None,
+    };
+    let mut entry =
+        check_github_release(client, "wxdb", WXDB_RELEASE_REPOSITORY, current.as_deref()).await;
+    if current.is_none() {
+        entry["status"] = Value::String("not_detected".into());
+        entry["update_available"] = Value::Bool(false);
+        entry["detail"] = Value::String(format!(
+            "未能执行 {} --version；请检查 wxdb 路径或 PATH",
+            executable.display()
+        ));
+    }
+    entry
+}
+
+async fn check_python_dependencies(paths: &AppPaths, configured: &str) -> Vec<Value> {
+    let python = configured_program(paths, configured);
+    let version = run_hidden_command(&python, &["--version"], &paths.working_dir).await;
+    let current_version = match version {
+        Ok(output) => version_from_text(&output).or_else(|| non_empty_line(&output)),
+        Err(error) => {
+            return vec![update_entry(
+                "Python 虚拟环境",
+                None,
+                None,
+                "not_detected",
+                format!("未能执行 {}：{error:#}", python.display()),
+            )]
+        }
+    };
+    let mut entries = vec![update_entry(
+        "Python 虚拟环境",
+        current_version.as_deref(),
+        None,
+        "installed",
+        "已检查解释器；下方列出当前虚拟环境中可升级的 pip 包",
+    )];
+    let output = match run_hidden_command(
+        &python,
+        &["-m", "pip", "list", "--outdated", "--format=json"],
+        &paths.working_dir,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            entries.push(update_entry(
+                "Python pip 依赖",
+                None,
+                None,
+                "unavailable",
+                format!("无法检查 pip 更新：{error:#}"),
+            ));
+            return entries;
+        }
+    };
+    let packages = match serde_json::from_str::<Value>(&output)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+    {
+        Some(packages) => packages,
+        None => {
+            entries.push(update_entry(
+                "Python pip 依赖",
+                None,
+                None,
+                "unavailable",
+                "pip 未返回预期 JSON，无法判断依赖更新",
+            ));
+            return entries;
+        }
+    };
+    if packages.is_empty() {
+        entries.push(update_entry(
+            "Python pip 依赖",
+            Some("已检查"),
+            Some("均为最新"),
+            "up_to_date",
+            "当前虚拟环境中没有可升级的 pip 包",
+        ));
+        return entries;
+    }
+    for package in packages {
+        let name = package
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("未知包");
+        let current = package.get("version").and_then(Value::as_str);
+        let latest = package.get("latest_version").and_then(Value::as_str);
+        entries.push(update_entry(
+            &format!("Python: {name}"),
+            current,
+            latest,
+            "update_available",
+            "虚拟环境 pip 依赖",
+        ));
+    }
+    entries
+}
+
+async fn run_hidden_command(program: &Path, args: &[&str], working_dir: &Path) -> Result<String> {
+    let mut command = AsyncCommand::new(program);
+    command
+        .args(args)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    let output = timeout(UPDATE_CHECK_TIMEOUT, command.output())
+        .await
+        .map_err(|_| anyhow!("命令在 {} 秒内未完成", UPDATE_CHECK_TIMEOUT.as_secs()))??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("命令退出码 {}：{}", output.status, stderr);
+    }
+    Ok(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+fn configured_program(paths: &AppPaths, configured: &str) -> PathBuf {
+    let path = PathBuf::from(configured.trim());
+    if path.is_absolute() || !configured.contains(['\\', '/']) {
+        path
+    } else {
+        paths.working_dir.join(path)
+    }
+}
+
+fn update_entry(
+    name: &str,
+    current_version: Option<&str>,
+    latest_version: Option<&str>,
+    status: &str,
+    detail: impl Into<String>,
+) -> Value {
+    json!({
+        "name": name,
+        "current_version": current_version,
+        "latest_version": latest_version,
+        "status": status,
+        "update_available": status == "update_available",
+        "detail": detail.into(),
+    })
+}
+
+fn version_from_text(text: &str) -> Option<String> {
+    text.split(|character: char| character.is_whitespace() || character == ',')
+        .find_map(|token| {
+            version_components(token).map(|components| {
+                components
+                    .into_iter()
+                    .map(|part| part.to_string())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+        })
+}
+
+fn non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn version_is_newer(candidate: &str, current: &str) -> bool {
+    let Some(candidate) = version_components(candidate) else {
+        return false;
+    };
+    let Some(current) = version_components(current) else {
+        return false;
+    };
+    let width = candidate.len().max(current.len());
+    for index in 0..width {
+        match candidate
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&current.get(index).copied().unwrap_or(0))
+        {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    false
+}
+
+fn version_components(value: &str) -> Option<Vec<u64>> {
+    let value = value.trim().trim_start_matches(['v', 'V']);
+    let version = value
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect::<String>();
+    if version.is_empty()
+        || !version
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    version
+        .split('.')
+        .map(|part| {
+            (!part.is_empty())
+                .then(|| part.parse::<u64>().ok())
+                .flatten()
+        })
+        .collect()
+}
+
 fn runtime_output_dir(paths: &AppPaths) -> Result<PathBuf> {
     let raw = fs::read_to_string(&paths.config_path)?;
     let value: toml::Value = raw.parse()?;
@@ -968,5 +1319,26 @@ mod tests {
         let output = redact_toml_secrets(text).unwrap();
         assert!(!output.contains("actual-secret"));
         assert!(output.contains("<redacted-secret>"));
+    }
+
+    #[test]
+    fn version_comparison_handles_tags_and_component_width() {
+        assert!(version_is_newer("v0.1.10", "0.1.4"));
+        assert!(version_is_newer("1.2.0", "1.1.99"));
+        assert!(!version_is_newer("v0.1.4", "0.1.4"));
+        assert!(!version_is_newer("v0.1.3", "0.1.4"));
+        assert!(!version_is_newer("not-a-version", "0.1.4"));
+    }
+
+    #[test]
+    fn version_parser_extracts_tool_version_from_command_output() {
+        assert_eq!(
+            version_from_text("wxdb version v0.1.4\n").as_deref(),
+            Some("0.1.4")
+        );
+        assert_eq!(
+            version_from_text("Python 3.12.2").as_deref(),
+            Some("3.12.2")
+        );
     }
 }
