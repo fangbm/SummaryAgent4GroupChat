@@ -696,7 +696,7 @@ fn start_elevated_operation(state: &ControlState, operation: ElevatedOperation) 
         "-NonInteractive",
         "-Command",
         &format!(
-            "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs",
+            "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -WindowStyle Hidden",
             ps_quote(&executable.display().to_string()),
             ps_quote(&arguments)
         ),
@@ -811,6 +811,7 @@ fn run_elevated(
 }
 
 fn run_logged(command: &mut Command, log_path: &Path) -> Result<()> {
+    hide_window(command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
