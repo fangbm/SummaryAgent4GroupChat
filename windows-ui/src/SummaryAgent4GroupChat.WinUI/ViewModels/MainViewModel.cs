@@ -26,6 +26,8 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private bool _followLogs = true;
     [ObservableProperty] private bool _isCheckingUpdates;
     [ObservableProperty] private string _updateCheckStatus = "启动后会自动检查应用与受管理依赖的更新。";
+    [ObservableProperty] private bool _dependenciesNeedInstall;
+    [ObservableProperty] private string _dependencyStatus = "正在检测运行依赖…";
     public ObservableCollection<UpdateCheckItem> UpdateItems { get; } = [];
 
     [ObservableProperty] private string _platformKind = "wx";
@@ -81,6 +83,7 @@ public sealed partial class MainViewModel : ObservableObject
             await RefreshAsync();
             _ = SubscribeOutputAsync(_lifetime.Token);
             _ = PollLogsAsync(_lifetime.Token);
+            await CheckRuntimeDependenciesAsync();
             _ = CheckForUpdatesAsync(silent: true);
         }
         catch (Exception error)
@@ -167,6 +170,27 @@ public sealed partial class MainViewModel : ObservableObject
     public async Task RunWxdbInitAsync() => await AgentCommandAsync("wxdb.init", "已请求管理员权限运行 wxdb init");
     public async Task OpenPathAsync(string kind) => await AgentCommandAsync("path.open", "已打开路径", new { kind });
 
+    public async Task<bool> CheckRuntimeDependenciesAsync()
+    {
+        if (_client is null) return false;
+        DependencyStatus = "正在检测运行依赖…";
+        try
+        {
+            var reply = await _client.CallAsync("runtime.check", cancellationToken: _lifetime.Token);
+            reply.ThrowIfError();
+            var result = reply.Result!.Value;
+            DependenciesNeedInstall = !result.GetProperty("ready").GetBoolean();
+            DependencyStatus = result.GetProperty("detail").GetString() ?? "运行依赖检查完成。";
+            return DependenciesNeedInstall;
+        }
+        catch (Exception error)
+        {
+            DependenciesNeedInstall = false;
+            DependencyStatus = $"运行依赖检查失败：{error.Message}";
+            return false;
+        }
+    }
+
     public async Task CheckForUpdatesAsync(bool silent = false)
     {
         if (_client is null || IsCheckingUpdates) return;
@@ -202,6 +226,7 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 Notice = "更新检查已完成";
             }
+            await CheckRuntimeDependenciesAsync();
         }
         catch (Exception error)
         {

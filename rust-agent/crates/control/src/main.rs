@@ -418,6 +418,7 @@ async fn dispatch(
         "agent.stop" => agent_stop(state),
         "runtime.install" => start_elevated_operation(state, ElevatedOperation::RuntimeInstall),
         "wxdb.init" => start_elevated_operation(state, ElevatedOperation::WxdbInit),
+        "runtime.check" => runtime_check(state).await,
         "path.open" => path_open(state, params),
         "logs.tail" => logs_tail(state),
         "update.check" => update_check(state).await,
@@ -785,6 +786,65 @@ fn logs_tail(state: &ControlState) -> Result<Value> {
         Err(error) => format!("暂无日志：{error}"),
     };
     Ok(json!({ "path": path, "text": text }))
+}
+
+async fn runtime_check(state: &ControlState) -> Result<Value> {
+    let config = AgentConfig::from_path(&state.paths.config_path)
+        .context("reading configuration for runtime check")?;
+    let platform = config.platform.kind.as_str();
+    if platform != "wx" {
+        return Ok(json!({
+            "platform": platform,
+            "ready": true,
+            "missing": [],
+            "detail": "当前平台不需要微信运行环境",
+            "install_available": false,
+        }));
+    }
+
+    let mut missing = Vec::new();
+    let python = configured_program(&state.paths, &config.wx4py.python_executable);
+    if run_hidden_command(
+        &python,
+        &[
+            "-c",
+            "import wx4py; print(getattr(wx4py, '__version__', 'installed'))",
+        ],
+        &state.paths.working_dir,
+    )
+    .await
+    .is_err()
+    {
+        missing.push("Python 与 wx4py".to_string());
+    }
+
+    let wxdb_configured = config.wx_cli.executable.trim();
+    if !wxdb_configured.eq_ignore_ascii_case("builtin") {
+        let wxdb = configured_program(&state.paths, wxdb_configured);
+        if run_hidden_command(&wxdb, &["--version"], &state.paths.working_dir)
+            .await
+            .is_err()
+        {
+            missing.push("wxdb".to_string());
+        }
+    }
+
+    let ready = missing.is_empty();
+    let detail = if ready {
+        "微信运行环境已就绪；wxdb init 可在微信登录后按需运行。".to_string()
+    } else {
+        format!(
+            "缺少：{}。可使用安装微信运行环境完成安装。",
+            missing.join("、")
+        )
+    };
+    Ok(json!({
+        "platform": platform,
+        "ready": ready,
+        "missing": missing,
+        "detail": detail,
+        "install_available": !ready,
+    }))
 }
 
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(20);

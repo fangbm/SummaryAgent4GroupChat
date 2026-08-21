@@ -99,6 +99,8 @@ winget install --id JRSoftware.InnoSetup -e --scope user --accept-package-agreem
 
 GUI 启动后会后台检查一次；也可在左侧“更新与依赖”页手动检查。检查范围包括应用 Release、独立 wxdb Release 与当前 `.venv` 中所有可升级的 pip 依赖。检查只读取版本信息，不会自动下载安装或修改你的 Python、wxdb、ffmpeg 等环境。
 
+微信模式首次启动还会检测 Python、`wx4py` 与外部 wxdb 是否可用；缺少时会显示原生确认弹窗，可直接启动“安装微信运行环境”。“运行 wxdb init”和输出目录等维护操作也位于“更新与依赖”页。
+
 ### 最小 LLM 配置
 
 以下为 OpenAI 兼容服务的最小环境变量示例：

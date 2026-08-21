@@ -16,4 +16,24 @@ public sealed partial class UpdatesPage : Page
     {
         if (ViewModel is not null) await ViewModel.CheckForUpdatesAsync();
     }
+
+    private async void CheckDependencies_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+    {
+        if (ViewModel is not null) await ViewModel.CheckRuntimeDependenciesAsync();
+    }
+
+    private async void InstallRuntime_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+    {
+        if (ViewModel is not null) await ViewModel.InstallRuntimeAsync();
+    }
+
+    private async void WxdbInit_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+    {
+        if (ViewModel is not null) await ViewModel.RunWxdbInitAsync();
+    }
+
+    private async void OpenOutput_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+    {
+        if (ViewModel is not null) await ViewModel.OpenPathAsync("output");
+    }
 }

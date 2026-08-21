@@ -20,17 +20,6 @@
                 <Button Content="停止主程序" Click="Stop_Click" />
                 <Button Content="刷新状态" Click="Refresh_Click" />
             </StackPanel>
-            <Border Style="{StaticResource StatusCard}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="维护操作" Style="{ThemeResource SubtitleTextBlockStyle}" />
-                    <StackPanel Orientation="Horizontal" Spacing="10">
-                        <Button Content="安装微信运行环境" Click="InstallRuntime_Click" />
-                        <Button Content="运行 wxdb init" Click="WxdbInit_Click" />
-                        <Button Content="打开输出目录" Click="OpenOutput_Click" />
-                    </StackPanel>
-                    <TextBlock Text="这两项管理操作会单独申请管理员权限；日常 GUI 与主程序保持普通权限。" Opacity="0.72" TextWrapping="Wrap" />
-                </StackPanel>
-            </Border>
         </StackPanel>
     </ScrollViewer>
 </Page>

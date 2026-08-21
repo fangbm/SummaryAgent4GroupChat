@@ -20,6 +20,20 @@
                 </StackPanel>
             </Border>
 
+            <Border Style="{StaticResource StatusCard}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="运行依赖" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <TextBlock Text="{Binding DependencyStatus}" TextWrapping="Wrap" />
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <Button Content="安装微信运行环境" Click="InstallRuntime_Click" />
+                        <Button Content="运行 wxdb init" Click="WxdbInit_Click" />
+                        <Button Content="打开输出目录" Click="OpenOutput_Click" />
+                        <Button Content="重新检测" Click="CheckDependencies_Click" />
+                    </StackPanel>
+                    <TextBlock Text="安装运行环境和 wxdb init 会单独申请管理员权限；日常 GUI 与主程序保持普通权限。" Opacity="0.72" TextWrapping="Wrap" />
+                </StackPanel>
+            </Border>
+
             <ListView ItemsSource="{Binding UpdateItems}" SelectionMode="None">
                 <ListView.ItemTemplate>
                     <DataTemplate>

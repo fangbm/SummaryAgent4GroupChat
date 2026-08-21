@@ -9,6 +9,7 @@ namespace SummaryAgent4GroupChat.WinUI;
 
 public sealed partial class MainWindow : Window
 {
+    private bool _startupChecksCompleted;
     public MainViewModel ViewModel { get; } = new();
 
     public MainWindow()
@@ -17,7 +18,7 @@ public sealed partial class MainWindow : Window
         SystemBackdrop = new MicaBackdrop();
         ExtendsContentIntoTitleBar = true;
         ContentFrame.Navigate(typeof(DashboardPage), ViewModel);
-        Activated += async (_, _) => await ViewModel.InitializeAsync();
+        Activated += async (_, _) => await InitializeAndCheckDependenciesAsync();
     }
 
     private async void Navigation_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
@@ -52,5 +53,29 @@ public sealed partial class MainWindow : Window
         }
 
         ContentFrame.Navigate(typeof(ConfigEditorPage), new EditorPageContext(ViewModel, tag));
+    }
+
+    private async Task InitializeAndCheckDependenciesAsync()
+    {
+        if (_startupChecksCompleted) return;
+        _startupChecksCompleted = true;
+        await ViewModel.InitializeAsync();
+        if (!ViewModel.DependenciesNeedInstall) return;
+
+        var xamlRoot = (Content as FrameworkElement)?.XamlRoot;
+        if (xamlRoot is null) return;
+        var dialog = new ContentDialog
+        {
+            XamlRoot = xamlRoot,
+            Title = "需要安装微信运行依赖",
+            Content = $"{ViewModel.DependencyStatus}\n\n是否现在安装？安装过程会申请管理员权限。",
+            PrimaryButtonText = "安装依赖",
+            CloseButtonText = "暂不安装",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            await ViewModel.InstallRuntimeAsync();
+        }
     }
 }
