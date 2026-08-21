@@ -1106,8 +1106,21 @@ fn materialize_embedded_script(name: &str, contents: &str) -> Result<PathBuf> {
     let directory = std::env::temp_dir().join("SummaryAgent4GroupChat-elevated");
     fs::create_dir_all(&directory)?;
     let path = directory.join(format!("{}-{name}.ps1", Uuid::new_v4()));
-    fs::write(&path, contents)?;
+    write_powershell_script(&path, contents)?;
     Ok(path)
+}
+
+/// Windows PowerShell 5.1 decodes BOM-less scripts with the ANSI code page
+/// (GBK on zh-CN systems), turning UTF-8 Chinese strings into mojibake that
+/// can break parsing entirely (ParserError before anything executes). Always
+/// persist generated scripts as UTF-8 with a BOM.
+fn write_powershell_script(path: &Path, contents: &str) -> Result<()> {
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    let mut bytes = Vec::with_capacity(contents.len() + 3);
+    bytes.extend_from_slice([0xEF, 0xBB, 0xBF].as_slice());
+    bytes.extend_from_slice(contents.as_bytes());
+    fs::write(path, bytes)?;
+    Ok(())
 }
 
 fn run_pip_update(paths: &AppPaths, log_path: &Path, update_package: Option<&str>) -> Result<()> {
@@ -1134,11 +1147,14 @@ fn run_application_update(paths: &AppPaths, id: &str, log_path: &Path) -> Result
     let update_dir = paths.working_dir.join("runtime").join("updates");
     fs::create_dir_all(&update_dir)?;
     let script_path = update_dir.join(format!("{id}-application-update.ps1"));
-    fs::write(
+    write_powershell_script(
         &script_path,
         r#"param([Parameter(Mandatory = $true)][string]$Destination)
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+# Emit UTF-8 so the control service captures Chinese output correctly.
+$OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $OutputEncoding
 $headers = @{ "User-Agent" = "SummaryAgent4GroupChat updater" }
 $release = Invoke-RestMethod -Uri "https://api.github.com/repos/fangbm/SummaryAgent4GroupChat/releases/latest" -Headers $headers
 $asset = @($release.assets | Where-Object { $_.name -like "SummaryAgent4GroupChat-Inno-Setup-windows-x64-*.exe" } | Select-Object -First 1)
@@ -2072,6 +2088,25 @@ mod tests {
         assert!(is_secret_key("api_keys"));
         assert!(is_secret_key("token"));
         assert!(is_secret_key("download_secret"));
+    }
+
+    #[test]
+    fn generated_scripts_are_written_with_utf8_bom() {
+        let path = std::env::temp_dir().join(format!("bom-test-{}.ps1", Uuid::new_v4()));
+        write_powershell_script(&path, "Write-Output \"中文\"").unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        assert!(String::from_utf8_lossy(&bytes[3..]).contains("中文"));
+    }
+
+    #[test]
+    fn generated_scripts_do_not_double_the_bom() {
+        let path = std::env::temp_dir().join(format!("bom-test-{}.ps1", Uuid::new_v4()));
+        write_powershell_script(&path, "\u{feff}Write-Output 1").unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(bytes.len(), 3 + "Write-Output 1".len());
     }
 
     #[cfg(windows)]
