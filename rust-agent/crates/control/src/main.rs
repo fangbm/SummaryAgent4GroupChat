@@ -43,6 +43,8 @@ const ELEVATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(300);
 // a payload that would run as administrator.
 const EMBEDDED_RUNTIME_INSTALL_SCRIPT: &str =
     include_str!("../../../../scripts/install-python-runtime.ps1");
+const EMBEDDED_WXDB_UPDATE_SCRIPT: &str = include_str!("../../../../scripts/update-wxdb.ps1");
+const EMBEDDED_PIP_UPDATE_SCRIPT: &str = include_str!("../../../../scripts/update-wx4py.ps1");
 
 #[derive(Debug, Parser)]
 #[command(name = "wechat-summary-control")]
@@ -1088,7 +1090,7 @@ fn run_logged(command: &mut Command, log_path: &Path) -> Result<()> {
 }
 
 fn run_wxdb_update(paths: &AppPaths, log_path: &Path) -> Result<()> {
-    let script = materialize_embedded_script("wxdb-update", EMBEDDED_RUNTIME_INSTALL_SCRIPT)?;
+    let script = materialize_embedded_script("wxdb-update", EMBEDDED_WXDB_UPDATE_SCRIPT)?;
     run_logged(
         Command::new("powershell.exe")
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
@@ -1096,8 +1098,7 @@ fn run_wxdb_update(paths: &AppPaths, log_path: &Path) -> Result<()> {
             .arg("-RootPath")
             .arg(&paths.working_dir)
             .arg("-ConfigPath")
-            .arg(&paths.config_path)
-            .arg("-ForceWxdbUpdate"),
+            .arg(&paths.config_path),
         log_path,
     )
 }
@@ -1127,20 +1128,19 @@ fn run_pip_update(paths: &AppPaths, log_path: &Path, update_package: Option<&str
     let package = update_package
         .filter(|package| is_safe_pip_package_name(package))
         .ok_or_else(|| anyhow!("pip update requires a valid package name"))?;
-    let config = AgentConfig::from_path(&paths.config_path)?;
-    let python = configured_program(paths, &config.wx4py.python_executable);
-    let mut command = Command::new(python);
-    command
-        .args([
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--upgrade",
-            package,
-        ])
-        .current_dir(&paths.working_dir);
-    run_logged(&mut command, log_path)
+    let script = materialize_embedded_script("pip-update", EMBEDDED_PIP_UPDATE_SCRIPT)?;
+    run_logged(
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script)
+            .arg("-RootPath")
+            .arg(&paths.working_dir)
+            .arg("-ConfigPath")
+            .arg(&paths.config_path)
+            .arg("-PackageName")
+            .arg(package),
+        log_path,
+    )
 }
 
 fn run_application_update(paths: &AppPaths, id: &str, log_path: &Path) -> Result<()> {
