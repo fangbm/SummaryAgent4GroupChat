@@ -25,10 +25,11 @@
                     <DataTemplate>
                         <Border Style="{StaticResource StatusCard}" Margin="0,0,0,10">
                             <Grid ColumnSpacing="18" RowSpacing="6">
+                                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                                 <Grid.ColumnDefinitions><ColumnDefinition Width="2*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
                                 <TextBlock Text="{Binding Name}" Style="{ThemeResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
-                                <TextBlock Grid.Column="1" Text="{Binding CurrentVersion}" TextWrapping="Wrap" />
-                                <TextBlock Grid.Column="2" Text="{Binding LatestVersion}" TextWrapping="Wrap" />
+                                <StackPanel Grid.Column="1" Spacing="2"><TextBlock Text="当前版本" Opacity="0.58" /><TextBlock Text="{Binding CurrentVersion}" TextWrapping="Wrap" /></StackPanel>
+                                <StackPanel Grid.Column="2" Spacing="2"><TextBlock Text="最新版本" Opacity="0.58" /><TextBlock Text="{Binding LatestVersion}" TextWrapping="Wrap" /></StackPanel>
                                 <TextBlock Grid.Column="3" Text="{Binding Status}" Foreground="{ThemeResource SystemControlHighlightAccentBrush}" />
                                 <TextBlock Grid.Row="1" Grid.ColumnSpan="4" Text="{Binding Detail}" Opacity="0.72" TextWrapping="Wrap" />
                             </Grid>
