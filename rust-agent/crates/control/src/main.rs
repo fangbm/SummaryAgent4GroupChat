@@ -1046,7 +1046,7 @@ async fn runtime_check(state: &ControlState) -> Result<Value> {
     let wxdb_configured = config.wx_cli.executable.trim();
     if !wxdb_configured.eq_ignore_ascii_case("builtin") {
         let wxdb = configured_program(&state.paths, wxdb_configured);
-        if run_hidden_command(&wxdb, &["--version"], &state.paths.working_dir)
+        if run_hidden_command(&wxdb, &["--help"], &state.paths.working_dir)
             .await
             .is_err()
         {
@@ -1201,17 +1201,18 @@ async fn check_wxdb_release(client: &reqwest::Client, paths: &AppPaths, configur
     }
 
     let executable = configured_program(paths, configured);
-    let current = match run_hidden_command(&executable, &["--version"], &paths.working_dir).await {
-        Ok(output) => version_from_text(&output).or_else(|| non_empty_line(&output)),
-        Err(_) => None,
-    };
+    let probe = run_hidden_command(&executable, &["--help"], &paths.working_dir).await;
+    let current = probe
+        .as_ref()
+        .ok()
+        .and_then(|output| version_from_text(output));
     let mut entry =
         check_github_release(client, "wxdb", WXDB_RELEASE_REPOSITORY, current.as_deref()).await;
-    if current.is_none() {
+    if probe.is_err() {
         entry["status"] = Value::String("not_detected".into());
         entry["update_available"] = Value::Bool(false);
         entry["detail"] = Value::String(format!(
-            "未能执行 {} --version；请检查 wxdb 路径或 PATH",
+            "未能执行 {} --help；请检查 wxdb 路径或 PATH",
             executable.display()
         ));
     }
