@@ -36,7 +36,11 @@ class GroupStateManager:
             since = until - timedelta(hours=self.settings.fixed_hours)
             mode = TimeRangeMode.FIXED_HOURS.value
         elif self.settings.mode == TimeRangeMode.TODAY:
-            since = until.replace(hour=0, minute=0, second=0, microsecond=0)
+            # "Today" follows the host's local calendar, not UTC midnight.
+            local_until = until.astimezone()
+            since = local_until.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).astimezone(UTC)
             mode = TimeRangeMode.TODAY.value
         elif last_ts:
             since = last_dt or until

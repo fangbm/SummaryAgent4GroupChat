@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 
 use crate::config::{TimeRangeConfig, TimeRangeMode};
 
@@ -25,10 +25,17 @@ impl TimeRangeCalculator {
             }
             TimeRangeMode::FixedMinutes => now - Duration::minutes(config.fixed_minutes),
             TimeRangeMode::FixedHours => now - Duration::hours(config.fixed_hours),
-            TimeRangeMode::Today => Utc
-                .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-                .single()
-                .expect("valid start of day"),
+            // "Today" must follow the host's local calendar, not UTC midnight.
+            TimeRangeMode::Today => Local
+                .from_local_datetime(
+                    &now.with_timezone(&Local)
+                        .date_naive()
+                        .and_hms_opt(0, 0, 0)
+                        .expect("valid midnight"),
+                )
+                .earliest()
+                .expect("start of local day resolves to a timestamp")
+                .with_timezone(&Utc),
         };
 
         ResolvedTimeRange {
@@ -103,7 +110,7 @@ pub fn parse_command_time_range_minutes(input: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{Local, NaiveTime, TimeZone, Utc};
 
     use super::*;
 
@@ -119,6 +126,24 @@ mod tests {
 
         let range = TimeRangeCalculator::resolve(now, None, &cfg);
         assert_eq!(range.since, now - Duration::minutes(30));
+    }
+
+    #[test]
+    fn today_mode_starts_at_local_midnight() {
+        let now = Utc::now();
+        let cfg = TimeRangeConfig {
+            mode: TimeRangeMode::Today,
+            fallback_minutes: 30,
+            fixed_minutes: 10,
+            fixed_hours: 2,
+        };
+
+        let range = TimeRangeCalculator::resolve(now, None, &cfg);
+
+        let local_since = range.since.with_timezone(&Local);
+        assert_eq!(local_since.time(), NaiveTime::MIN);
+        assert!(range.since <= now);
+        assert_eq!(range.until, now);
     }
 
     #[test]

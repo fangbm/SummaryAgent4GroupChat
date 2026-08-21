@@ -2,14 +2,40 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
+from collections.abc import Awaitable, Callable
 
 from linux_bot.config import load_bot_config
 from linux_bot.ipc_client import WindowsIpcClient
 from linux_bot.service import LinuxBotService
 from linux_bot.wx_bot_adapter import CliWxBotAdapter
 from pipeline_core.logging import configure_logging
+from pipeline_core.protocol import SignalMessage
 from pipeline_core.storage import SQLiteStore
+
+logger = logging.getLogger(__name__)
+
+
+async def supervise_receiver(
+    ipc: WindowsIpcClient,
+    handler: Callable[[SignalMessage], Awaitable[None]],
+    reconnect_seconds: int,
+) -> None:
+    """Keep the IPC receive loop alive: reconnect and restart on any exit."""
+    while True:
+        try:
+            await ipc.receive_loop(handler)
+            logger.warning("IPC receive loop ended; reconnecting in %ss", reconnect_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("IPC receive loop crashed; reconnecting in %ss", reconnect_seconds)
+        await asyncio.sleep(max(reconnect_seconds, 1))
+        try:
+            await ipc.connect()
+        except Exception:
+            logger.exception("IPC reconnect failed; will retry")
 
 
 async def run(config_path: str) -> None:
@@ -25,12 +51,22 @@ async def run(config_path: str) -> None:
         send_signal=ipc.send,
     )
     await ipc.connect()
-    receiver = asyncio.create_task(ipc.receive_loop(service.handle_worker_signal))
+    receiver = asyncio.create_task(
+        supervise_receiver(
+            ipc,
+            service.handle_worker_signal,
+            config.windows_bridge.reconnect_seconds,
+        )
+    )
     try:
         async for message in adapter.iter_messages():
             await service.handle_incoming_message(message)
     finally:
         receiver.cancel()
+        try:
+            await receiver
+        except asyncio.CancelledError:
+            pass
         await ipc.close()
 
 

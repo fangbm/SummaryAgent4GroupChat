@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Local, Utc};
 
 use crate::models::{ChatMessage, UserStat};
 
@@ -41,7 +41,7 @@ impl ChatFormatter {
             .map(|msg| {
                 format!(
                     "[{}] {}: {}",
-                    format_beijing_message_time(msg.timestamp),
+                    format_local_message_time(msg.timestamp),
                     msg.display_sender(),
                     msg.content.trim()
                 )
@@ -103,8 +103,9 @@ fn round1(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
-fn format_beijing_message_time(value: DateTime<Utc>) -> String {
-    (value + Duration::hours(8))
+fn format_local_message_time(value: DateTime<Utc>) -> String {
+    value
+        .with_timezone(&Local)
         .format("%m-%d %H:%M")
         .to_string()
 }
@@ -118,7 +119,7 @@ fn is_text_message_type(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{Local, TimeZone, Utc};
 
     use super::*;
 
@@ -132,6 +133,14 @@ mod tests {
         }
     }
 
+    fn local_stamp(ts: i64) -> String {
+        Utc.timestamp_opt(ts, 0)
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%m-%d %H:%M")
+            .to_string()
+    }
+
     #[test]
     fn formats_chat_records_and_stats() {
         let formatted = ChatFormatter::format(&[
@@ -143,7 +152,7 @@ mod tests {
         assert!(formatted.merged_input.contains("[CHAT_RECORDS]"));
         assert!(formatted
             .merged_input
-            .contains("[05-23 19:45] Alice: 第一条"));
+            .contains(format!("[{}] Alice: 第一条", local_stamp(1_716_464_700)).as_str()));
         assert!(formatted.merged_input.contains("[USER_STATS]"));
         assert_eq!(formatted.total_messages, 3);
         assert_eq!(formatted.user_stats[0].user, "Alice");

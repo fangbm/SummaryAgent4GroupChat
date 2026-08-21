@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -8,6 +9,8 @@ import websockets
 
 from pipeline_core.auth import authorization_header
 from pipeline_core.protocol import SignalMessage
+
+logger = logging.getLogger(__name__)
 
 
 class WindowsIpcClient:
@@ -35,9 +38,27 @@ class WindowsIpcClient:
         await self._connection.send(signal.model_dump_json())
 
     async def receive_loop(self, handler: Callable[[SignalMessage], Awaitable[None]]) -> None:
+        """Consume worker signals until the connection closes.
+
+        Malformed frames and handler failures are logged and skipped so one bad
+        message cannot silently terminate the whole bot.
+        """
         if self._connection is None:
             await self.connect()
         assert self._connection is not None
         async for raw in self._connection:
-            payload = json.loads(raw)
-            await handler(SignalMessage.model_validate(payload))
+            try:
+                payload = json.loads(raw)
+                signal = SignalMessage.model_validate(payload)
+            except Exception:
+                preview = raw if isinstance(raw, str) else str(raw)
+                logger.warning("dropping malformed IPC frame: %.200s", preview)
+                continue
+            try:
+                await handler(signal)
+            except Exception:
+                logger.exception(
+                    "worker signal handler failed for type=%s request=%s",
+                    signal.type,
+                    getattr(signal.payload, "get", lambda *_: None)("request_id"),
+                )
