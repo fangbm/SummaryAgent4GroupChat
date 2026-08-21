@@ -13,7 +13,9 @@ from windows_worker.wx_cli_adapter import FakeWxClient
 
 
 def test_windows_trigger_matcher_filters_and_matches_prefix() -> None:
-    config = WorkerConfig(security=SecuritySettings(ipc_token="token", download_secret="download"))
+    config = WorkerConfig(
+        security=SecuritySettings(ipc_token="x8Kp2vQm5tRw9zLc", download_secret="y3Nf7bHd1sJg6vKa")
+    )
     config.wechat.listen.whitelist_groups = ["AI交流群"]
     config.wechat.listen.blacklist_users = ["wxid_bot"]
     matcher = WindowsTriggerMatcher(config.wechat.listen)
@@ -37,7 +39,9 @@ def test_windows_trigger_matcher_filters_and_matches_prefix() -> None:
 
 def test_windows_time_range_uses_last_trigger(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "worker.sqlite3")
-    config = WorkerConfig(security=SecuritySettings(ipc_token="token", download_secret="download"))
+    config = WorkerConfig(
+        security=SecuritySettings(ipc_token="x8Kp2vQm5tRw9zLc", download_secret="y3Nf7bHd1sJg6vKa")
+    )
     manager = WindowsTimeRangeManager(store, config.wechat.time_range)
 
     since, until, mode, last_trigger = manager.on_trigger("g", 1_769_000_000)
@@ -51,8 +55,28 @@ def test_windows_time_range_uses_last_trigger(tmp_path) -> None:
     assert second_last_trigger == second_since
 
 
+def test_windows_time_range_today_starts_at_local_midnight(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "worker.sqlite3")
+    config = WorkerConfig(
+        security=SecuritySettings(ipc_token="x8Kp2vQm5tRw9zLc", download_secret="y3Nf7bHd1sJg6vKa")
+    )
+    config.wechat.time_range.mode = "today"
+    manager = WindowsTimeRangeManager(store, config.wechat.time_range)
+    now = datetime.now(UTC)
+    current_ts = int(now.timestamp())
+
+    since, until, mode, _ = manager.on_trigger("g", current_ts)
+
+    local_midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    assert mode == "today"
+    assert since == local_midnight.astimezone(UTC)
+    assert until == datetime.fromtimestamp(current_ts, tz=UTC)
+
+
 async def test_windows_single_host_service_processes_and_replies_text(tmp_path) -> None:
-    config = WorkerConfig(security=SecuritySettings(ipc_token="token", download_secret="download"))
+    config = WorkerConfig(
+        security=SecuritySettings(ipc_token="x8Kp2vQm5tRw9zLc", download_secret="y3Nf7bHd1sJg6vKa")
+    )
     config.image_gen.enabled = False
     config.wechat.listen.whitelist_groups = ["g"]
     store = SQLiteStore(tmp_path / "worker.sqlite3")

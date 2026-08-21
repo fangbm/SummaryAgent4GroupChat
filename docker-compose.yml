@@ -6,6 +6,12 @@ services:
       - ./:/app
     env_file:
       - .env
-    command: ["python", "-m", "linux_bot.main", "--config", "config/bot.yaml"]
+    # The slim base image has no project dependencies; install them (plus the
+    # package itself so `python -m linux_bot.main` resolves) before starting.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        pip install --no-cache-dir -e . && \
+        python -m linux_bot.main --config config/bot.yaml
     restart: unless-stopped
-

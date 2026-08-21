@@ -14,6 +14,35 @@ T = TypeVar("T", bound=BaseModel)
 
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-(.*?))?\}")
 
+INSECURE_SECRET_VALUES = frozenset(
+    {
+        "",
+        "change-me",
+        "change-me-download",
+        "changeme",
+        "changeme-download",
+        "secret",
+        "password",
+        "token",
+    }
+)
+
+
+def validate_secret(value: str, *, field: str) -> str:
+    """Reject empty strings and well-known placeholder secrets (fail closed).
+
+    Raises ``ValueError`` so pydantic field validators wrap it into a
+    ``ValidationError``, which :func:`load_settings` maps to
+    ``PipelineError(CONFIG_INVALID)``.
+    """
+    normalized = value.strip().lower()
+    if normalized in INSECURE_SECRET_VALUES:
+        raise ValueError(
+            f"{field} is set to an insecure placeholder ({value!r}); "
+            "generate a strong random value and provide it via its environment variable"
+        )
+    return value
+
 
 def _parse_env_scalar(value: str) -> Any:
     try:

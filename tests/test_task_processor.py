@@ -24,7 +24,7 @@ class BrokenImageClient:
 
 async def test_task_processor_success_with_placeholder_image(tmp_path) -> None:
     config = WorkerConfig(
-        security=SecuritySettings(ipc_token="token", download_secret="download"),
+        security=SecuritySettings(ipc_token="x8Kp2vQm5tRw9zLc", download_secret="y3Nf7bHd1sJg6vKa"),
     )
     config.file_transfer.output_dir = str(tmp_path / "out")
     config.file_transfer.public_base_url = "http://worker/images"
@@ -70,7 +70,9 @@ async def test_task_processor_success_with_placeholder_image(tmp_path) -> None:
 
 
 async def test_task_processor_blocks_sensitive_group_for_cloud_llm(tmp_path) -> None:
-    config = WorkerConfig(security=SecuritySettings(ipc_token="token", download_secret="download"))
+    config = WorkerConfig(
+        security=SecuritySettings(ipc_token="x8Kp2vQm5tRw9zLc", download_secret="y3Nf7bHd1sJg6vKa")
+    )
     config.privacy.sensitive_groups = ["g"]
     store = SQLiteStore(tmp_path / "worker.sqlite3")
     processor = TaskProcessor(
@@ -104,7 +106,9 @@ async def test_task_processor_blocks_sensitive_group_for_cloud_llm(tmp_path) -> 
 
 
 async def test_task_processor_degrades_to_text_when_image_generation_fails(tmp_path) -> None:
-    config = WorkerConfig(security=SecuritySettings(ipc_token="token", download_secret="download"))
+    config = WorkerConfig(
+        security=SecuritySettings(ipc_token="x8Kp2vQm5tRw9zLc", download_secret="y3Nf7bHd1sJg6vKa")
+    )
     store = SQLiteStore(tmp_path / "worker.sqlite3")
     processor = TaskProcessor(
         config=config,

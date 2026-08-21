@@ -39,7 +39,11 @@ class WindowsTimeRangeManager:
             since = until - timedelta(hours=self.settings.fixed_hours)
             mode = "fixed_hours"
         elif self.settings.mode == "today":
-            since = until.replace(hour=0, minute=0, second=0, microsecond=0)
+            # "Today" follows the host's local calendar, not UTC midnight.
+            local_until = until.astimezone()
+            since = local_until.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).astimezone(UTC)
             mode = "today"
         elif last_dt:
             since = last_dt

@@ -1,0 +1,64 @@
+name: Package Smoke
+
+# Full installer build + silent-install smoke check. Runs after merges to
+# main (and on demand) instead of on every pull request: the release-profile
+# rebuild and lzma2 packaging add ~10 minutes that PR checks do not need.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: package-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-agent
+          prefix-key: package-smoke
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+      - name: Build installer and smoke check
+        shell: pwsh
+        run: |
+          .\scripts\package-windows-installer.ps1
+          $installer = Get-ChildItem .\dist -File -Filter 'SummaryAgent4GroupChat-Inno-Setup-windows-x64-*.exe' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $installer -or $installer.Length -lt 1MB) {
+            throw 'Inno installer was not produced or is unexpectedly small.'
+          }
+          # /CURRENTUSER skips elevation: the runner shell is non-elevated and
+          # a silent admin install would exit immediately without installing.
+          # Start-Process -Wait is required: PowerShell does not wait for
+          # GUI-subsystem executables invoked with &, so $LASTEXITCODE would
+          # still hold a stale value while the installer runs in background.
+          $installLog = Join-Path $env:TEMP 'summary-agent-smoke-install.log'
+          Remove-Item $installLog -ErrorAction SilentlyContinue
+          $proc = Start-Process -FilePath $installer.FullName -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS',
+            '/CURRENTUSER', "/LOG=$installLog"
+          )
+          if ($proc.ExitCode -ne 0) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
+            throw "Silent installer smoke test failed with exit code $($proc.ExitCode)."
+          }
+          $installedExe = Join-Path $env:LOCALAPPDATA 'SummaryAgent4GroupChat\SummaryAgent4GroupChat.exe'
+          if (-not (Test-Path -LiteralPath $installedExe)) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
+            throw "Installer did not place the WinUI executable at $installedExe."
+          }
+          Write-Host "Installer smoke check passed: $($installer.FullName)"

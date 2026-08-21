@@ -13,7 +13,7 @@ from pipeline_core.storage import SQLiteStore
 
 
 async def test_linux_service_tracks_task_and_sends_text_fallback(tmp_path) -> None:
-    config = LinuxBotConfig(windows_bridge=WindowsBridgeSettings(token="token"))
+    config = LinuxBotConfig(windows_bridge=WindowsBridgeSettings(token="x8Kp2vQm5tRw9zLc"))
     store = SQLiteStore(tmp_path / "linux.sqlite3")
     adapter = FakeWxBotAdapter()
     sent: list[SignalMessage] = []

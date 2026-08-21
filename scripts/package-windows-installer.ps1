@@ -128,6 +128,9 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
+; Lets automated environments (CI smoke test) pass /CURRENTUSER so the
+; installer runs without elevation while interactive installs stay admin.
+PrivilegesRequiredOverridesAllowed=commandline
 ArchitecturesAllowed=x64compatible
 UninstallDisplayIcon={app}\SummaryAgent4GroupChat.exe
 SetupLogging=yes

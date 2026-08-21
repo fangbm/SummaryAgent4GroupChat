@@ -1,8 +1,14 @@
 name: CI
 
+# Lightweight checks for pull requests. Full packaging + installer smoke test
+# lives in package-smoke.yml and runs on main.
 on:
-  push:
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows:
@@ -12,6 +18,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
@@ -19,6 +27,9 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-agent
       - name: Install Python checks
         shell: pwsh
         run: |
@@ -36,34 +47,13 @@ jobs:
         run: |
           cargo test --workspace --exclude wechat-summary-gui
           cargo check -p wechat-summary-gui
-      - name: WinUI build and tests
+      - name: WinUI tests
         shell: pwsh
-        run: |
-          dotnet test .\windows-ui\SummaryAgent4GroupChat.WinUI.sln -c Release -p:Platform=x64
-          dotnet publish .\windows-ui\src\SummaryAgent4GroupChat.WinUI\SummaryAgent4GroupChat.WinUI.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64
-      - name: Inno installer build and smoke check
-        shell: pwsh
-        run: |
-          choco install innosetup --yes --no-progress
-          .\scripts\package-windows-installer.ps1
-          $installer = Get-ChildItem .\dist -File -Filter 'SummaryAgent4GroupChat-Inno-Setup-windows-x64-*.exe' |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $installer -or $installer.Length -lt 1MB) {
-            throw 'Inno installer was not produced or is unexpectedly small.'
-          }
-          & $installer.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS
-          if ($LASTEXITCODE -ne 0) {
-            throw "Silent installer smoke test failed with exit code $LASTEXITCODE."
-          }
-          $installedExe = Join-Path $env:LOCALAPPDATA 'SummaryAgent4GroupChat\SummaryAgent4GroupChat.exe'
-          if (-not (Test-Path -LiteralPath $installedExe)) {
-            throw "Installer did not place the WinUI executable at $installedExe."
-          }
-          Write-Host "Installer smoke check passed: $($installer.FullName)"
+        run: dotnet test .\windows-ui\SummaryAgent4GroupChat.WinUI.sln -c Release -p:Platform=x64
       - name: Python lint and tests
         shell: pwsh
         run: |
           .\.venv\Scripts\python.exe -m ruff check .
           .\.venv\Scripts\python.exe -m mypy src
-          .\.venv\Scripts\python.exe -m pytest -q
+          .\.venv\Scripts\python.exe -m coverage run -m pytest -q
+          .\.venv\Scripts\python.exe -m coverage report --fail-under=60

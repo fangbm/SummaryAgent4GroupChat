@@ -15,6 +15,8 @@ edition = "2021"
 license = "MIT"
 publish = false
 version = "0.1.4"
+# usize::is_multiple_of and other std APIs used by the workspace require 1.87.
+rust-version = "1.87"
 
 [workspace.dependencies]
 anyhow = "1.0"

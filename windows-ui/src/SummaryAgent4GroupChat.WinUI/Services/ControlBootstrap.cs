@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using SummaryAgent4GroupChat.WinUI.Models;
 
@@ -6,6 +8,8 @@ namespace SummaryAgent4GroupChat.WinUI.Services;
 
 public static class ControlBootstrap
 {
+    public const string TokenEnvironmentVariable = "SUMMARY_AGENT_CONTROL_TOKEN";
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
 
     public static async Task<ControlClient> ConnectAsync(CancellationToken cancellationToken)
@@ -25,7 +29,7 @@ public static class ControlBootstrap
             Convert.ToHexString(Guid.NewGuid().ToByteArray()),
             configPath,
             workingDirectory);
-        await File.WriteAllTextAsync(sessionPath, JsonSerializer.Serialize(session, JsonOptions), cancellationToken);
+        WriteSessionFile(sessionPath, JsonSerializer.Serialize(session, JsonOptions));
         StartControl(session);
         for (var attempt = 0; attempt < 24; attempt++)
         {
@@ -86,13 +90,38 @@ public static class ControlBootstrap
         };
         startInfo.ArgumentList.Add("--pipe");
         startInfo.ArgumentList.Add(session.Pipe);
-        startInfo.ArgumentList.Add("--token");
-        startInfo.ArgumentList.Add(session.Token);
+        // The token travels via the environment: command lines are visible to
+        // every local process through Win32 process introspection.
+        startInfo.EnvironmentVariables[TokenEnvironmentVariable] = session.Token;
         startInfo.ArgumentList.Add("--config");
         startInfo.ArgumentList.Add(session.ConfigPath);
         startInfo.ArgumentList.Add("--working-dir");
         startInfo.ArgumentList.Add(session.WorkingDirectory);
         Process.Start(startInfo);
+    }
+
+    private static void WriteSessionFile(string path, string contents)
+    {
+        File.WriteAllText(path, contents);
+        RestrictToCurrentUser(path);
+    }
+
+    private static void RestrictToCurrentUser(string path)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var fileInfo = new FileInfo(path);
+        var security = fileInfo.GetAccessControl();
+        var identity = WindowsIdentity.GetCurrent();
+        security.SetAccessRuleProtection(true, false);
+        security.AddAccessRule(new FileSystemAccessRule(
+            identity.User!,
+            FileSystemRights.FullControl,
+            AccessControlType.Allow));
+        fileInfo.SetAccessControl(security);
     }
 
     private static string ResolveConfigPath()
