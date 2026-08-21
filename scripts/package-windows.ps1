@@ -18,9 +18,10 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 # Keep transient restore data beside the project rather than filling the system drive.
 New-Item -ItemType Directory -Force -Path $BuildCacheDir | Out-Null
 $env:NUGET_PACKAGES = Join-Path $BuildCacheDir "nuget-packages"
+$env:NUGET_HTTP_CACHE_PATH = Join-Path $BuildCacheDir "nuget-http-cache"
 $env:TEMP = Join-Path $BuildCacheDir "temp"
 $env:TMP = $env:TEMP
-New-Item -ItemType Directory -Force -Path $env:NUGET_PACKAGES, $env:TEMP | Out-Null
+New-Item -ItemType Directory -Force -Path $env:NUGET_PACKAGES, $env:NUGET_HTTP_CACHE_PATH, $env:TEMP | Out-Null
 
 if (-not $SkipBuild) {
     Push-Location $RustRoot
