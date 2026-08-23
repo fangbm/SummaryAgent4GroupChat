@@ -45,7 +45,11 @@ use crate::platform::{
     PlatformWorker,
 };
 
-const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 15;
+// wx4py can replay an already observed command after the first pipeline has
+// completed, and those replayed events do not always include a stable ID.
+// Keep this long enough to cover that delayed delivery without treating a
+// normal later command as the same event.
+const TRIGGER_DEDUPE_WINDOW_SECONDS: i64 = 2 * 60;
 const TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS: i64 = 5;
 const TRIGGER_DEDUPE_RETENTION_SECONDS: i64 = 2 * 60 * 60;
 const WXDB_RECOVERED_TRIGGER_REALTIME_DEDUPE_SECONDS: i64 = 30 * 60;
@@ -1854,22 +1858,20 @@ impl RecentTriggerAttempts {
         let process_cutoff = observed_at - Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS);
         let key = trigger_attempt_key(trigger);
         if let Some(attempts) = self.attempts_by_key.get(&key) {
-            let duplicate = if let Some(stable_id) = stable_id {
-                attempts.iter().any(|attempt| {
-                    attempt
-                        .stable_id
-                        .as_deref()
-                        .is_some_and(|previous| stable_ids_match(previous, stable_id))
-                })
-            } else {
-                attempts
-                    .iter()
-                    .filter(|attempt| attempt.stable_id.is_none())
-                    .any(|attempt| {
+            let duplicate = attempts.iter().any(|attempt| {
+                match (stable_id, attempt.stable_id.as_deref()) {
+                    // When both transports provide stable IDs, distinct IDs
+                    // represent distinct commands even if they arrive close together.
+                    (Some(current), Some(previous)) => stable_ids_match(previous, current),
+                    // wx4py realtime events can omit their ID while wxdb has one
+                    // (and vice versa). Fall back to the room/content key and a
+                    // bounded arrival-time window so the late replay is ignored.
+                    _ => {
                         attempt.observed_at >= process_cutoff
                             || event_times_close(attempt.event_at, event_at)
-                    })
-            };
+                    }
+                }
+            });
             if duplicate {
                 return true;
             }
@@ -6544,6 +6546,32 @@ mod tests {
             &trigger,
             event_at + Duration::seconds(1),
             delayed_observed_at
+        ));
+    }
+
+    #[test]
+    fn recent_trigger_attempts_rejects_missing_id_replay_after_pipeline_completion() {
+        let mut attempts = RecentTriggerAttempts::default();
+        let trigger = TriggerMatch {
+            room_id: "paper2galgame用户群2".into(),
+            trigger_symbol: "/总结".into(),
+            trigger_content: "/总结 12h".into(),
+        };
+        let first_event_at = Utc.with_ymd_and_hms(2026, 8, 23, 5, 28, 3).unwrap();
+        let first_observed_at = first_event_at + Duration::seconds(3);
+        let delayed_observed_at = first_observed_at + Duration::seconds(86);
+
+        assert!(!attempts.is_duplicate_at_with_id(
+            &trigger,
+            Some("wxdb:12345"),
+            first_event_at,
+            first_observed_at,
+        ));
+        assert!(attempts.is_duplicate_at_with_id(
+            &trigger,
+            None,
+            delayed_observed_at,
+            delayed_observed_at,
         ));
     }
 
