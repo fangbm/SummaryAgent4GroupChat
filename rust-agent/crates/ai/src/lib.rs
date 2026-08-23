@@ -2992,6 +2992,9 @@ impl OpenAiImageClient {
         payload.insert("model".into(), json!(self.model));
         payload.insert("prompt".into(), json!(prompt));
         payload.insert("n".into(), json!(1));
+        // Image generation expects one complete JSON result or an async task ID.
+        // Do not let provider defaults turn this endpoint into an SSE response.
+        payload.insert("stream".into(), json!(false));
 
         if !self.config.size.trim().is_empty() {
             payload.insert("size".into(), json!(self.config.size));
@@ -4174,6 +4177,7 @@ mod tests {
         assert_eq!(payload["model"], "gpt-image-2");
         assert_eq!(payload["prompt"], "画一张群聊总结海报");
         assert_eq!(payload["n"], 1);
+        assert_eq!(payload["stream"], false);
         assert_eq!(payload["size"], "16:9");
         assert_eq!(payload["resolution"], "2k");
         assert!(payload.get("quality").is_none());
