@@ -221,6 +221,13 @@ impl OpenAiCompatibleLlm {
         self
     }
 
+    /// Overrides the transport mode while preserving the provider, key pool,
+    /// trace configuration, and all other completion settings.
+    pub fn with_streaming(mut self, stream: bool) -> Self {
+        self.config.stream = stream;
+        self
+    }
+
     pub fn with_trace_dir(mut self, trace_dir: impl Into<PathBuf>) -> Self {
         self.trace_dir = Some(trace_dir.into());
         self
@@ -273,9 +280,7 @@ impl OpenAiCompatibleLlm {
             max_tokens,
         );
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
-        if self.config.stream {
-            payload["stream"] = Value::Bool(true);
-        }
+        set_chat_completion_stream(&mut payload, self.config.stream);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         let mut thinking_fallback_used = false;
@@ -2336,6 +2341,10 @@ fn chat_completion_payload(
         }
     }
     payload
+}
+
+fn set_chat_completion_stream(payload: &mut Value, stream: bool) {
+    payload["stream"] = Value::Bool(stream);
 }
 
 fn image_caption_payload(
@@ -4714,6 +4723,15 @@ reasoning_effort = "none"
             chat_completion_payload("model-a", "system prompt", "user prompt", 0.3, Some(2000));
 
         assert_eq!(payload["max_tokens"], json!(2000));
+    }
+
+    #[test]
+    fn chat_completion_stream_mode_overrides_request_body_override() {
+        let mut payload = json!({"stream": true});
+
+        set_chat_completion_stream(&mut payload, false);
+
+        assert_eq!(payload["stream"], false);
     }
 
     #[test]
