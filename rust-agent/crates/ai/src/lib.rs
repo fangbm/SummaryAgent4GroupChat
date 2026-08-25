@@ -125,6 +125,13 @@ impl ChatCompletionStreamError {
     fn into_ai_error(self) -> AiError {
         AiError::Stream(self.to_string())
     }
+
+    /// A provider that accepts streaming but fails while producing an SSE body
+    /// often still succeeds with an ordinary JSON response. Try that once
+    /// before spending the normal retry budget on another broken stream.
+    fn supports_non_stream_fallback(&self) -> bool {
+        true
+    }
 }
 
 impl std::fmt::Display for ChatCompletionStreamError {
@@ -280,10 +287,12 @@ impl OpenAiCompatibleLlm {
             max_tokens,
         );
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
-        set_chat_completion_stream(&mut payload, self.config.stream);
+        let mut use_streaming = self.config.stream;
+        set_chat_completion_stream(&mut payload, use_streaming);
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         let mut thinking_fallback_used = false;
+        let mut stream_fallback_used = false;
         let permit = self.key_pool.acquire().await;
         let key_index = permit.key_index();
         'request_variants: loop {
@@ -301,7 +310,8 @@ impl OpenAiCompatibleLlm {
                     user_chars = user_content.chars().count(),
                     max_tokens = ?max_tokens,
                     timeout_seconds = self.config.timeout_seconds,
-                    stream = self.config.stream,
+                    stream = use_streaming,
+                    stream_fallback = stream_fallback_used,
                     stream_first_event_timeout_seconds = self.config.stream_first_event_timeout_seconds,
                     stream_idle_timeout_seconds = self.config.stream_idle_timeout_seconds,
                     attempt,
@@ -318,9 +328,7 @@ impl OpenAiCompatibleLlm {
                     .json(&payload);
                 let response = match send_chat_completion_request(
                     request,
-                    self.config
-                        .stream
-                        .then(|| Duration::from_secs(stream_first_event_timeout_seconds)),
+                    use_streaming.then(|| Duration::from_secs(stream_first_event_timeout_seconds)),
                 )
                 .await
                 {
@@ -473,7 +481,7 @@ impl OpenAiCompatibleLlm {
                     "LLM chat completion HTTP request completed"
                 );
 
-                let (body, response) = if self.config.stream && response_is_sse(&response) {
+                let (body, response) = if use_streaming && response_is_sse(&response) {
                     let remaining_first_event_timeout =
                         Duration::from_secs(stream_first_event_timeout_seconds)
                             .saturating_sub(started.elapsed());
@@ -487,10 +495,13 @@ impl OpenAiCompatibleLlm {
                         Ok(streamed) => (streamed.raw_body, streamed.response),
                         Err(error) => {
                             let elapsed_ms = started.elapsed().as_millis();
-                            let retry = attempt < max_attempts
+                            let fallback_to_non_stream =
+                                !stream_fallback_used && error.supports_non_stream_fallback();
+                            let retry_after_stream_failure = attempt < max_attempts
                                 && error.is_retryable()
                                 && retry_budget.allows(http_retry_delay_ms(attempt));
-                            let retry_after_ms = if retry {
+                            let retry = fallback_to_non_stream || retry_after_stream_failure;
+                            let retry_after_ms = if retry_after_stream_failure {
                                 http_retry_delay_ms(attempt)
                             } else {
                                 0
@@ -521,9 +532,22 @@ impl OpenAiCompatibleLlm {
                                 max_attempts,
                                 retry,
                                 retry_after_ms,
+                                fallback = if fallback_to_non_stream { "non_stream" } else { "none" },
                                 error = %error_message,
                                 "LLM chat completion stream failed"
                             );
+                            if fallback_to_non_stream {
+                                info!(
+                                    trace_id = %trace_id,
+                                    attempt,
+                                    max_attempts,
+                                    "LLM chat completion retrying once with streaming disabled"
+                                );
+                                use_streaming = false;
+                                stream_fallback_used = true;
+                                set_chat_completion_stream(&mut payload, false);
+                                continue 'request_variants;
+                            }
                             if retry {
                                 notify_retry(
                                     &self.retry_notifier,
@@ -3532,7 +3556,7 @@ struct SseChatCompletionAccumulator {
     pending: Vec<u8>,
     content: String,
     finish_reason: Option<String>,
-    received_data: bool,
+    received_content: bool,
     completed: bool,
 }
 
@@ -3543,7 +3567,7 @@ impl SseChatCompletionAccumulator {
             pending: Vec::new(),
             content: String::new(),
             finish_reason: None,
-            received_data: false,
+            received_content: false,
             completed: false,
         }
     }
@@ -3575,7 +3599,6 @@ impl SseChatCompletionAccumulator {
             return Ok(());
         }
 
-        self.received_data = true;
         let data = data.join("\n");
         if data.trim() == "[DONE]" {
             self.completed = true;
@@ -3587,6 +3610,7 @@ impl SseChatCompletionAccumulator {
         })?;
         if let Some(content) = content_value_to_text(event.pointer("/choices/0/delta/content")) {
             self.content.push_str(&content);
+            self.received_content = true;
         }
         if let Some(finish_reason) = event
             .pointer("/choices/0/finish_reason")
@@ -3618,7 +3642,7 @@ async fn collect_streamed_chat_completion(
 ) -> Result<StreamedChatCompletion, ChatCompletionStreamError> {
     let mut accumulator = SseChatCompletionAccumulator::new();
     loop {
-        let wait_timeout = if accumulator.received_data {
+        let wait_timeout = if accumulator.received_content {
             idle_timeout
         } else {
             first_event_timeout
@@ -3627,7 +3651,7 @@ async fn collect_streamed_chat_completion(
             Ok(Ok(Some(chunk))) => chunk,
             Ok(Ok(None)) => return Err(ChatCompletionStreamError::EndedWithoutDone),
             Ok(Err(error)) => return Err(ChatCompletionStreamError::Read(error)),
-            Err(_) if accumulator.received_data => {
+            Err(_) if accumulator.received_content => {
                 return Err(ChatCompletionStreamError::IdleTimeout(
                     idle_timeout.as_secs(),
                 ))
@@ -4623,7 +4647,7 @@ data: {"type":"transcript.text.delta","delta":"文字"}
         accumulator.push_chunk(first.as_bytes()).unwrap();
         accumulator.push_chunk(second.as_bytes()).unwrap();
 
-        assert!(accumulator.received_data);
+        assert!(accumulator.received_content);
         assert!(accumulator.completed);
         let streamed = accumulator.into_streamed_response();
         assert_eq!(
@@ -4640,8 +4664,29 @@ data: {"type":"transcript.text.delta","delta":"文字"}
         let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
         accumulator.push_chunk(partial.as_bytes()).unwrap();
 
-        assert!(accumulator.received_data);
+        assert!(accumulator.received_content);
         assert!(!accumulator.completed);
+    }
+
+    #[test]
+    fn streamed_reasoning_does_not_count_as_first_visible_token() {
+        let mut accumulator = SseChatCompletionAccumulator::new();
+        let reasoning = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"internal\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"more internal\"},\"finish_reason\":null}]}\n\n"
+        );
+
+        accumulator.push_chunk(reasoning.as_bytes()).unwrap();
+
+        assert!(!accumulator.received_content);
+        assert!(accumulator.content.is_empty());
+    }
+
+    #[test]
+    fn all_sse_stream_failures_are_eligible_for_one_non_stream_fallback() {
+        assert!(ChatCompletionStreamError::EndedWithoutDone.supports_non_stream_fallback());
+        assert!(ChatCompletionStreamError::FirstEventTimeout(30).supports_non_stream_fallback());
+        assert!(ChatCompletionStreamError::IdleTimeout(30).supports_non_stream_fallback());
     }
 
     #[test]
