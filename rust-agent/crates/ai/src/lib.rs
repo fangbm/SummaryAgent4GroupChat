@@ -296,7 +296,6 @@ impl OpenAiCompatibleLlm {
         let permit = self.key_pool.acquire().await;
         let key_index = permit.key_index();
         'request_variants: loop {
-            let retry_budget = RetryBudget::new();
             for attempt in 1..=max_attempts {
                 let trace_id = Uuid::new_v4();
                 let started = Instant::now();
@@ -334,6 +333,10 @@ impl OpenAiCompatibleLlm {
                 {
                     Ok(response) => response,
                     Err(error) => {
+                        // This budget is for backoff time, not time already spent
+                        // waiting for the provider. Start it after the request so a
+                        // 120-second timeout does not silently consume all retries.
+                        let retry_budget = RetryBudget::new();
                         let elapsed_ms = started.elapsed().as_millis();
                         let retry = attempt < max_attempts
                             && error.is_retryable()
@@ -397,6 +400,7 @@ impl OpenAiCompatibleLlm {
                     });
                     let snippet = truncate_for_log(&body, 500);
                     let response_for_log = full_response_for_log(&body);
+                    let retry_budget = RetryBudget::new();
                     let retry_candidate = attempt < max_attempts
                         && should_retry_chat_completion_failure(status, &snippet)
                         && retry_budget.allows(http_retry_delay_ms_for_status(
@@ -494,6 +498,7 @@ impl OpenAiCompatibleLlm {
                     {
                         Ok(streamed) => (streamed.raw_body, streamed.response),
                         Err(error) => {
+                            let retry_budget = RetryBudget::new();
                             let elapsed_ms = started.elapsed().as_millis();
                             let fallback_to_non_stream =
                                 !stream_fallback_used && error.supports_non_stream_fallback();
