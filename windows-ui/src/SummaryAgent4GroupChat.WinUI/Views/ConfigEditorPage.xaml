@@ -86,12 +86,36 @@
                     <StackPanel Orientation="Horizontal" Spacing="20"><CheckBox Content="启用图片生成" IsChecked="{Binding ImageGenerationEnabled, Mode=TwoWay}" /><CheckBox Content="启用图片转述" IsChecked="{Binding ImageCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用视频转述" IsChecked="{Binding VideoCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用语音转写" IsChecked="{Binding VoiceTranscriptionEnabled, Mode=TwoWay}" /></StackPanel>
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                        <StackPanel Spacing="5"><TextBlock Text="图片 API Key 环境变量" /><TextBox Text="{Binding ImageApiKeyEnvironment, Mode=TwoWay}" /></StackPanel>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="图片接口类型" /><TextBox Text="{Binding ImageProvider, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片模型名称" /><TextBox Text="{Binding ImageModel, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="图片 Base URL" /><TextBox Text="{Binding ImageBaseUrl, Mode=TwoWay}" /></StackPanel>
-                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片超时（秒）" /><NumberBox Value="{Binding ImageTimeoutSeconds, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片 API Key 环境变量" /><TextBox Text="{Binding ImageApiKeyEnvironment, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="2" Spacing="5"><TextBlock Text="多 Key 环境变量（逗号或换行分隔）" /><TextBox Text="{Binding ImageApiKeysEnvironment, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="2" Grid.Column="1" Spacing="5"><TextBlock Text="模型环境变量（模型名称留空时使用）" /><TextBox Text="{Binding ImageModelEnvironment, Mode=TwoWay}" /></StackPanel>
                     </Grid>
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="Base URL 环境变量（Base URL 留空时使用）" /><TextBox Text="{Binding ImageBaseUrlEnvironment, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片尺寸" /><TextBox Text="{Binding ImageSize, Mode=TwoWay}" PlaceholderText="例如 2:3 或 1024x1024" /></StackPanel>
+                        <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="图片分辨率（优先于质量，留空禁用）" /><TextBox Text="{Binding ImageResolution, Mode=TwoWay}" PlaceholderText="例如 1k 或 2k" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片质量（分辨率留空时使用）" /><TextBox Text="{Binding ImageQuality, Mode=TwoWay}" PlaceholderText="例如 high" /></StackPanel>
+                    </Grid>
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="图片超时（秒）" /><NumberBox Value="{Binding ImageTimeoutSeconds, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="5xx 重试次数" /><NumberBox Value="{Binding ImageRetryAttempts, Mode=TwoWay}" Minimum="0" SpinButtonPlacementMode="Compact" /></StackPanel>
+                        <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="每 Key 最大并发（0 为不限）" /><NumberBox Value="{Binding ImageMaxConcurrentPerKey, Mode=TwoWay}" Minimum="0" SpinButtonPlacementMode="Compact" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="首次任务轮询延迟（秒）" /><NumberBox Value="{Binding ImagePollInitialDelaySeconds, Mode=TwoWay}" Minimum="0" SpinButtonPlacementMode="Compact" /></StackPanel>
+                    </Grid>
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="任务轮询间隔（秒）" /><NumberBox Value="{Binding ImagePollIntervalSeconds, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel>
+                        <CheckBox Grid.Column="1" Content="允许接口官方回退" IsChecked="{Binding ImageOfficialFallback, Mode=TwoWay}" VerticalAlignment="Bottom" />
+                    </Grid>
+                    <StackPanel Spacing="5"><TextBlock Text="图片提示词模板（可用 {summary}，留空使用默认）" /><TextBox Text="{Binding ImagePromptTemplate, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="72" /></StackPanel>
                 </StackPanel>
 
                 <Expander Header="高级配置（请求体覆写、提示词与未覆盖字段）" IsExpanded="False">
