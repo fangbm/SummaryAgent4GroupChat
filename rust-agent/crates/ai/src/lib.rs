@@ -191,6 +191,7 @@ pub struct OpenAiCompatibleLlm {
     retry_notifier: Option<RetryNotifier>,
     trace_dir: Option<PathBuf>,
     trace_context: Option<AiTraceContext>,
+    force_disable_thinking: bool,
 }
 
 impl OpenAiCompatibleLlm {
@@ -220,6 +221,7 @@ impl OpenAiCompatibleLlm {
             retry_notifier: None,
             trace_dir: None,
             trace_context: None,
+            force_disable_thinking: false,
         })
     }
 
@@ -232,6 +234,14 @@ impl OpenAiCompatibleLlm {
     /// trace configuration, and all other completion settings.
     pub fn with_streaming(mut self, stream: bool) -> Self {
         self.config.stream = stream;
+        self
+    }
+
+    /// Image-generation prompts need concise, directly usable visual
+    /// instructions. Do not let a global thinking override spend the whole
+    /// request timeout before returning that prompt.
+    pub fn with_thinking_disabled(mut self) -> Self {
+        self.force_disable_thinking = true;
         self
     }
 
@@ -287,6 +297,9 @@ impl OpenAiCompatibleLlm {
             max_tokens,
         );
         apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
+        if self.force_disable_thinking {
+            disable_chat_completion_thinking(&mut payload);
+        }
         let mut use_streaming = self.config.stream;
         set_chat_completion_stream(&mut payload, use_streaming);
 
@@ -316,6 +329,7 @@ impl OpenAiCompatibleLlm {
                     attempt,
                     max_attempts,
                     thinking_fallback = thinking_fallback_used,
+                    thinking_disabled = self.force_disable_thinking,
                     "LLM chat completion request started"
                 );
                 let stream_first_event_timeout_seconds =
