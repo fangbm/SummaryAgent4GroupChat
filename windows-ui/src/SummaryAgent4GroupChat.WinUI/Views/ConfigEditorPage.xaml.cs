@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Navigation;
@@ -8,6 +9,8 @@ namespace SummaryAgent4GroupChat.WinUI.Views;
 
 public sealed partial class ConfigEditorPage : Page
 {
+    private MainViewModel? _observedViewModel;
+    private bool _clearingSecretInputs;
     private MainViewModel? ViewModel => DataContext as MainViewModel;
 
     public ConfigEditorPage() => InitializeComponent();
@@ -15,7 +18,14 @@ public sealed partial class ConfigEditorPage : Page
     protected override void OnNavigatedTo(NavigationEventArgs e)
     {
         var context = (EditorPageContext)e.Parameter;
+        if (_observedViewModel is not null)
+        {
+            _observedViewModel.PropertyChanged -= ViewModel_PropertyChanged;
+        }
         DataContext = context.ViewModel;
+        _observedViewModel = context.ViewModel;
+        _observedViewModel.PropertyChanged += ViewModel_PropertyChanged;
+        ClearSecretInputs();
 
         (PageTitle.Text, PageDescription.Text) = context.Section switch
         {
@@ -43,4 +53,46 @@ public sealed partial class ConfigEditorPage : Page
     private async void Refresh_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null) await ViewModel.RefreshAsync(); }
     private async void OpenConfig_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null) await ViewModel.OpenPathAsync("config"); }
     private void LoadForm_Click(object sender, RoutedEventArgs e) => ViewModel?.LoadFormFromConfig();
+    private void LlmApiKeys_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (!_clearingSecretInputs && ViewModel is not null && sender is PasswordBox box) ViewModel.LlmApiKeysInput = box.Password;
+    }
+    private void ImageApiKeys_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (!_clearingSecretInputs && ViewModel is not null && sender is PasswordBox box) ViewModel.ImageApiKeysInput = box.Password;
+    }
+
+    private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(MainViewModel.LlmApiKeysInput) or nameof(MainViewModel.ImageApiKeysInput)
+            && ViewModel is not null
+            && string.IsNullOrEmpty(e.PropertyName == nameof(MainViewModel.LlmApiKeysInput)
+                ? ViewModel.LlmApiKeysInput
+                : ViewModel.ImageApiKeysInput))
+        {
+            ClearSecretInput(e.PropertyName == nameof(MainViewModel.LlmApiKeysInput)
+                ? LlmApiKeysBox
+                : ImageApiKeysBox);
+        }
+    }
+
+    private void ClearSecretInputs()
+    {
+        ClearSecretInput(LlmApiKeysBox);
+        ClearSecretInput(ImageApiKeysBox);
+    }
+
+    private void ClearSecretInput(PasswordBox input)
+    {
+        if (_clearingSecretInputs) return;
+        _clearingSecretInputs = true;
+        try
+        {
+            input.Password = string.Empty;
+        }
+        finally
+        {
+            _clearingSecretInputs = false;
+        }
+    }
 }

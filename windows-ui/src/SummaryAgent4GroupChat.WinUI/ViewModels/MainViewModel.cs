@@ -59,7 +59,9 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private bool _scheduleSendText = true;
     [ObservableProperty] private bool _scheduleSendImage = true;
 
-    [ObservableProperty] private string _llmApiKeyEnvironment = "LLM_API_KEY";
+    // Keys are deliberately write-only: config.read redacts them before the
+    // form sees anything, and an empty editor keeps the existing value.
+    [ObservableProperty] private string _llmApiKeysInput = string.Empty;
     [ObservableProperty] private string _llmBaseUrl = string.Empty;
     [ObservableProperty] private string _llmModel = string.Empty;
     [ObservableProperty] private string _llmTimeoutSeconds = "120";
@@ -70,12 +72,9 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _llmChunkConcurrency = "4";
     [ObservableProperty] private bool _imageGenerationEnabled = true;
     [ObservableProperty] private string _imageProvider = "openai";
-    [ObservableProperty] private string _imageApiKeyEnvironment = "IMAGE_API_KEY";
-    [ObservableProperty] private string _imageApiKeysEnvironment = "IMAGE_API_KEYS";
+    [ObservableProperty] private string _imageApiKeysInput = string.Empty;
     [ObservableProperty] private string _imageBaseUrl = string.Empty;
-    [ObservableProperty] private string _imageBaseUrlEnvironment = "IMAGE_BASE_URL";
     [ObservableProperty] private string _imageModel = string.Empty;
-    [ObservableProperty] private string _imageModelEnvironment = "IMAGE_MODEL";
     [ObservableProperty] private string _imageSize = "2:3";
     [ObservableProperty] private string _imageResolution = "1k";
     [ObservableProperty] private string _imageQuality = string.Empty;
@@ -340,7 +339,7 @@ public sealed partial class MainViewModel : ObservableObject
         ScheduleSendText = ReadBool("scheduled_summary", "send_text", true);
         ScheduleSendImage = ReadBool("scheduled_summary", "send_image", true);
 
-        LlmApiKeyEnvironment = ReadString("llm", "api_key_env", "LLM_API_KEY");
+        LlmApiKeysInput = string.Empty;
         LlmBaseUrl = ReadString("llm", "base_url", string.Empty);
         LlmModel = ReadString("llm", "model", string.Empty);
         LlmTimeoutSeconds = ReadString("llm", "timeout_seconds", "120");
@@ -351,12 +350,9 @@ public sealed partial class MainViewModel : ObservableObject
         LlmChunkConcurrency = ReadString("llm", "max_concurrent_chunk_requests", "4");
         ImageGenerationEnabled = ReadBool("image_gen", "enabled", true);
         ImageProvider = ReadString("image_gen", "provider", "openai");
-        ImageApiKeyEnvironment = ReadString("image_gen", "api_key_env", "IMAGE_API_KEY");
-        ImageApiKeysEnvironment = ReadString("image_gen", "api_keys_env", "IMAGE_API_KEYS");
+        ImageApiKeysInput = string.Empty;
         ImageBaseUrl = ReadString("image_gen", "base_url", string.Empty);
-        ImageBaseUrlEnvironment = ReadString("image_gen", "base_url_env", "IMAGE_BASE_URL");
         ImageModel = ReadString("image_gen", "model", string.Empty);
-        ImageModelEnvironment = ReadString("image_gen", "model_env", "IMAGE_MODEL");
         ImageSize = ReadString("image_gen", "size", "2:3");
         ImageResolution = ReadString("image_gen", "resolution", string.Empty);
         ImageQuality = ReadString("image_gen", "quality", string.Empty);
@@ -692,7 +688,7 @@ public sealed partial class MainViewModel : ObservableObject
         AddBoolIfChanged(operations, "scheduled_summary", "send_text", ScheduleSendText);
         AddBoolIfChanged(operations, "scheduled_summary", "send_image", ScheduleSendImage);
 
-        AddIfChanged(operations, "llm", "api_key_env", LlmApiKeyEnvironment);
+        AddSecretKeysIfEntered(operations, "llm", LlmApiKeysInput);
         AddOptionalIfChanged(operations, "llm", "base_url", LlmBaseUrl);
         AddOptionalIfChanged(operations, "llm", "model", LlmModel);
         AddNumberIfChanged(operations, "llm", "timeout_seconds", LlmTimeoutSeconds, 120);
@@ -703,12 +699,9 @@ public sealed partial class MainViewModel : ObservableObject
         AddNumberIfChanged(operations, "llm", "max_concurrent_chunk_requests", LlmChunkConcurrency, 4);
         AddBoolIfChanged(operations, "image_gen", "enabled", ImageGenerationEnabled);
         AddIfChanged(operations, "image_gen", "provider", ImageProvider);
-        AddIfChanged(operations, "image_gen", "api_key_env", ImageApiKeyEnvironment);
-        AddIfChanged(operations, "image_gen", "api_keys_env", ImageApiKeysEnvironment);
+        AddSecretKeysIfEntered(operations, "image_gen", ImageApiKeysInput);
         AddOptionalIfChanged(operations, "image_gen", "base_url", ImageBaseUrl);
-        AddIfChanged(operations, "image_gen", "base_url_env", ImageBaseUrlEnvironment);
         AddOptionalIfChanged(operations, "image_gen", "model", ImageModel);
-        AddIfChanged(operations, "image_gen", "model_env", ImageModelEnvironment);
         AddIfChanged(operations, "image_gen", "size", ImageSize);
         AddOptionalIfChanged(operations, "image_gen", "resolution", ImageResolution);
         AddOptionalIfChanged(operations, "image_gen", "quality", ImageQuality);
@@ -801,6 +794,17 @@ public sealed partial class MainViewModel : ObservableObject
         if (changed)
         {
             AddOperation(operations, [section], key, values);
+        }
+    }
+
+    private void AddSecretKeysIfEntered(List<Dictionary<string, object?>> operations, string section, string current)
+    {
+        var keys = current.Split([',', '\n', '\r'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (keys.Length > 0)
+        {
+            // The key pool already accepts a list and gives it priority over
+            // legacy api_key/api_key_env values. Never read or compare secrets.
+            AddOperation(operations, [section], "api_keys", keys);
         }
     }
 

@@ -73,7 +73,7 @@
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                        <StackPanel Spacing="5"><TextBlock Text="API Key 环境变量" /><TextBox Text="{Binding LlmApiKeyEnvironment, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Spacing="5"><TextBlock Text="API Key（逗号分隔多 Key）" /><PasswordBox x:Name="LlmApiKeysBox" PasswordChanged="LlmApiKeys_PasswordChanged" PlaceholderText="留空保留当前密钥；输入新值覆盖" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="模型名称" /><TextBox Text="{Binding LlmModel, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="Base URL" /><TextBox Text="{Binding LlmBaseUrl, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Grid.Column="1" Spacing="8">
@@ -90,18 +90,15 @@
                         <StackPanel Spacing="5"><TextBlock Text="图片接口类型" /><TextBox Text="{Binding ImageProvider, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片模型名称" /><TextBox Text="{Binding ImageModel, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="图片 Base URL" /><TextBox Text="{Binding ImageBaseUrl, Mode=TwoWay}" /></StackPanel>
-                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片 API Key 环境变量" /><TextBox Text="{Binding ImageApiKeyEnvironment, Mode=TwoWay}" /></StackPanel>
-                        <StackPanel Grid.Row="2" Spacing="5"><TextBlock Text="多 Key 环境变量（逗号或换行分隔）" /><TextBox Text="{Binding ImageApiKeysEnvironment, Mode=TwoWay}" /></StackPanel>
-                        <StackPanel Grid.Row="2" Grid.Column="1" Spacing="5"><TextBlock Text="模型环境变量（模型名称留空时使用）" /><TextBox Text="{Binding ImageModelEnvironment, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片 API Key（逗号分隔多 Key）" /><PasswordBox x:Name="ImageApiKeysBox" PasswordChanged="ImageApiKeys_PasswordChanged" PlaceholderText="留空保留当前密钥；输入新值覆盖" /></StackPanel>
                     </Grid>
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                        <StackPanel Spacing="5"><TextBlock Text="Base URL 环境变量（Base URL 留空时使用）" /><TextBox Text="{Binding ImageBaseUrlEnvironment, Mode=TwoWay}" /></StackPanel>
-                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片尺寸" /><TextBox Text="{Binding ImageSize, Mode=TwoWay}" PlaceholderText="例如 2:3 或 1024x1024" /></StackPanel>
-                        <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="图片分辨率（优先于质量，留空禁用）" /><TextBox Text="{Binding ImageResolution, Mode=TwoWay}" PlaceholderText="例如 1k 或 2k" /></StackPanel>
-                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片质量（分辨率留空时使用）" /><TextBox Text="{Binding ImageQuality, Mode=TwoWay}" PlaceholderText="例如 high" /></StackPanel>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="图片尺寸" /><TextBox Text="{Binding ImageSize, Mode=TwoWay}" PlaceholderText="例如 2:3 或 1024x1024" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片分辨率（优先于质量，留空禁用）" /><TextBox Text="{Binding ImageResolution, Mode=TwoWay}" PlaceholderText="例如 1k 或 2k" /></StackPanel>
                     </Grid>
+                    <StackPanel Spacing="5"><TextBlock Text="图片质量（分辨率留空时使用）" /><TextBox Text="{Binding ImageQuality, Mode=TwoWay}" PlaceholderText="例如 high" /></StackPanel>
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
