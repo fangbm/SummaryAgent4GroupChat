@@ -2731,10 +2731,6 @@ async fn run_summary_pipeline(
     // completions that prepare image generation must be regular JSON replies:
     // some compatible providers close long SSE bodies with invalid encoding.
     let image_llm = llm.clone().with_streaming(false);
-    // Turning a chat summary into an image prompt is a formatting task. Keep
-    // the user's output limit unlimited, but avoid global thinking overrides
-    // holding this latency-sensitive stage open with invisible reasoning.
-    let image_prompt_llm = image_llm.clone().with_thinking_disabled();
     let mut pending_text_reply = None;
     if options.text_summary_enabled {
         let summary_result = complete_text_summary_with_refusal_retry(
@@ -2890,7 +2886,7 @@ async fn run_summary_pipeline(
         );
         let image_prompt = match complete_image_prompt_with_refusal_retry(
             config,
-            &image_prompt_llm,
+            &image_llm,
             &trigger.room_id,
             "image prompt",
             &config.image_prompt.system_prompt,
@@ -3096,7 +3092,6 @@ async fn run_background_image_pipeline_inner(
     // This background path is used after manual text summaries. Keep its
     // image-preparation completions on normal JSON responses as well.
     .with_streaming(false);
-    let image_prompt_llm = llm.clone().with_thinking_disabled();
     let privacy = PrivacyFilter::new(config.privacy.clone());
     let image_summary_result = complete_image_summary_with_refusal_retry(
         config,
@@ -3153,7 +3148,7 @@ async fn run_background_image_pipeline_inner(
     );
     let image_prompt = complete_image_prompt_with_refusal_retry(
         config,
-        &image_prompt_llm,
+        &llm,
         room_id,
         "background image prompt",
         &config.image_prompt.system_prompt,
