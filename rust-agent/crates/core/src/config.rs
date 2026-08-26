@@ -45,6 +45,8 @@ pub struct AgentConfig {
     pub text_summary: TextSummaryConfig,
     #[serde(default)]
     pub image_summary: ImageSummaryConfig,
+    #[serde(default)]
+    pub image_pipeline: ImagePipelineConfig,
     pub image_gen: ImageGenConfig,
     #[serde(default)]
     pub image_prompt: ImagePromptConfig,
@@ -467,6 +469,29 @@ impl Default for ImageSummaryConfig {
     }
 }
 
+/// Scheduling and wall-clock limits for the LLM calls that prepare a generated
+/// image. The downstream image-generation API does not consume these slots.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImagePipelineConfig {
+    /// `0` derives capacity from image-enabled scheduled rooms.
+    #[serde(default)]
+    pub max_concurrent_requests: usize,
+    #[serde(default = "default_image_summary_total_timeout")]
+    pub summary_total_timeout_seconds: u64,
+    #[serde(default = "default_image_prompt_total_timeout")]
+    pub prompt_total_timeout_seconds: u64,
+}
+
+impl Default for ImagePipelineConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: 0,
+            summary_total_timeout_seconds: default_image_summary_total_timeout(),
+            prompt_total_timeout_seconds: default_image_prompt_total_timeout(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageGenConfig {
     #[serde(default = "default_true")]
@@ -872,6 +897,14 @@ fn default_llm_timeout() -> u64 {
     120
 }
 
+fn default_image_summary_total_timeout() -> u64 {
+    240
+}
+
+fn default_image_prompt_total_timeout() -> u64 {
+    120
+}
+
 fn default_llm_stream() -> bool {
     true
 }
@@ -1227,6 +1260,7 @@ api_key_env = "LLM_API_KEY""#,
         .unwrap();
         let text_summary: TextSummaryConfig = toml::from_str("").unwrap();
         let image_summary: ImageSummaryConfig = toml::from_str("").unwrap();
+        let image_pipeline: ImagePipelineConfig = toml::from_str("").unwrap();
         let image_prompt: ImagePromptConfig = toml::from_str("").unwrap();
         let image_caption: ImageCaptionConfig = toml::from_str("").unwrap();
         let voice_transcription: VoiceTranscriptionConfig = toml::from_str("").unwrap();
@@ -1242,6 +1276,9 @@ api_key_env = "LLM_API_KEY""#,
         assert!(text_summary.system_prompt.contains("文字总结"));
         assert!(text_summary.user_prompt_template.contains("{chat_input}"));
         assert!(image_summary.user_prompt_template.contains("{chat_input}"));
+        assert_eq!(image_pipeline.max_concurrent_requests, 0);
+        assert_eq!(image_pipeline.summary_total_timeout_seconds, 240);
+        assert_eq!(image_pipeline.prompt_total_timeout_seconds, 120);
         assert!(image_prompt
             .user_prompt_template
             .contains("{image_summary}"));

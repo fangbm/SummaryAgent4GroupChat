@@ -400,6 +400,14 @@ user_prompt_template = """
 {chat_input}
 """
 
+[image_pipeline]
+# 图片摘要和图片提示词共用的全局并发槽位。0 = 自动按本次启用图片总结的定时群数量分配。
+# 设置正整数可作为上限，例如 3。
+max_concurrent_requests = 0
+# 这两个总时限覆盖等待槽位后的完整 LLM 调用及其重试，避免长尾请求永久占槽。
+summary_total_timeout_seconds = 240
+prompt_total_timeout_seconds = 120
+
 [image_gen]
 enabled = true
 provider = "openai"

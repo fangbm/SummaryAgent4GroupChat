@@ -85,6 +85,12 @@
                     <TextBlock Text="图片生成与媒体理解" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
                     <StackPanel Orientation="Horizontal" Spacing="20"><CheckBox Content="启用图片生成" IsChecked="{Binding ImageGenerationEnabled, Mode=TwoWay}" /><CheckBox Content="启用图片转述" IsChecked="{Binding ImageCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用视频转述" IsChecked="{Binding VideoCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用语音转写" IsChecked="{Binding VoiceTranscriptionEnabled, Mode=TwoWay}" /></StackPanel>
                     <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="图片流水线槽位（0 为按启用群数自动）" TextWrapping="Wrap" /><NumberBox Value="{Binding ImagePipelineMaxConcurrentRequests, Mode=TwoWay}" Minimum="0" SpinButtonPlacementMode="Compact" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片摘要总时限（秒）" /><NumberBox Value="{Binding ImageSummaryTotalTimeoutSeconds, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel>
+                        <StackPanel Grid.Column="2" Spacing="5"><TextBlock Text="图片提示词总时限（秒）" /><NumberBox Value="{Binding ImagePromptTotalTimeoutSeconds, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel>
+                    </Grid>
+                    <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                         <StackPanel Spacing="5"><TextBlock Text="图片接口类型" /><TextBox Text="{Binding ImageProvider, Mode=TwoWay}" /></StackPanel>

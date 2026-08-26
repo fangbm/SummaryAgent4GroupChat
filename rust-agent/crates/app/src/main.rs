@@ -26,6 +26,7 @@ use runtime_log::*;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use wechat_summary_ai::{
@@ -374,6 +375,132 @@ impl SummaryTaskScheduler {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ImagePipelineStage {
+    Summary,
+    Prompt,
+}
+
+impl ImagePipelineStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Summary => "image_summary",
+            Self::Prompt => "image_prompt",
+        }
+    }
+}
+
+struct ImagePipelineSlotRequest {
+    room_id: String,
+    stage: ImagePipelineStage,
+    responder: oneshot::Sender<ImagePipelineSlotLease>,
+}
+
+enum ImagePipelineSlotCommand {
+    Acquire(ImagePipelineSlotRequest),
+    SetCapacity(usize),
+}
+
+#[derive(Clone)]
+struct ImagePipelineSlotPool {
+    command_sender: tokio_mpsc::UnboundedSender<ImagePipelineSlotCommand>,
+}
+
+struct ImagePipelineSlotLease {
+    release_sender: tokio_mpsc::UnboundedSender<()>,
+}
+
+impl Drop for ImagePipelineSlotLease {
+    fn drop(&mut self) {
+        let _ = self.release_sender.send(());
+    }
+}
+
+impl ImagePipelineSlotPool {
+    fn new(capacity: usize) -> Self {
+        let (command_sender, mut command_receiver) = tokio_mpsc::unbounded_channel();
+        let (release_sender, mut release_receiver) = tokio_mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut capacity = capacity.max(1);
+            let mut in_use = 0usize;
+            let mut prompts: VecDeque<ImagePipelineSlotRequest> = VecDeque::new();
+            let mut summaries: VecDeque<ImagePipelineSlotRequest> = VecDeque::new();
+            loop {
+                while in_use < capacity {
+                    let Some(request) = prompts.pop_front().or_else(|| summaries.pop_front())
+                    else {
+                        break;
+                    };
+                    let room_id = request.room_id.clone();
+                    let stage = request.stage;
+                    if request
+                        .responder
+                        .send(ImagePipelineSlotLease {
+                            release_sender: release_sender.clone(),
+                        })
+                        .is_ok()
+                    {
+                        in_use += 1;
+                        info!(
+                            room_id = %room_id,
+                            stage = stage.as_str(),
+                            in_use,
+                            capacity,
+                            pending_prompts = prompts.len(),
+                            pending_summaries = summaries.len(),
+                            "image pipeline slot granted"
+                        );
+                    }
+                }
+
+                tokio::select! {
+                    Some(command) = command_receiver.recv() => match command {
+                        ImagePipelineSlotCommand::Acquire(request) => match request.stage {
+                            ImagePipelineStage::Prompt => prompts.push_back(request),
+                            ImagePipelineStage::Summary => summaries.push_back(request),
+                        },
+                        ImagePipelineSlotCommand::SetCapacity(value) => {
+                            capacity = value.max(1);
+                            info!(capacity, in_use, "image pipeline slot capacity updated");
+                        }
+                    },
+                    Some(()) = release_receiver.recv() => {
+                        in_use = in_use.saturating_sub(1);
+                    },
+                    else => break,
+                }
+            }
+        });
+        Self { command_sender }
+    }
+
+    async fn acquire(
+        &self,
+        room_id: &str,
+        stage: ImagePipelineStage,
+    ) -> Result<ImagePipelineSlotLease> {
+        let (responder, receiver) = oneshot::channel();
+        self.command_sender
+            .send(ImagePipelineSlotCommand::Acquire(
+                ImagePipelineSlotRequest {
+                    room_id: room_id.to_string(),
+                    stage,
+                    responder,
+                },
+            ))
+            .map_err(|_| anyhow::anyhow!("image pipeline scheduler stopped"))?;
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("image pipeline scheduler stopped while waiting"))
+    }
+
+    fn set_capacity(&self, capacity: usize) {
+        let _ = self
+            .command_sender
+            .send(ImagePipelineSlotCommand::SetCapacity(capacity.max(1)));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_path = config_path_from_args();
@@ -404,6 +531,8 @@ async fn run_agent(config_path: &str) -> Result<()> {
     let recent_observed_messages = Arc::new(Mutex::new(RecentObservedMessages::default()));
     let mut scheduler =
         SummaryTaskScheduler::new(SUMMARY_MAX_CONCURRENCY, SUMMARY_PENDING_CAPACITY);
+    let image_pipeline_slots =
+        ImagePipelineSlotPool::new(image_pipeline_slot_capacity(config, &platform.rooms));
     let mut next_artifact_cleanup = Instant::now() + StdDuration::from_secs(6 * 60 * 60);
 
     info!(
@@ -443,6 +572,8 @@ async fn run_agent(config_path: &str) -> Result<()> {
         let old_watcher_fingerprint = platform.watcher_fingerprint.clone();
         if config_reloader.reload_if_changed()? {
             let config = config_reloader.config();
+            image_pipeline_slots
+                .set_capacity(image_pipeline_slot_capacity(config, &platform.rooms));
             let new_fingerprint = PlatformConnectionFingerprint::from_config(config);
             if new_fingerprint != old_fingerprint {
                 platform.request_reconnect(config, "platform connection configuration changed");
@@ -505,6 +636,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
             config,
             &store,
             &platform.worker,
+            &image_pipeline_slots,
             &mut scheduled_backlog,
             &mut scheduler,
         );
@@ -527,6 +659,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 &platform.worker,
                 &recent_trigger_attempts,
                 &recent_observed_messages,
+                &image_pipeline_slots,
                 PlatformEventSource::WxdbRecovered,
                 event,
                 &mut scheduler,
@@ -557,6 +690,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                     &platform.worker,
                     &recent_trigger_attempts,
                     &recent_observed_messages,
+                    &image_pipeline_slots,
                     PlatformEventSource::Realtime,
                     event,
                     &mut scheduler,
@@ -585,6 +719,7 @@ fn enqueue_platform_event(
     client: &PlatformWorker,
     recent_trigger_attempts: &Arc<Mutex<RecentTriggerAttempts>>,
     recent_observed_messages: &Arc<Mutex<RecentObservedMessages>>,
+    image_pipeline_slots: &ImagePipelineSlotPool,
     event_source: PlatformEventSource,
     event: PlatformEvent,
     scheduler: &mut SummaryTaskScheduler,
@@ -605,6 +740,7 @@ fn enqueue_platform_event(
     let task_client = client.clone();
     let task_attempts = Arc::clone(recent_trigger_attempts);
     let task_observed = Arc::clone(recent_observed_messages);
+    let task_image_pipeline_slots = image_pipeline_slots.clone();
     let task_room_id = room_id.clone();
     let future = Box::pin(async move {
         let task_matcher = TriggerMatcher::new(effective_listen_config(&task_config))
@@ -616,6 +752,7 @@ fn enqueue_platform_event(
             &task_client,
             &task_attempts,
             &task_observed,
+            &task_image_pipeline_slots,
             event_source,
             event,
         )
@@ -1544,6 +1681,7 @@ async fn handle_platform_event(
     client: &PlatformWorker,
     recent_trigger_attempts: &Arc<Mutex<RecentTriggerAttempts>>,
     recent_observed_messages: &Arc<Mutex<RecentObservedMessages>>,
+    image_pipeline_slots: &ImagePipelineSlotPool,
     event_source: PlatformEventSource,
     event: PlatformEvent,
 ) -> Result<()> {
@@ -1762,6 +1900,7 @@ async fn handle_platform_event(
         &trigger,
         &range,
         pipeline_options,
+        image_pipeline_slots,
         Some(ImageCooldownRecorder {
             store: store.clone(),
             timestamp: incoming.timestamp,
@@ -1978,6 +2117,7 @@ fn drain_scheduled_backlog(
     config: &AgentConfig,
     store: &SqliteStateStore,
     client: &PlatformWorker,
+    image_pipeline_slots: &ImagePipelineSlotPool,
     backlog: &mut ScheduledSummaryBacklog,
     scheduler: &mut SummaryTaskScheduler,
 ) {
@@ -2038,6 +2178,7 @@ fn drain_scheduled_backlog(
         let task_config = config.clone();
         let task_store = store.clone();
         let task_client = client.clone();
+        let task_image_pipeline_slots = image_pipeline_slots.clone();
         let task_range = request.range.clone();
         let future = Box::pin(async move {
             run_scheduled_summary_task(
@@ -2048,6 +2189,7 @@ fn drain_scheduled_backlog(
                 trigger,
                 task_range,
                 now,
+                &task_image_pipeline_slots,
             )
             .await
         });
@@ -2085,6 +2227,7 @@ fn requeue_scheduled_request_after_state_read_failure(
     backlog.record_retry(Instant::now());
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_scheduled_summary_task(
     config: &AgentConfig,
     store: &SqliteStateStore,
@@ -2093,6 +2236,7 @@ async fn run_scheduled_summary_task(
     trigger: TriggerMatch,
     range: ResolvedTimeRange,
     now: DateTime<Utc>,
+    image_pipeline_slots: &ImagePipelineSlotPool,
 ) -> Result<()> {
     if config.image_gen.enabled && !config.image_summary_enabled_for_room(&trigger.room_id) {
         info!(room_id = %trigger.room_id, "scheduled image summary disabled by room capability");
@@ -2111,6 +2255,7 @@ async fn run_scheduled_summary_task(
         &trigger,
         &range,
         PipelineOptions::scheduled(config, &trigger.room_id),
+        image_pipeline_slots,
         None,
         None,
     )
@@ -2203,6 +2348,27 @@ impl PipelineOptions {
             send_disabled_message: false,
             log_retry_attempts: false,
         }
+    }
+}
+
+fn image_pipeline_slot_capacity(config: &AgentConfig, platform_rooms: &[String]) -> usize {
+    let enabled_rooms = if config.scheduled_summary.enabled
+        && config.scheduled_summary.send_image
+        && config.image_gen.enabled
+    {
+        scheduled_rooms(config, platform_rooms)
+            .into_iter()
+            .filter(|room_id| config.image_summary_enabled_for_room(room_id))
+            .count()
+    } else {
+        0
+    };
+    let automatic = enabled_rooms.max(1);
+    let configured = config.image_pipeline.max_concurrent_requests;
+    if configured == 0 {
+        automatic
+    } else {
+        automatic.min(configured.max(1))
     }
 }
 
@@ -2417,6 +2583,7 @@ async fn run_summary_pipeline(
     trigger: &TriggerMatch,
     range: &ResolvedTimeRange,
     options: PipelineOptions,
+    image_pipeline_slots: &ImagePipelineSlotPool,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
     recent_observed_messages: Option<&RecentObservedMessages>,
 ) -> Result<PipelineOutcome> {
@@ -2780,6 +2947,7 @@ async fn run_summary_pipeline(
             llm_input,
             chat_messages,
             options.text_summary_enabled,
+            image_pipeline_slots.clone(),
             image_cooldown_recorder,
         )
         .await;
@@ -2800,15 +2968,21 @@ async fn run_summary_pipeline(
     }
 
     if options.image_gen_enabled {
-        let image_summary_result = match complete_image_summary_with_refusal_retry(
+        let image_summary_result = match run_image_pipeline_llm_stage(
             config,
-            &image_llm,
+            image_pipeline_slots,
             &trigger.room_id,
-            "image summary",
-            &config.image_summary.system_prompt,
-            &config.image_summary.user_prompt_template,
-            &chat_messages,
-            &privacy,
+            ImagePipelineStage::Summary,
+            complete_image_summary_with_refusal_retry(
+                config,
+                &image_llm,
+                &trigger.room_id,
+                "image summary",
+                &config.image_summary.system_prompt,
+                &config.image_summary.user_prompt_template,
+                &chat_messages,
+                &privacy,
+            ),
         )
         .await
         .context("calling LLM for image summary")
@@ -2884,13 +3058,19 @@ async fn run_summary_pipeline(
                 image_prompt_request.chars().count()
             ),
         );
-        let image_prompt = match complete_image_prompt_with_refusal_retry(
+        let image_prompt = match run_image_pipeline_llm_stage(
             config,
-            &image_llm,
+            image_pipeline_slots,
             &trigger.room_id,
-            "image prompt",
-            &config.image_prompt.system_prompt,
-            &image_prompt_request,
+            ImagePipelineStage::Prompt,
+            complete_image_prompt_with_refusal_retry(
+                config,
+                &image_llm,
+                &trigger.room_id,
+                "image prompt",
+                &config.image_prompt.system_prompt,
+                &image_prompt_request,
+            ),
         )
         .await
         .context("calling LLM for image prompt")
@@ -3019,6 +3199,7 @@ async fn run_summary_pipeline(
     Ok(PipelineOutcome::SummaryProduced)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_background_image_pipeline(
     config: AgentConfig,
     sender: PlatformSender,
@@ -3026,6 +3207,7 @@ async fn run_background_image_pipeline(
     llm_input: String,
     chat_messages: Vec<ChatMessage>,
     text_summary_enabled: bool,
+    image_pipeline_slots: ImagePipelineSlotPool,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
 ) -> bool {
     let result = run_background_image_pipeline_inner(
@@ -3034,6 +3216,7 @@ async fn run_background_image_pipeline(
         &room_id,
         &llm_input,
         &chat_messages,
+        &image_pipeline_slots,
         image_cooldown_recorder.as_ref(),
     )
     .await;
@@ -3079,6 +3262,7 @@ async fn run_background_image_pipeline_inner(
     room_id: &str,
     llm_input: &str,
     chat_messages: &[ChatMessage],
+    image_pipeline_slots: &ImagePipelineSlotPool,
     image_cooldown_recorder: Option<&ImageCooldownRecorder>,
 ) -> Result<()> {
     let retry_notifier = retry_log_notifier(config, room_id.to_string());
@@ -3093,15 +3277,21 @@ async fn run_background_image_pipeline_inner(
     // image-preparation completions on normal JSON responses as well.
     .with_streaming(false);
     let privacy = PrivacyFilter::new(config.privacy.clone());
-    let image_summary_result = complete_image_summary_with_refusal_retry(
+    let image_summary_result = run_image_pipeline_llm_stage(
         config,
-        &llm,
+        image_pipeline_slots,
         room_id,
-        "background image summary",
-        &config.image_summary.system_prompt,
-        &config.image_summary.user_prompt_template,
-        chat_messages,
-        &privacy,
+        ImagePipelineStage::Summary,
+        complete_image_summary_with_refusal_retry(
+            config,
+            &llm,
+            room_id,
+            "background image summary",
+            &config.image_summary.system_prompt,
+            &config.image_summary.user_prompt_template,
+            chat_messages,
+            &privacy,
+        ),
     )
     .await
     .context("calling LLM for background image summary")?;
@@ -3146,13 +3336,19 @@ async fn run_background_image_pipeline_inner(
             image_prompt_request.chars().count()
         ),
     );
-    let image_prompt = complete_image_prompt_with_refusal_retry(
+    let image_prompt = run_image_pipeline_llm_stage(
         config,
-        &llm,
+        image_pipeline_slots,
         room_id,
-        "background image prompt",
-        &config.image_prompt.system_prompt,
-        &image_prompt_request,
+        ImagePipelineStage::Prompt,
+        complete_image_prompt_with_refusal_retry(
+            config,
+            &llm,
+            room_id,
+            "background image prompt",
+            &config.image_prompt.system_prompt,
+            &image_prompt_request,
+        ),
     )
     .await
     .context("calling LLM for background image prompt")?;
@@ -3341,6 +3537,53 @@ async fn complete_text_summary_with_refusal_retry(
     }
 
     Ok(retry_result)
+}
+
+async fn run_image_pipeline_llm_stage<T, F>(
+    config: &AgentConfig,
+    image_pipeline_slots: &ImagePipelineSlotPool,
+    room_id: &str,
+    stage: ImagePipelineStage,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let total_timeout_seconds = match stage {
+        ImagePipelineStage::Summary => config.image_pipeline.summary_total_timeout_seconds,
+        ImagePipelineStage::Prompt => config.image_pipeline.prompt_total_timeout_seconds,
+    }
+    .max(1);
+    let wait_started = Instant::now();
+    let lease = image_pipeline_slots.acquire(room_id, stage).await?;
+    let wait_ms = wait_started.elapsed().as_millis();
+    info!(
+        room_id = %room_id,
+        stage = stage.as_str(),
+        wait_ms,
+        total_timeout_seconds,
+        "image pipeline LLM stage started"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "image pipeline llm stage started room={} stage={} wait_ms={} total_timeout_seconds={}",
+            room_id,
+            stage.as_str(),
+            wait_ms,
+            total_timeout_seconds
+        ),
+    );
+    let result = tokio::time::timeout(StdDuration::from_secs(total_timeout_seconds), future).await;
+    drop(lease);
+    match result {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "image pipeline {} exceeded total timeout of {} seconds",
+            stage.as_str(),
+            total_timeout_seconds
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6761,6 +7004,85 @@ mod tests {
             scheduled_rooms(&config, &["平台群".to_string()]),
             vec!["定时群".to_string()]
         );
+    }
+
+    #[test]
+    fn image_pipeline_capacity_tracks_enabled_scheduled_rooms() {
+        let mut config =
+            AgentConfig::from_toml_str(include_str!("../../../config/agent.toml")).unwrap();
+        config.scheduled_summary.rooms = vec!["群A".into(), "群B".into(), "群C".into()];
+        config.room_capabilities.insert(
+            "群B".into(),
+            wechat_summary_core::config::RoomCapabilityConfig {
+                image_summary_enabled: Some(false),
+            },
+        );
+
+        assert_eq!(image_pipeline_slot_capacity(&config, &[]), 2);
+        config.image_pipeline.max_concurrent_requests = 1;
+        assert_eq!(image_pipeline_slot_capacity(&config, &[]), 1);
+        config.image_pipeline.max_concurrent_requests = 8;
+        assert_eq!(image_pipeline_slot_capacity(&config, &[]), 2);
+    }
+
+    #[tokio::test]
+    async fn image_pipeline_slot_pool_prioritizes_prompts() {
+        let pool = ImagePipelineSlotPool::new(1);
+        let held = pool
+            .acquire("already-running", ImagePipelineStage::Summary)
+            .await
+            .unwrap();
+        let (order_sender, mut order_receiver) = tokio_mpsc::unbounded_channel();
+
+        let (summary_ready_sender, summary_ready_receiver) = oneshot::channel();
+        let (summary_release_sender, summary_release_receiver) = oneshot::channel();
+        let summary_pool = pool.clone();
+        let summary_order_sender = order_sender.clone();
+        let summary_task = tokio::spawn(async move {
+            let _ = summary_ready_sender.send(());
+            let lease = summary_pool
+                .acquire("queued-summary", ImagePipelineStage::Summary)
+                .await
+                .unwrap();
+            let _ = summary_order_sender.send("summary");
+            let _ = summary_release_receiver.await;
+            drop(lease);
+        });
+        summary_ready_receiver.await.unwrap();
+        tokio::time::sleep(TestDuration::from_millis(10)).await;
+
+        let (prompt_ready_sender, prompt_ready_receiver) = oneshot::channel();
+        let (prompt_release_sender, prompt_release_receiver) = oneshot::channel();
+        let prompt_pool = pool.clone();
+        let prompt_task = tokio::spawn(async move {
+            let _ = prompt_ready_sender.send(());
+            let lease = prompt_pool
+                .acquire("ready-prompt", ImagePipelineStage::Prompt)
+                .await
+                .unwrap();
+            let _ = order_sender.send("prompt");
+            let _ = prompt_release_receiver.await;
+            drop(lease);
+        });
+        prompt_ready_receiver.await.unwrap();
+        tokio::time::sleep(TestDuration::from_millis(10)).await;
+
+        drop(held);
+        let first = tokio::time::timeout(TestDuration::from_secs(1), order_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, "prompt");
+        prompt_release_sender.send(()).unwrap();
+
+        let second = tokio::time::timeout(TestDuration::from_secs(1), order_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, "summary");
+        summary_release_sender.send(()).unwrap();
+        prompt_task.await.unwrap();
+        summary_task.await.unwrap();
     }
 
     #[test]

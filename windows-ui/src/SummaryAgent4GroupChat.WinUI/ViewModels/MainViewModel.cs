@@ -85,6 +85,9 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _imageRetryAttempts = "5";
     [ObservableProperty] private string _imageMaxConcurrentPerKey = "0";
     [ObservableProperty] private string _imagePromptTemplate = string.Empty;
+    [ObservableProperty] private string _imagePipelineMaxConcurrentRequests = "0";
+    [ObservableProperty] private string _imageSummaryTotalTimeoutSeconds = "240";
+    [ObservableProperty] private string _imagePromptTotalTimeoutSeconds = "120";
     [ObservableProperty] private bool _imageCaptionEnabled;
     [ObservableProperty] private bool _videoCaptionEnabled;
     [ObservableProperty] private bool _voiceTranscriptionEnabled;
@@ -363,6 +366,9 @@ public sealed partial class MainViewModel : ObservableObject
         ImageRetryAttempts = ReadString("image_gen", "retry_5xx_attempts", "5");
         ImageMaxConcurrentPerKey = ReadString("image_gen", "max_concurrent_per_key", "0");
         ImagePromptTemplate = ReadString("image_gen", "prompt_template", string.Empty);
+        ImagePipelineMaxConcurrentRequests = ReadString("image_pipeline", "max_concurrent_requests", "0");
+        ImageSummaryTotalTimeoutSeconds = ReadString("image_pipeline", "summary_total_timeout_seconds", "240");
+        ImagePromptTotalTimeoutSeconds = ReadString("image_pipeline", "prompt_total_timeout_seconds", "120");
         ImageCaptionEnabled = ReadBool("image_caption", "enabled", false);
         VideoCaptionEnabled = ReadBool("video_caption", "enabled", false);
         VoiceTranscriptionEnabled = ReadBool("voice_transcription", "enabled", false);
@@ -712,6 +718,9 @@ public sealed partial class MainViewModel : ObservableObject
         AddNumberIfChanged(operations, "image_gen", "retry_5xx_attempts", ImageRetryAttempts, 5);
         AddNumberIfChanged(operations, "image_gen", "max_concurrent_per_key", ImageMaxConcurrentPerKey, 0);
         AddOptionalIfChanged(operations, "image_gen", "prompt_template", ImagePromptTemplate);
+        AddNumberIfChanged(operations, "image_pipeline", "max_concurrent_requests", ImagePipelineMaxConcurrentRequests, 0);
+        AddNumberIfChanged(operations, "image_pipeline", "summary_total_timeout_seconds", ImageSummaryTotalTimeoutSeconds, 240);
+        AddNumberIfChanged(operations, "image_pipeline", "prompt_total_timeout_seconds", ImagePromptTotalTimeoutSeconds, 120);
         AddBoolIfChanged(operations, "image_caption", "enabled", ImageCaptionEnabled);
         AddBoolIfChanged(operations, "video_caption", "enabled", VideoCaptionEnabled);
         AddBoolIfChanged(operations, "voice_transcription", "enabled", VoiceTranscriptionEnabled);

@@ -152,6 +152,8 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 
 定时总结由 `[scheduled_summary]` 控制，默认每天本地时间 22:00 汇总 24 小时。定时任务不受手动图片冷却影响。
 
+图片摘要与图片提示词共用独立的 `[image_pipeline]` 槽位池，图片提示词优先于等待中的图片摘要。默认 `max_concurrent_requests = 0` 会按本批启用图片总结的定时群数自动分配槽位；可设置正整数作为上限。图片生成 API 本身不占该槽位池。`summary_total_timeout_seconds` 和 `prompt_total_timeout_seconds` 分别限制两个 LLM 阶段（包含重试）的最长占槽时间。
+
 ## 媒体与图片
 
 | 功能 | 配置段 | 说明 |
