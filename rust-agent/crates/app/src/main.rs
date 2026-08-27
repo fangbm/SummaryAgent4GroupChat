@@ -25,6 +25,7 @@ mod report_schedule;
 mod summary_input;
 mod history_rules;
 mod media_rules;
+mod media_service;
 
 use runtime_log::*;
 
@@ -3007,10 +3008,10 @@ async fn run_summary_pipeline(
         ),
     );
 
-    let image_caption_count = apply_image_captions(config, &trigger.room_id, &mut history).await?;
-    let video_caption_count = apply_video_captions(config, &trigger.room_id, &mut history).await?;
-    let voice_transcription_count =
-        apply_voice_transcriptions(config, &trigger.room_id, &mut history).await?;
+    let media = media_service::enrich_history(config, &trigger.room_id, &mut history).await?;
+    let image_caption_count = media.images;
+    let video_caption_count = media.videos;
+    let voice_transcription_count = media.voices;
 
     let prepared_input = summary_input::prepare(config, history);
     let chat_messages = prepared_input.messages;
@@ -3022,7 +3023,7 @@ async fn run_summary_pipeline(
             None,
             None,
             chat_messages.len() as u64,
-            (image_caption_count + video_caption_count + voice_transcription_count) as u64,
+            media.total() as u64,
         );
     }
     if prepared_input.total_messages == 0 {
@@ -3103,7 +3104,7 @@ async fn run_summary_pipeline(
                 None,
                 None,
                 chat_messages.len() as u64,
-                (image_caption_count + video_caption_count + voice_transcription_count) as u64,
+                media.total() as u64,
             );
         }
         let summary_result = complete_text_summary_with_refusal_retry(
@@ -3123,7 +3124,7 @@ async fn run_summary_pipeline(
                 Some(&summary),
                 None,
                 chat_messages.len() as u64,
-                (image_caption_count + video_caption_count + voice_transcription_count) as u64,
+                media.total() as u64,
             );
         }
         info!(
@@ -5332,7 +5333,7 @@ fn format_media_decode_limit(limit: Option<usize>) -> String {
         .unwrap_or_else(|| "unlimited".to_string())
 }
 
-async fn apply_image_captions(
+pub(crate) async fn apply_image_captions(
     config: &AgentConfig,
     room_id: &str,
     history: &mut [PlatformHistoryMessage],
@@ -5527,7 +5528,7 @@ fn spawn_image_caption_task(
     });
 }
 
-async fn apply_video_captions(
+pub(crate) async fn apply_video_captions(
     config: &AgentConfig,
     room_id: &str,
     history: &mut [PlatformHistoryMessage],
@@ -5714,7 +5715,7 @@ fn spawn_video_caption_task(
     });
 }
 
-async fn apply_voice_transcriptions(
+pub(crate) async fn apply_voice_transcriptions(
     config: &AgentConfig,
     room_id: &str,
     history: &mut [PlatformHistoryMessage],
