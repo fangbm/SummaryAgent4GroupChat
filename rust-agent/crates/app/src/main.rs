@@ -23,6 +23,7 @@ mod runtime_log;
 mod outbox;
 mod report_schedule;
 mod summary_input;
+mod history_rules;
 
 use runtime_log::*;
 
@@ -1276,7 +1277,7 @@ fn poll_wxdb_command_room(
             continue;
         }
         let content = message.content.trim().to_string();
-        if content.is_empty() || is_agent_status_content(&content) {
+        if content.is_empty() || history_rules::is_agent_status_content(&content) {
             continue;
         }
         let incoming = IncomingMessage {
@@ -2181,8 +2182,8 @@ impl RecentObservedMessages {
                     && message.msg_type == "text"
                     && !message.is_self
                     && !message.content.trim().is_empty()
-                    && !is_current_incoming_message(message, incoming)
-                    && !is_agent_status_content(&message.content)
+                    && !history_rules::is_current_incoming(message, incoming)
+                    && !history_rules::is_agent_status_content(&message.content)
             })
             .count()
     }
@@ -2986,7 +2987,7 @@ async fn run_summary_pipeline(
         }
     }
     history.retain(|message| {
-        !is_current_trigger_message(message, incoming) && !is_agent_status_message(message)
+        !history_rules::is_current_trigger(message, incoming) && !history_rules::is_agent_status(message)
     });
     let filtered_history_len = history.len();
     let removed_history_len = raw_history_len.saturating_sub(filtered_history_len);
@@ -5285,51 +5286,6 @@ fn cloud_blocked(config: &AgentConfig, room_id: &str) -> bool {
                 .any(|room| room == room_id))
 }
 
-fn is_current_trigger_message(
-    message: &PlatformHistoryMessage,
-    incoming: &IncomingMessage,
-) -> bool {
-    message.timestamp == incoming.timestamp
-        && (message
-            .stable_id
-            .as_deref()
-            .zip(incoming.stable_id.as_deref())
-            .is_some_and(|(left, right)| stable_ids_match(left, right))
-            || (message.stable_id.is_none()
-                && incoming.stable_id.is_none()
-                && message.content.trim() == incoming.content.trim()
-                && (message.sender_id == incoming.sender_id || message.is_self)))
-}
-
-fn is_current_incoming_message(message: &IncomingMessage, incoming: &IncomingMessage) -> bool {
-    message.timestamp == incoming.timestamp
-        && (message
-            .stable_id
-            .as_deref()
-            .zip(incoming.stable_id.as_deref())
-            .is_some_and(|(left, right)| stable_ids_match(left, right))
-            || (message.stable_id.is_none()
-                && incoming.stable_id.is_none()
-                && message.content.trim() == incoming.content.trim()
-                && message.sender_id == incoming.sender_id))
-}
-
-fn is_agent_status_message(message: &PlatformHistoryMessage) -> bool {
-    is_agent_status_content(&message.content)
-}
-
-fn is_agent_status_content(content: &str) -> bool {
-    let content = content.trim();
-    content.starts_with("收到 /总结")
-        || content.starts_with("收到 #总结")
-        || content.starts_with("总结失败：")
-        || content.starts_with("这段时间没有可总结的文本聊天记录")
-        || content.starts_with("历史读取暂时为空")
-        || content.starts_with("当前配置未开启文字总结或图片生成")
-        || content.starts_with("群聊总结（")
-        || content.contains("暂时失败，正在重试")
-}
-
 fn format_summary_reply(summary: &str, range: &ResolvedTimeRange, total_messages: usize) -> String {
     format!(
         "群聊总结（{} - {}，{} 条）\n\n{}",
@@ -6398,7 +6354,7 @@ mod tests {
             is_self: false,
         };
 
-        assert!(is_current_trigger_message(&history, &incoming));
+        assert!(history_rules::is_current_trigger(&history, &incoming));
     }
 
     #[test]
@@ -6479,7 +6435,7 @@ mod tests {
             is_self: true,
         };
 
-        assert!(is_agent_status_message(&message));
+        assert!(history_rules::is_agent_status(&message));
     }
 
     #[test]
