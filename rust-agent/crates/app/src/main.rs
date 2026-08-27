@@ -21,11 +21,12 @@ use std::os::windows::process::CommandExt;
 mod platform;
 mod runtime_log;
 mod outbox;
+mod report_schedule;
 
 use runtime_log::*;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -611,7 +612,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
     }
 
     let mut scheduled_backlog = ScheduledSummaryBacklog::default();
-    let mut next_weekly_runs = weekly_report_schedule(Utc::now(), config);
+    let mut next_weekly_runs = report_schedule::schedule(Utc::now(), config);
     loop {
         let old_fingerprint = platform.fingerprint.clone();
         let old_watcher_fingerprint = platform.watcher_fingerprint.clone();
@@ -637,7 +638,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 scheduled_backlog.clear_retry();
             }
             next_scheduled_run = next_scheduled_run_after(Utc::now(), config);
-            next_weekly_runs = weekly_report_schedule(Utc::now(), config);
+            next_weekly_runs = report_schedule::schedule(Utc::now(), config);
             if let Some(run_at) = next_scheduled_run {
                 info!(
                     run_at_utc = %run_at,
@@ -703,7 +704,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 }
             });
             if let Some(group) = config.report_groups.get(&name) {
-                if let Some(next) = next_weekly_report_run_after(now + Duration::seconds(1), group) {
+                if let Some(next) = report_schedule::next_run_after(now + Duration::seconds(1), group) {
                     next_weekly_runs.insert(name, next);
                 }
             }
@@ -5030,36 +5031,6 @@ fn next_scheduled_run_after(now: DateTime<Utc>, config: &AgentConfig) -> Option<
         Some(run_at)
     } else {
         Some(run_at + Duration::days(1))
-    }
-}
-
-fn weekly_report_schedule(now: DateTime<Utc>, config: &AgentConfig) -> HashMap<String, DateTime<Utc>> {
-    config
-        .report_groups
-        .iter()
-        .filter(|(_, group)| group.enabled && !group.rooms.is_empty())
-        .filter_map(|(name, group)| next_weekly_report_run_after(now, group).map(|run_at| (name.clone(), run_at)))
-        .collect()
-}
-
-fn next_weekly_report_run_after(
-    now: DateTime<Utc>,
-    group: &wechat_summary_core::config::ReportGroupConfig,
-) -> Option<DateTime<Utc>> {
-    if group.weekday > 6 || group.local_hour > 23 || group.local_minute > 59 {
-        return None;
-    }
-    let local_now = now.with_timezone(&Local);
-    let current_day = local_now.weekday().num_days_from_monday();
-    let days = (group.weekday + 7 - current_day) % 7;
-    let candidate_date = local_now.date_naive() + Duration::days(days as i64);
-    let candidate = Local
-        .from_local_datetime(&candidate_date.and_hms_opt(group.local_hour, group.local_minute, 0)?)
-        .single()?;
-    if candidate <= local_now {
-        Some((candidate + Duration::days(7)).with_timezone(&Utc))
-    } else {
-        Some(candidate.with_timezone(&Utc))
     }
 }
 
