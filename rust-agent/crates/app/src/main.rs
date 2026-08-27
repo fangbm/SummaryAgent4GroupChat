@@ -20,6 +20,7 @@ use std::os::windows::process::CommandExt;
 
 mod platform;
 mod runtime_log;
+mod outbox;
 
 use runtime_log::*;
 
@@ -40,7 +41,7 @@ use wechat_summary_core::{
     TriggerMatch, TriggerMatcher,
 };
 use wechat_summary_storage::{
-    DeliveryState, NewTask, SourceReference, SqliteStateStore, TaskState,
+    NewTask, SourceReference, SqliteStateStore, TaskState,
 };
 
 use crate::platform::{
@@ -96,8 +97,8 @@ struct PendingSummaryTask {
 
 #[derive(Clone)]
 struct OperationalTask {
-    id: String,
-    store: SqliteStateStore,
+    pub(crate) id: String,
+    pub(crate) store: SqliteStateStore,
 }
 
 impl OperationalTask {
@@ -4882,26 +4883,7 @@ async fn deliver_outboxed_text(
     client: &PlatformWorker,
     room_id: &str,
     text: &str,
-) -> Result<()> {
-    let payload = redact_operational_payload(config, text);
-    let delivery = task
-        .store
-        .enqueue_delivery(Some(&task.id), room_id, "text", &payload)
-        .context("enqueueing summary text delivery")?;
-    task.store
-        .update_delivery(&delivery.id, DeliveryState::Sending, 1, Utc::now(), None)?;
-    match client.send_text(room_id, &payload).await {
-        Ok(()) => {
-            task.store
-                .update_delivery(&delivery.id, DeliveryState::Delivered, 1, Utc::now(), None)?;
-            Ok(())
-        }
-        Err(error) => {
-            schedule_delivery_failure(config, &task.store, &delivery, &error)?;
-            Err(error).context("sending outboxed summary text")
-        }
-    }
-}
+) -> Result<()> { outbox::deliver_text(config, task, client, room_id, text).await }
 
 async fn deliver_outboxed_image(
     config: &AgentConfig,
@@ -4909,110 +4891,13 @@ async fn deliver_outboxed_image(
     client: &PlatformWorker,
     room_id: &str,
     artifact: &ImageArtifact,
-) -> Result<()> {
-    let delivery = task
-        .store
-        .enqueue_delivery(Some(&task.id), room_id, "image", &artifact.path)
-        .context("enqueueing summary image delivery")?;
-    task.store
-        .update_delivery(&delivery.id, DeliveryState::Sending, 1, Utc::now(), None)?;
-    match client.send_image(room_id, &artifact.path).await {
-        Ok(()) => {
-            task.store
-                .update_delivery(&delivery.id, DeliveryState::Delivered, 1, Utc::now(), None)?;
-            Ok(())
-        }
-        Err(error) => {
-            schedule_delivery_failure(config, &task.store, &delivery, &error)?;
-            Err(error).context("sending outboxed summary image")
-        }
-    }
-}
+) -> Result<()> { outbox::deliver_image(config, task, client, room_id, artifact).await }
 
 async fn drain_outbox(
     config: &AgentConfig,
     store: &SqliteStateStore,
     client: &PlatformWorker,
-) -> Result<()> {
-    for delivery in store.due_deliveries(8)? {
-        store.update_delivery(
-            &delivery.id,
-            DeliveryState::Sending,
-            delivery.attempts.saturating_add(1),
-            Utc::now(),
-            None,
-        )?;
-        let result = match delivery.kind.as_str() {
-            "text" => client.send_text(&delivery.room_id, &delivery.payload).await,
-            "image" => client.send_image(&delivery.room_id, &delivery.payload).await,
-            _ => Err(anyhow::anyhow!("unsupported outbox delivery kind {}", delivery.kind)),
-        };
-        match result {
-            Ok(()) => store.update_delivery(
-                &delivery.id,
-                DeliveryState::Delivered,
-                delivery.attempts.saturating_add(1),
-                Utc::now(),
-                None,
-            )?,
-            Err(error) => schedule_delivery_failure(config, store, &delivery, &error)?,
-        }
-    }
-    Ok(())
-}
-
-fn schedule_delivery_failure(
-    config: &AgentConfig,
-    store: &SqliteStateStore,
-    delivery: &wechat_summary_storage::DeliveryRecord,
-    error: &anyhow::Error,
-) -> Result<()> {
-    let message = format_error_chain(error);
-    let now = Utc::now();
-    if delivery_may_have_reached_platform(&message) {
-        store.update_delivery(
-            &delivery.id,
-            DeliveryState::Uncertain,
-            delivery.attempts.saturating_add(1),
-            now,
-            Some(&message),
-        )?;
-        return Ok(());
-    }
-    let elapsed = now - delivery.created_at;
-    let retry_window = Duration::seconds(config.operations.outbox_retry_window_seconds.max(1));
-    if elapsed >= retry_window {
-        store.update_delivery(
-            &delivery.id,
-            DeliveryState::Failed,
-            delivery.attempts.saturating_add(1),
-            now,
-            Some(&message),
-        )?;
-        return Ok(());
-    }
-    let exponent = delivery.attempts.min(6);
-    let delay_seconds = (5_i64 * (1_i64 << exponent)).min(300);
-    store.update_delivery(
-        &delivery.id,
-        DeliveryState::Pending,
-        delivery.attempts.saturating_add(1),
-        now + Duration::seconds(delay_seconds),
-        Some(&message),
-    )?;
-    Ok(())
-}
-
-fn delivery_may_have_reached_platform(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("ack") || error.contains("timed out") || error.contains("timeout")
-}
-
-fn redact_operational_payload(config: &AgentConfig, value: &str) -> String {
-    let mut privacy = config.privacy.clone();
-    privacy.redact_enabled = true;
-    PrivacyFilter::new(privacy).apply(value)
-}
+) -> Result<()> { outbox::drain(config, store, client).await }
 
 async fn send_deferred_summary_text(
     config: &AgentConfig,
