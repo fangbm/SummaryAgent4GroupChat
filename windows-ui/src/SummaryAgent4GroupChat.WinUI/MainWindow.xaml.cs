@@ -42,6 +42,12 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        if (tag == "tasks")
+        {
+            ContentFrame.Navigate(typeof(TaskCenterPage), ViewModel);
+            return;
+        }
+
         if (tag == "updates")
         {
             ContentFrame.Navigate(typeof(UpdatesPage), ViewModel);

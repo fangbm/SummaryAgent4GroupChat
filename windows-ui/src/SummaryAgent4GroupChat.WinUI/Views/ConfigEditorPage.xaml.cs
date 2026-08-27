@@ -49,6 +49,7 @@ public sealed partial class ConfigEditorPage : Page
 
     private async void Validate_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null) await ViewModel.ValidateAsync(); }
     private async void Save_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null) await ViewModel.SaveAsync(); }
+    private async void SavePoliciesAndReports_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null) await ViewModel.SavePoliciesAndReportsAsync(); }
     private async void SaveRaw_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null) await ViewModel.SaveRawConfigAsync(); }
     private async void Refresh_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null) await ViewModel.RefreshAsync(); }
     private async void OpenConfig_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null) await ViewModel.OpenPathAsync("config"); }

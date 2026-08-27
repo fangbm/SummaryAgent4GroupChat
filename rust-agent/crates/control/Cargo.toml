@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,3 +19,4 @@ uuid.workspace = true
 windows-sys.workspace = true
 reqwest.workspace = true
 wechat-summary-core = { path = "../core" }
+wechat-summary-storage = { path = "../storage" }

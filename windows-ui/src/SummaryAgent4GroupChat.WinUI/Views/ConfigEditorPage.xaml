@@ -39,6 +39,15 @@
                         <StackPanel Grid.Row="2" Grid.Column="1" Spacing="5"><TextBlock Text="wxdb 缓存目录（留空使用默认位置）" /><TextBox Text="{Binding WxdbCacheDirectory, Mode=TwoWay}" /></StackPanel>
                     </Grid>
                     <StackPanel Spacing="5"><TextBlock Text="禁用图片总结的群聊（逗号或换行分隔）" /><TextBox Text="{Binding DisabledImageRooms, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="72" /></StackPanel>
+                    <Expander Header="房间策略模板与群组周报" IsExpanded="False">
+                        <StackPanel Spacing="10" Padding="0,12,0,0">
+                            <TextBlock Text="策略模板 JSON：模板字段可包含 text_summary_enabled、image_summary_enabled、image_caption_enabled、video_caption_enabled、voice_transcription_enabled 和冷却时间。房间通过 room_capabilities.&lt;群名&gt;.template 绑定模板。" TextWrapping="Wrap" Opacity="0.72" />
+                            <TextBox Text="{Binding PolicyTemplatesJson, Mode=TwoWay}" FontFamily="Cascadia Mono" AcceptsReturn="True" TextWrapping="NoWrap" MinHeight="150" ScrollViewer.VerticalScrollBarVisibility="Auto" />
+                            <TextBlock Text="群组周报 JSON：每个条目包含 enabled、rooms、weekday（周一为 0）、local_hour、local_minute。周报仅聚合运行统计，并向 rooms 中所有群发送图表和简短说明。" TextWrapping="Wrap" Opacity="0.72" />
+                            <TextBox Text="{Binding ReportGroupsJson, Mode=TwoWay}" FontFamily="Cascadia Mono" AcceptsReturn="True" TextWrapping="NoWrap" MinHeight="150" ScrollViewer.VerticalScrollBarVisibility="Auto" />
+                            <Button Content="保存策略与群组" Click="SavePoliciesAndReports_Click" HorizontalAlignment="Left" />
+                        </StackPanel>
+                    </Expander>
                 </StackPanel>
 
                 <StackPanel x:Name="ListenPanel" Spacing="14" Visibility="Collapsed">
@@ -119,6 +128,10 @@
                         <CheckBox Grid.Column="1" Content="允许接口官方回退" IsChecked="{Binding ImageOfficialFallback, Mode=TwoWay}" VerticalAlignment="Bottom" />
                     </Grid>
                     <StackPanel Spacing="5"><TextBlock Text="图片提示词模板（可用 {summary}，留空使用默认）" /><TextBox Text="{Binding ImagePromptTemplate, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="72" /></StackPanel>
+                    <StackPanel Spacing="5">
+                        <TextBlock Text="备用供应商路由（主供应商失败后按顺序尝试；密钥仅在保存时写入，不会回显）" TextWrapping="Wrap" />
+                        <TextBox Text="{Binding ProviderFallbacksJson, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" FontFamily="Cascadia Mono" FontSize="13" AcceptsReturn="True" TextWrapping="NoWrap" MinHeight="180" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" />
+                    </StackPanel>
                 </StackPanel>
 
                 <Expander Header="高级配置（请求体覆写、提示词与未覆盖字段）" IsExpanded="False">

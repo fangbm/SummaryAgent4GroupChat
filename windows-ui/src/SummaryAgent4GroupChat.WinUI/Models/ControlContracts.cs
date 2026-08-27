@@ -29,3 +29,39 @@ public sealed record UpdateCheckItem(
     bool CanInstall,
     string Target,
     string? PackageName);
+
+public sealed record TaskCenterItem(
+    string Id,
+    string RoomId,
+    string Source,
+    string State,
+    string Stage,
+    string CreatedAt,
+    string? Summary,
+    string? Error,
+    ulong MessageCount,
+    ulong MediaCount);
+
+public sealed record OutboxItem(
+    string Id,
+    string RoomId,
+    string Kind,
+    string State,
+    uint Attempts,
+    string NextAttemptAt,
+    string? Error);
+
+public sealed record ProviderHealthItem(
+    string Capability,
+    string ProviderKey,
+    uint ConsecutiveFailures,
+    string? CircuitOpenUntil,
+    string? LastError,
+    string UpdatedAt);
+
+public sealed record SourceReferenceItem(
+    uint PointIndex,
+    string SourceId,
+    string OccurredAt,
+    string SenderLabel,
+    uint MessageIndex);

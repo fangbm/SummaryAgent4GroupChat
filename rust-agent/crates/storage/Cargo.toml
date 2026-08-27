@@ -9,5 +9,6 @@ rust-version.workspace = true
 [dependencies]
 chrono.workspace = true
 rusqlite.workspace = true
+uuid.workspace = true
 thiserror.workspace = true
 

@@ -13,6 +13,7 @@
             <NavigationViewItem Content="接入平台" Tag="platform" />
             <NavigationViewItem Content="监听与命令" Tag="listen" />
             <NavigationViewItem Content="定时总结" Tag="schedule" />
+            <NavigationViewItem Content="任务中心" Tag="tasks" />
             <NavigationViewItem Content="模型与媒体" Tag="models" />
             <NavigationViewItem Content="运行信息" Tag="runtime" />
             <NavigationViewItem Content="更新与依赖" Tag="updates" />

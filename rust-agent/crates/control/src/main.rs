@@ -28,6 +28,7 @@ use tokio::{
 };
 use uuid::Uuid;
 use wechat_summary_core::AgentConfig;
+use wechat_summary_storage::{DeliveryState, NewTask, SqliteStateStore, TaskState};
 
 const PROTOCOL_VERSION: u32 = 1;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -388,6 +389,7 @@ async fn serve_connection(
     let is_subscription = matches!(
         request.method.as_str(),
         "output.subscribe" | "logs.subscribe" | "status.subscribe" | "operation.subscribe"
+            | "tasks.subscribe" | "outbox.subscribe" | "providers.subscribe"
     );
     let response = match dispatch(&state, &request.method, &request.params).await {
         Ok(result) => Response {
@@ -415,7 +417,10 @@ async fn serve_connection(
                 if (topic == "output" && event.event == "output")
                     || (topic == "logs" && event.event == "log")
                     || (topic == "status" && event.event == "status.changed")
-                    || (topic == "operation" && event.event.starts_with("operation.")) =>
+                    || (topic == "operation" && event.event.starts_with("operation."))
+                    || (topic == "tasks" && event.event.starts_with("task."))
+                    || (topic == "outbox" && event.event.starts_with("outbox."))
+                    || (topic == "providers" && event.event.starts_with("provider.")) =>
             {
                 write_event(&mut pipe, event).await?;
             }
@@ -470,7 +475,17 @@ async fn dispatch(
         "path.open" => path_open(state, params),
         "logs.tail" => logs_tail(state),
         "update.check" => update_check(state).await,
-        "output.subscribe" | "logs.subscribe" | "status.subscribe" | "operation.subscribe" => {
+        "tasks.list" => tasks_list(state, params),
+        "tasks.get" => task_get(state, params),
+        "tasks.cancel" => task_cancel(state, params),
+        "tasks.retry" => task_retry(state, params),
+        "outbox.list" => outbox_list(state, params),
+        "outbox.retry" => outbox_retry(state, params),
+        "outbox.resolve" => outbox_resolve(state, params),
+        "providers.health" => providers_health(state),
+        "report-groups.read" => report_groups_read(state),
+        "output.subscribe" | "logs.subscribe" | "status.subscribe" | "operation.subscribe"
+        | "tasks.subscribe" | "outbox.subscribe" | "providers.subscribe" => {
             Ok(json!({ "subscribed": true }))
         }
         _ => {
@@ -480,6 +495,125 @@ async fn dispatch(
         }
     };
     result.map_err(ApiError::internal)
+}
+
+fn operational_store(state: &ControlState) -> Result<SqliteStateStore> {
+    let config = AgentConfig::from_path(&state.paths.config_path)?;
+    SqliteStateStore::open(&config.storage.sqlite_path)
+        .context("opening operational state store")
+}
+
+fn requested_limit(params: &Value) -> usize {
+    params.get("limit").and_then(Value::as_u64).unwrap_or(100).clamp(1, 500) as usize
+}
+
+fn task_to_json(task: &wechat_summary_storage::TaskRecord) -> Value {
+    json!({
+        "id": task.id, "room_id": task.room_id, "source": task.source,
+        "state": format!("{:?}", task.state).to_ascii_lowercase(), "stage": task.stage,
+        "since": task.since, "until": task.until, "created_at": task.created_at,
+        "started_at": task.started_at, "completed_at": task.completed_at,
+        "summary": task.summary, "error": task.error, "retry_of": task.retry_of,
+        "message_count": task.message_count, "media_count": task.media_count,
+    })
+}
+
+fn delivery_to_json(delivery: &wechat_summary_storage::DeliveryRecord) -> Value {
+    json!({
+        "id": delivery.id, "task_id": delivery.task_id, "room_id": delivery.room_id,
+        "kind": delivery.kind, "state": format!("{:?}", delivery.state).to_ascii_lowercase(),
+        "attempts": delivery.attempts, "next_attempt_at": delivery.next_attempt_at,
+        "created_at": delivery.created_at, "updated_at": delivery.updated_at, "error": delivery.error,
+    })
+}
+
+fn required_id(params: &Value) -> Result<&str> {
+    params.get("id").and_then(Value::as_str).filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("params.id must be a non-empty string"))
+}
+
+fn tasks_list(state: &ControlState, params: &Value) -> Result<Value> {
+    let store = operational_store(state)?;
+    let room_id = params.get("room_id").and_then(Value::as_str);
+    let state_filter = match params.get("state").and_then(Value::as_str) {
+        Some("queued") => Some(TaskState::Queued), Some("running") => Some(TaskState::Running),
+        Some("succeeded") => Some(TaskState::Succeeded), Some("failed") => Some(TaskState::Failed),
+        Some("cancelled") => Some(TaskState::Cancelled), _ => None,
+    };
+    let tasks = store.tasks(requested_limit(params), room_id, state_filter)?;
+    Ok(json!({ "tasks": tasks.iter().map(task_to_json).collect::<Vec<_>>() }))
+}
+
+fn task_get(state: &ControlState, params: &Value) -> Result<Value> {
+    let store = operational_store(state)?;
+    let id = required_id(params)?;
+    let task = store.task(id)?.ok_or_else(|| anyhow!("task not found"))?;
+    let sources = store.source_references(id)?.into_iter().map(|source| json!({
+        "point_index": source.point_index, "source_id": source.source_id,
+        "occurred_at": source.occurred_at, "sender_label": source.sender_label,
+        "message_index": source.message_index,
+    })).collect::<Vec<_>>();
+    Ok(json!({ "task": task_to_json(&task), "sources": sources }))
+}
+
+fn task_cancel(state: &ControlState, params: &Value) -> Result<Value> {
+    let store = operational_store(state)?;
+    let id = required_id(params)?;
+    let task = store.task(id)?.ok_or_else(|| anyhow!("task not found"))?;
+    store.update_task(&task.id, TaskState::Cancelled, "cancelled", None, Some("cancelled from task center"), task.message_count, task.media_count)?;
+    emit(state, "task.changed", json!({ "id": id, "state": "cancelled" }));
+    Ok(json!({ "cancelled": true }))
+}
+
+fn task_retry(state: &ControlState, params: &Value) -> Result<Value> {
+    let store = operational_store(state)?;
+    let original = store.task(required_id(params)?)?.ok_or_else(|| anyhow!("task not found"))?;
+    let retry = store.create_task(NewTask {
+        room_id: &original.room_id, source: "manual_retry", since: original.since, until: original.until,
+        config_revision: &original.config_revision, retry_of: Some(&original.id),
+    })?;
+    emit(state, "task.changed", json!({ "id": retry.id, "state": "queued", "retry_of": original.id }));
+    Ok(json!({ "task": task_to_json(&retry) }))
+}
+
+fn outbox_list(state: &ControlState, params: &Value) -> Result<Value> {
+    let store = operational_store(state)?;
+    let deliveries = store.deliveries(requested_limit(params))?;
+    Ok(json!({ "deliveries": deliveries.iter().map(delivery_to_json).collect::<Vec<_>>() }))
+}
+
+fn outbox_retry(state: &ControlState, params: &Value) -> Result<Value> {
+    let store = operational_store(state)?;
+    store.retry_delivery(required_id(params)?)?;
+    emit(state, "outbox.changed", json!({ "id": required_id(params)?, "state": "pending" }));
+    Ok(json!({ "queued": true }))
+}
+
+fn outbox_resolve(state: &ControlState, params: &Value) -> Result<Value> {
+    let store = operational_store(state)?;
+    let id = required_id(params)?;
+    let action = params.get("action").and_then(Value::as_str).unwrap_or("cancel");
+    if action == "retry" { store.retry_delivery(id)?; }
+    else { store.update_delivery(id, DeliveryState::Cancelled, 0, chrono::Utc::now(), Some("resolved from task center"))?; }
+    emit(state, "outbox.changed", json!({ "id": id, "action": action }));
+    Ok(json!({ "resolved": true }))
+}
+
+fn providers_health(state: &ControlState) -> Result<Value> {
+    let entries = operational_store(state)?.provider_health()?;
+    Ok(json!({ "providers": entries.into_iter().map(|entry| json!({
+        "capability": entry.capability, "provider_key": entry.provider_key,
+        "consecutive_failures": entry.consecutive_failures, "circuit_open_until": entry.circuit_open_until,
+        "last_error": entry.last_error, "updated_at": entry.updated_at,
+    })).collect::<Vec<_>>() }))
+}
+
+fn report_groups_read(state: &ControlState) -> Result<Value> {
+    let config = AgentConfig::from_path(&state.paths.config_path)?;
+    Ok(json!({ "groups": config.report_groups.iter().map(|(name, group)| json!({
+        "name": name, "enabled": group.enabled, "rooms": group.rooms,
+        "weekday": group.weekday, "local_hour": group.local_hour, "local_minute": group.local_minute,
+    })).collect::<Vec<_>>() }))
 }
 
 fn status_payload(state: &ControlState) -> Result<Value> {

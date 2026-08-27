@@ -4872,6 +4872,7 @@ name = "wechat-summary-control"
 version = "0.2.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "reqwest",
  "serde",
@@ -4881,6 +4882,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "uuid",
  "wechat-summary-core",
+ "wechat-summary-storage",
  "windows-sys 0.59.0",
 ]
 
@@ -4916,6 +4918,7 @@ dependencies = [
  "chrono",
  "rusqlite",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

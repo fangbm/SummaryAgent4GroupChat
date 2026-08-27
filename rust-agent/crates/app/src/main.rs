@@ -24,7 +24,7 @@ mod runtime_log;
 use runtime_log::*;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -39,7 +39,9 @@ use wechat_summary_core::{
     AgentConfig, ChatFormatter, PrivacyFilter, ResolvedTimeRange, TimeRangeCalculator,
     TriggerMatch, TriggerMatcher,
 };
-use wechat_summary_storage::SqliteStateStore;
+use wechat_summary_storage::{
+    DeliveryState, NewTask, SourceReference, SqliteStateStore, TaskState,
+};
 
 use crate::platform::{
     PlatformClient, PlatformEvent, PlatformHistoryCursor, PlatformHistoryMessage, PlatformSender,
@@ -90,6 +92,44 @@ type SummaryFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 struct PendingSummaryTask {
     room_id: String,
     future: SummaryFuture,
+}
+
+#[derive(Clone)]
+struct OperationalTask {
+    id: String,
+    store: SqliteStateStore,
+}
+
+impl OperationalTask {
+    fn set_stage(
+        &self,
+        state: TaskState,
+        stage: &str,
+        summary: Option<&str>,
+        error: Option<&str>,
+        message_count: u64,
+        media_count: u64,
+    ) {
+        if let Err(error) = self.store.update_task(
+            &self.id,
+            state,
+            stage,
+            summary,
+            error,
+            message_count,
+            media_count,
+        ) {
+            warn!(task_id = %self.id, error = %error, "failed to update operational task");
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.store
+            .task(&self.id)
+            .ok()
+            .flatten()
+            .is_some_and(|task| task.state == TaskState::Cancelled)
+    }
 }
 
 struct SummaryTaskScheduler {
@@ -526,6 +566,9 @@ async fn run_agent(config_path: &str) -> Result<()> {
 
     let store = SqliteStateStore::open(&config.storage.sqlite_path)
         .with_context(|| format!("opening state store {}", config.storage.sqlite_path))?;
+    store
+        .cleanup_operational_data(config.operations.retention_days)
+        .context("cleaning expired operational records")?;
     let mut platform = PlatformRuntime::start(config).await?;
     let recent_trigger_attempts = Arc::new(Mutex::new(RecentTriggerAttempts::default()));
     let recent_observed_messages = Arc::new(Mutex::new(RecentObservedMessages::default()));
@@ -567,6 +610,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
     }
 
     let mut scheduled_backlog = ScheduledSummaryBacklog::default();
+    let mut next_weekly_runs = weekly_report_schedule(Utc::now(), config);
     loop {
         let old_fingerprint = platform.fingerprint.clone();
         let old_watcher_fingerprint = platform.watcher_fingerprint.clone();
@@ -592,6 +636,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 scheduled_backlog.clear_retry();
             }
             next_scheduled_run = next_scheduled_run_after(Utc::now(), config);
+            next_weekly_runs = weekly_report_schedule(Utc::now(), config);
             if let Some(run_at) = next_scheduled_run {
                 info!(
                     run_at_utc = %run_at,
@@ -606,8 +651,12 @@ async fn run_agent(config_path: &str) -> Result<()> {
         platform.reconnect_if_due(config).await;
         platform.restart_watcher_if_due(config);
         scheduler.reap(config);
+        if let Err(error) = drain_outbox(config, &store, &platform.worker).await {
+            warn!(error = %error, "outbox drain failed");
+        }
         if Instant::now() >= next_artifact_cleanup {
             cleanup_runtime_artifacts(config);
+            let _ = store.cleanup_operational_data(config.operations.retention_days);
             next_artifact_cleanup = Instant::now() + StdDuration::from_secs(6 * 60 * 60);
         }
         if next_scheduled_run.is_some_and(|run_at| now >= run_at) {
@@ -632,12 +681,46 @@ async fn run_agent(config_path: &str) -> Result<()> {
             }
         }
 
+        let due_weekly_reports = next_weekly_runs
+            .iter()
+            .filter(|(_, run_at)| now >= **run_at)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in due_weekly_reports {
+            let config_for_report = config.clone();
+            let store_for_report = store.clone();
+            let worker_for_report = platform.worker.clone();
+            let task_group_name = name.clone();
+            tokio::spawn(async move {
+                if let Err(error) = run_weekly_group_report(
+                    &config_for_report,
+                    &store_for_report,
+                    &worker_for_report,
+                    &task_group_name,
+                ).await {
+                    append_runtime_log(&config_for_report, &format!("weekly report failed group={} error={error:#}", task_group_name));
+                }
+            });
+            if let Some(group) = config.report_groups.get(&name) {
+                if let Some(next) = next_weekly_report_run_after(now + Duration::seconds(1), group) {
+                    next_weekly_runs.insert(name, next);
+                }
+            }
+        }
+
         drain_scheduled_backlog(
             config,
             &store,
             &platform.worker,
             &image_pipeline_slots,
             &mut scheduled_backlog,
+            &mut scheduler,
+        );
+        drain_manual_retry_tasks(
+            config,
+            &store,
+            &platform.worker,
+            &image_pipeline_slots,
             &mut scheduler,
         );
 
@@ -1864,6 +1947,23 @@ async fn handle_platform_event(
         &config.time_range,
         command.range_minutes,
     );
+    let task = OperationalTask {
+        id: store
+            .create_task(NewTask {
+                room_id: &trigger.room_id,
+                source: match event_source {
+                    PlatformEventSource::Realtime => "manual",
+                    PlatformEventSource::WxdbRecovered => "manual_wxdb_recovered",
+                },
+                since: range.since,
+                until: range.until,
+                config_revision: &config_revision(config),
+                retry_of: None,
+            })?
+            .id,
+        store: store.clone(),
+    };
+    task.set_stage(TaskState::Running, "accepted", None, None, 0, 0);
 
     info!(
         room_id = %trigger.room_id,
@@ -1906,11 +2006,14 @@ async fn handle_platform_event(
             timestamp: incoming.timestamp,
         }),
         recent_observed_snapshot.as_ref(),
+        Some(&task),
     )
     .await
     {
         Ok(PipelineOutcome::SummaryProduced) => {
             store.set_last_trigger(&trigger.room_id, incoming.timestamp)?;
+            record_primary_llm_health(store, config, None);
+            task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
             info!(room_id = %trigger.room_id, "summary pipeline completed");
             append_runtime_log(
                 config,
@@ -1918,6 +2021,7 @@ async fn handle_platform_event(
             );
         }
         Ok(PipelineOutcome::NoSummary) => {
+            task.set_stage(TaskState::Succeeded, "completed_without_output", None, None, 0, 0);
             info!(room_id = %trigger.room_id, "summary pipeline completed without summary output");
             append_runtime_log(
                 config,
@@ -1929,6 +2033,8 @@ async fn handle_platform_event(
         }
         Err(error) => {
             let error_message = format_error_chain(&error);
+            record_primary_llm_health(store, config, Some(&error_message));
+            task.set_stage(TaskState::Failed, "failed", None, Some(&error_message), 0, 0);
             error!(room_id = %trigger.room_id, error = %error_message, "summary pipeline failed");
             append_runtime_log(
                 config,
@@ -2227,6 +2333,56 @@ fn requeue_scheduled_request_after_state_read_failure(
     backlog.record_retry(Instant::now());
 }
 
+fn drain_manual_retry_tasks(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    client: &PlatformWorker,
+    image_pipeline_slots: &ImagePipelineSlotPool,
+    scheduler: &mut SummaryTaskScheduler,
+) {
+    let retries = match store.queued_retry_tasks(8) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            append_runtime_log(config, &format!("manual retry task query failed error={error}"));
+            return;
+        }
+    };
+    for record in retries {
+        let room_id = record.room_id.clone();
+        let scheduler_room_id = room_id.clone();
+        let task = OperationalTask { id: record.id.clone(), store: store.clone() };
+        let task_config = config.clone();
+        let task_client = client.clone();
+        let task_slots = image_pipeline_slots.clone();
+        let task_for_future = task.clone();
+        let future = Box::pin(async move {
+            task_for_future.set_stage(TaskState::Running, "retry_accepted", None, None, 0, 0);
+            let incoming = IncomingMessage {
+                room_id: room_id.clone(), room_name: Some(room_id.clone()), stable_id: None,
+                sender_id: "task_center".to_string(), sender_name: Some("任务中心重试".to_string()),
+                content: "[task_retry]".to_string(), msg_type: "text".to_string(), timestamp: Utc::now(), is_self: true,
+            };
+            let trigger = TriggerMatch { room_id: room_id.clone(), trigger_symbol: "[task_retry]".to_string(), trigger_content: "[task_retry]".to_string() };
+            let range = ResolvedTimeRange { since: record.since, until: record.until, mode: TimeRangeMode::FixedMinutes };
+            let result = run_summary_pipeline(
+                &task_config, &task_client, &incoming, &trigger, &range,
+                PipelineOptions::manual(&task_config, &room_id, false), &task_slots,
+                Some(ImageCooldownRecorder { store: task_for_future.store.clone(), timestamp: Utc::now() }), None, Some(&task_for_future),
+            ).await;
+            match &result {
+                Ok(PipelineOutcome::SummaryProduced) => task_for_future.set_stage(TaskState::Succeeded, "retry_completed", None, None, 0, 0),
+                Ok(PipelineOutcome::NoSummary) => task_for_future.set_stage(TaskState::Succeeded, "retry_completed_without_output", None, None, 0, 0),
+                Err(error) => task_for_future.set_stage(TaskState::Failed, "retry_failed", None, Some(&format_error_chain(error)), 0, 0),
+            }
+            result.map(|_| ())
+        });
+        match scheduler.enqueue(scheduler_room_id, future) {
+            ScheduleResult::Started | ScheduleResult::Queued => {}
+            ScheduleResult::DuplicateRoom | ScheduleResult::QueueFull => break,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_scheduled_summary_task(
     config: &AgentConfig,
@@ -2248,6 +2404,20 @@ async fn run_scheduled_summary_task(
             ),
         );
     }
+    let task = OperationalTask {
+        id: store
+            .create_task(NewTask {
+                room_id: &trigger.room_id,
+                source: "scheduled",
+                since: range.since,
+                until: range.until,
+                config_revision: &config_revision(config),
+                retry_of: None,
+            })?
+            .id,
+        store: store.clone(),
+    };
+    task.set_stage(TaskState::Running, "accepted", None, None, 0, 0);
     match run_summary_pipeline(
         config,
         client,
@@ -2258,11 +2428,14 @@ async fn run_scheduled_summary_task(
         image_pipeline_slots,
         None,
         None,
+        Some(&task),
     )
     .await
     {
         Ok(PipelineOutcome::SummaryProduced) => {
             store.set_last_trigger(&trigger.room_id, now)?;
+            record_primary_llm_health(store, config, None);
+            task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
             append_runtime_log(
                 config,
                 &format!("scheduled pipeline completed room={}", trigger.room_id),
@@ -2270,6 +2443,7 @@ async fn run_scheduled_summary_task(
             Ok(())
         }
         Ok(PipelineOutcome::NoSummary) => {
+            task.set_stage(TaskState::Succeeded, "completed_without_output", None, None, 0, 0);
             append_runtime_log(
                 config,
                 &format!(
@@ -2281,6 +2455,8 @@ async fn run_scheduled_summary_task(
         }
         Err(error) => {
             let error_message = format_error_chain(&error);
+            record_primary_llm_health(store, config, Some(&error_message));
+            task.set_stage(TaskState::Failed, "failed", None, Some(&error_message), 0, 0);
             append_runtime_log(
                 config,
                 &format!(
@@ -2586,7 +2762,11 @@ async fn run_summary_pipeline(
     image_pipeline_slots: &ImagePipelineSlotPool,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
     recent_observed_messages: Option<&RecentObservedMessages>,
+    task: Option<&OperationalTask>,
 ) -> Result<PipelineOutcome> {
+    if task.is_some_and(OperationalTask::cancelled) {
+        return Ok(PipelineOutcome::NoSummary);
+    }
     if !options.text_summary_enabled && !options.image_gen_enabled {
         if options.send_disabled_message {
             client
@@ -2749,6 +2929,9 @@ async fn run_summary_pipeline(
         }
     }
     let platform_history_len = history.len();
+    if let Some(task) = task {
+        task.set_stage(TaskState::Running, "history", None, None, platform_history_len as u64, 0);
+    }
     let first_platform_ts = history.iter().map(|message| message.timestamp).min();
     let last_platform_ts = history.iter().map(|message| message.timestamp).max();
     info!(
@@ -2828,6 +3011,31 @@ async fn run_summary_pipeline(
         .into_iter()
         .map(history_to_chat_message)
         .collect::<Vec<_>>();
+    if let Some(task) = task {
+        let references = chat_messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| SourceReference {
+                task_id: task.id.clone(),
+                point_index: 0,
+                source_id: format!("m-{}", index + 1),
+                occurred_at: message.timestamp,
+                sender_label: format!("成员-{:x}", md5::compute(message.sender_id.as_bytes())),
+                message_index: (index + 1) as u32,
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = task.store.add_source_references(&references) {
+            warn!(task_id = %task.id, error = %error, "failed to store task source references");
+        }
+        task.set_stage(
+            TaskState::Running,
+            "media_processing",
+            None,
+            None,
+            chat_messages.len() as u64,
+            (image_caption_count + video_caption_count + voice_transcription_count) as u64,
+        );
+    }
     let formatted = ChatFormatter::format(&chat_messages);
     if formatted.total_messages == 0 {
         client
@@ -2900,6 +3108,16 @@ async fn run_summary_pipeline(
     let image_llm = llm.clone().with_streaming(false);
     let mut pending_text_reply = None;
     if options.text_summary_enabled {
+        if let Some(task) = task {
+            task.set_stage(
+                TaskState::Running,
+                "text_summary",
+                None,
+                None,
+                chat_messages.len() as u64,
+                (image_caption_count + video_caption_count + voice_transcription_count) as u64,
+            );
+        }
         let summary_result = complete_text_summary_with_refusal_retry(
             config,
             &llm,
@@ -2910,6 +3128,16 @@ async fn run_summary_pipeline(
         .await
         .context("calling LLM for text summary")?;
         let summary = summary_result.output;
+        if let Some(task) = task {
+            task.set_stage(
+                TaskState::Running,
+                "text_summary_completed",
+                Some(&summary),
+                None,
+                chat_messages.len() as u64,
+                (image_caption_count + video_caption_count + voice_transcription_count) as u64,
+            );
+        }
         info!(
             room_id = %trigger.room_id,
             output_chars = summary.chars().count(),
@@ -2927,10 +3155,14 @@ async fn run_summary_pipeline(
         if options.defer_text_until_image_ready {
             pending_text_reply = Some(reply);
         } else {
-            client
-                .send_text(&trigger.room_id, &reply)
-                .await
-                .context("sending summary text")?;
+            if let Some(task) = task {
+                deliver_outboxed_text(config, task, client, &trigger.room_id, &reply).await?;
+            } else {
+                client
+                    .send_text(&trigger.room_id, &reply)
+                    .await
+                    .context("sending summary text")?;
+            }
             info!(room_id = %trigger.room_id, "summary text sent");
             append_runtime_log(
                 config,
@@ -3008,6 +3240,7 @@ async fn run_summary_pipeline(
                     &trigger.room_id,
                     &mut pending_text_reply,
                     "after image summary failure",
+                    task,
                 )
                 .await?;
                 if options.text_summary_enabled {
@@ -3096,6 +3329,7 @@ async fn run_summary_pipeline(
                     &trigger.room_id,
                     &mut pending_text_reply,
                     "after image prompt failure",
+                    task,
                 )
                 .await?;
                 if options.text_summary_enabled {
@@ -3135,9 +3369,14 @@ async fn run_summary_pipeline(
                     &trigger.room_id,
                     &mut pending_text_reply,
                     "before image send",
+                    task,
                 )
                 .await?;
-                send_summary_image(config, client, &trigger.room_id, &artifact).await?;
+                if let Some(task) = task {
+                    deliver_outboxed_image(config, task, client, &trigger.room_id, &artifact).await?;
+                } else {
+                    send_summary_image(config, client, &trigger.room_id, &artifact).await?;
+                }
                 record_image_cooldown_success(
                     config,
                     image_cooldown_recorder.as_ref(),
@@ -3160,6 +3399,7 @@ async fn run_summary_pipeline(
                     &trigger.room_id,
                     &mut pending_text_reply,
                     "after image generation failure",
+                    task,
                 )
                 .await?;
                 if options.text_summary_enabled {
@@ -3193,6 +3433,7 @@ async fn run_summary_pipeline(
         &trigger.room_id,
         &mut pending_text_reply,
         "without image",
+        task,
     )
     .await?;
 
@@ -4635,21 +4876,166 @@ async fn send_summary_image(
     Ok(())
 }
 
+async fn deliver_outboxed_text(
+    config: &AgentConfig,
+    task: &OperationalTask,
+    client: &PlatformWorker,
+    room_id: &str,
+    text: &str,
+) -> Result<()> {
+    let payload = redact_operational_payload(config, text);
+    let delivery = task
+        .store
+        .enqueue_delivery(Some(&task.id), room_id, "text", &payload)
+        .context("enqueueing summary text delivery")?;
+    task.store
+        .update_delivery(&delivery.id, DeliveryState::Sending, 1, Utc::now(), None)?;
+    match client.send_text(room_id, &payload).await {
+        Ok(()) => {
+            task.store
+                .update_delivery(&delivery.id, DeliveryState::Delivered, 1, Utc::now(), None)?;
+            Ok(())
+        }
+        Err(error) => {
+            schedule_delivery_failure(config, &task.store, &delivery, &error)?;
+            Err(error).context("sending outboxed summary text")
+        }
+    }
+}
+
+async fn deliver_outboxed_image(
+    config: &AgentConfig,
+    task: &OperationalTask,
+    client: &PlatformWorker,
+    room_id: &str,
+    artifact: &ImageArtifact,
+) -> Result<()> {
+    let delivery = task
+        .store
+        .enqueue_delivery(Some(&task.id), room_id, "image", &artifact.path)
+        .context("enqueueing summary image delivery")?;
+    task.store
+        .update_delivery(&delivery.id, DeliveryState::Sending, 1, Utc::now(), None)?;
+    match client.send_image(room_id, &artifact.path).await {
+        Ok(()) => {
+            task.store
+                .update_delivery(&delivery.id, DeliveryState::Delivered, 1, Utc::now(), None)?;
+            Ok(())
+        }
+        Err(error) => {
+            schedule_delivery_failure(config, &task.store, &delivery, &error)?;
+            Err(error).context("sending outboxed summary image")
+        }
+    }
+}
+
+async fn drain_outbox(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    client: &PlatformWorker,
+) -> Result<()> {
+    for delivery in store.due_deliveries(8)? {
+        store.update_delivery(
+            &delivery.id,
+            DeliveryState::Sending,
+            delivery.attempts.saturating_add(1),
+            Utc::now(),
+            None,
+        )?;
+        let result = match delivery.kind.as_str() {
+            "text" => client.send_text(&delivery.room_id, &delivery.payload).await,
+            "image" => client.send_image(&delivery.room_id, &delivery.payload).await,
+            _ => Err(anyhow::anyhow!("unsupported outbox delivery kind {}", delivery.kind)),
+        };
+        match result {
+            Ok(()) => store.update_delivery(
+                &delivery.id,
+                DeliveryState::Delivered,
+                delivery.attempts.saturating_add(1),
+                Utc::now(),
+                None,
+            )?,
+            Err(error) => schedule_delivery_failure(config, store, &delivery, &error)?,
+        }
+    }
+    Ok(())
+}
+
+fn schedule_delivery_failure(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    delivery: &wechat_summary_storage::DeliveryRecord,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let message = format_error_chain(error);
+    let now = Utc::now();
+    if delivery_may_have_reached_platform(&message) {
+        store.update_delivery(
+            &delivery.id,
+            DeliveryState::Uncertain,
+            delivery.attempts.saturating_add(1),
+            now,
+            Some(&message),
+        )?;
+        return Ok(());
+    }
+    let elapsed = now - delivery.created_at;
+    let retry_window = Duration::seconds(config.operations.outbox_retry_window_seconds.max(1));
+    if elapsed >= retry_window {
+        store.update_delivery(
+            &delivery.id,
+            DeliveryState::Failed,
+            delivery.attempts.saturating_add(1),
+            now,
+            Some(&message),
+        )?;
+        return Ok(());
+    }
+    let exponent = delivery.attempts.min(6);
+    let delay_seconds = (5_i64 * (1_i64 << exponent)).min(300);
+    store.update_delivery(
+        &delivery.id,
+        DeliveryState::Pending,
+        delivery.attempts.saturating_add(1),
+        now + Duration::seconds(delay_seconds),
+        Some(&message),
+    )?;
+    Ok(())
+}
+
+fn delivery_may_have_reached_platform(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("ack") || error.contains("timed out") || error.contains("timeout")
+}
+
+fn redact_operational_payload(config: &AgentConfig, value: &str) -> String {
+    let mut privacy = config.privacy.clone();
+    privacy.redact_enabled = true;
+    PrivacyFilter::new(privacy).apply(value)
+}
+
 async fn send_deferred_summary_text(
     config: &AgentConfig,
     client: &PlatformWorker,
     room_id: &str,
     pending_text_reply: &mut Option<String>,
     reason: &str,
+    task: Option<&OperationalTask>,
 ) -> Result<bool> {
     let Some(reply) = pending_text_reply.take() else {
         return Ok(false);
     };
 
-    client
-        .send_text(room_id, &reply)
-        .await
-        .with_context(|| format!("sending deferred summary text {reason}"))?;
+    if let Some(task) = task {
+        deliver_outboxed_text(config, task, client, room_id, &reply)
+            .await
+            .with_context(|| format!("sending deferred summary text {reason}"))?;
+    } else {
+        client
+            .send_text(room_id, &reply)
+            .await
+            .with_context(|| format!("sending deferred summary text {reason}"))?;
+    }
     info!(
         room_id = %room_id,
         reason = %reason,
@@ -4702,6 +5088,36 @@ fn progress_message(options: PipelineOptions) -> &'static str {
     }
 }
 
+fn config_revision(config: &AgentConfig) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        config.platform.kind.as_str(),
+        config.llm.provider,
+        config.llm.model.as_deref().unwrap_or_default(),
+        config.runtime.output_dir
+    )
+}
+
+fn record_primary_llm_health(store: &SqliteStateStore, config: &AgentConfig, error: Option<&str>) {
+    let provider_key = format!(
+        "{}:{}",
+        config.llm.provider,
+        config.llm.model.as_deref().unwrap_or("default")
+    );
+    let failures = if error.is_some() {
+        store
+            .provider_health()
+            .ok()
+            .and_then(|entries| entries.into_iter().find(|entry| entry.capability == "llm" && entry.provider_key == provider_key))
+            .map(|entry| entry.consecutive_failures.saturating_add(1))
+            .unwrap_or(1)
+    } else { 0 };
+    let circuit_open_until = (failures >= 3).then(|| Utc::now() + Duration::minutes(5));
+    if let Err(update_error) = store.update_provider_health("llm", &provider_key, failures, circuit_open_until, error) {
+        warn!(error = %update_error, "failed to persist LLM provider health");
+    }
+}
+
 fn next_scheduled_run_after(now: DateTime<Utc>, config: &AgentConfig) -> Option<DateTime<Utc>> {
     if !config.scheduled_summary.enabled {
         return None;
@@ -4730,6 +5146,96 @@ fn next_scheduled_run_after(now: DateTime<Utc>, config: &AgentConfig) -> Option<
     } else {
         Some(run_at + Duration::days(1))
     }
+}
+
+fn weekly_report_schedule(now: DateTime<Utc>, config: &AgentConfig) -> HashMap<String, DateTime<Utc>> {
+    config
+        .report_groups
+        .iter()
+        .filter(|(_, group)| group.enabled && !group.rooms.is_empty())
+        .filter_map(|(name, group)| next_weekly_report_run_after(now, group).map(|run_at| (name.clone(), run_at)))
+        .collect()
+}
+
+fn next_weekly_report_run_after(
+    now: DateTime<Utc>,
+    group: &wechat_summary_core::config::ReportGroupConfig,
+) -> Option<DateTime<Utc>> {
+    if group.weekday > 6 || group.local_hour > 23 || group.local_minute > 59 {
+        return None;
+    }
+    let local_now = now.with_timezone(&Local);
+    let current_day = local_now.weekday().num_days_from_monday();
+    let days = (group.weekday + 7 - current_day) % 7;
+    let candidate_date = local_now.date_naive() + Duration::days(days as i64);
+    let candidate = Local
+        .from_local_datetime(&candidate_date.and_hms_opt(group.local_hour, group.local_minute, 0)?)
+        .single()?;
+    if candidate <= local_now {
+        Some((candidate + Duration::days(7)).with_timezone(&Utc))
+    } else {
+        Some(candidate.with_timezone(&Utc))
+    }
+}
+
+async fn run_weekly_group_report(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    client: &PlatformWorker,
+    group_name: &str,
+) -> Result<()> {
+    let group = config
+        .report_groups
+        .get(group_name)
+        .filter(|group| group.enabled && !group.rooms.is_empty())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("weekly report group is disabled or empty"))?;
+    let since = Utc::now() - Duration::days(7);
+    let history = store.tasks(10_000, None, None)?;
+    let tasks = history
+        .iter()
+        .filter(|task| group.rooms.contains(&task.room_id) && task.created_at >= since)
+        .collect::<Vec<_>>();
+    let succeeded = tasks.iter().filter(|task| task.state == TaskState::Succeeded).count();
+    let failed = tasks.iter().filter(|task| task.state == TaskState::Failed).count();
+    let messages = tasks.iter().map(|task| task.message_count).sum::<u64>();
+    let media = tasks.iter().map(|task| task.media_count).sum::<u64>();
+    let stats = format!(
+        "群组：{group_name}\n统计周期：最近 7 天\n成员群数量：{}\n总结任务：{}\n成功：{}\n失败：{}\n处理消息：{}\n处理媒体：{}\n请生成一张清晰、现代、中文可读的群聊运营统计图表。只呈现聚合指标，不呈现聊天正文、用户名、私人信息或敏感内容。",
+        group.rooms.len(), tasks.len(), succeeded, failed, messages, media
+    );
+    for room_id in &group.rooms {
+        let report_id = store.create_weekly_metric(group_name, room_id)?;
+        let task = OperationalTask {
+            id: store.create_task(NewTask {
+                room_id,
+                source: "weekly_report",
+                since,
+                until: Utc::now(),
+                config_revision: &config_revision(config),
+                retry_of: None,
+            })?.id,
+            store: store.clone(),
+        };
+        task.set_stage(TaskState::Running, "weekly_chart", Some(&stats), None, tasks.len() as u64, media);
+        let outcome = async {
+            let artifact = generate_summary_image(config, room_id, &stats, None).await?;
+            deliver_outboxed_image(config, &task, client, room_id, &artifact).await?;
+            let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。", tasks.len(), succeeded, failed);
+            deliver_outboxed_text(config, &task, client, room_id, &caption).await?;
+            store.update_weekly_metric(&report_id, "succeeded", Some(&caption), Some(&artifact.path), None)?;
+            task.set_stage(TaskState::Succeeded, "weekly_chart_delivered", Some(&caption), None, tasks.len() as u64, media);
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        if let Err(error) = outcome {
+            let error_message = format_error_chain(&error);
+            let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。统计图生成失败，已降级为文字统计。", tasks.len(), succeeded, failed);
+            let _ = deliver_outboxed_text(config, &task, client, room_id, &caption).await;
+            store.update_weekly_metric(&report_id, "degraded", Some(&caption), None, Some(&error_message))?;
+            task.set_stage(TaskState::Succeeded, "weekly_text_fallback", Some(&caption), Some(&error_message), tasks.len() as u64, media);
+        }
+    }
+    Ok(())
 }
 
 fn scheduled_rooms(config: &AgentConfig, platform_rooms: &[String]) -> Vec<String> {
@@ -7015,6 +7521,7 @@ mod tests {
             "群B".into(),
             wechat_summary_core::config::RoomCapabilityConfig {
                 image_summary_enabled: Some(false),
+                ..Default::default()
             },
         );
 
@@ -7404,6 +7911,7 @@ mod tests {
             "text-only-room".to_string(),
             wechat_summary_core::config::RoomCapabilityConfig {
                 image_summary_enabled: Some(false),
+                ..Default::default()
             },
         );
 

@@ -34,6 +34,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub room_capabilities: BTreeMap<String, RoomCapabilityConfig>,
     #[serde(default)]
+    pub policy_templates: BTreeMap<String, RoomPolicyTemplate>,
+    #[serde(default)]
+    pub report_groups: BTreeMap<String, ReportGroupConfig>,
+    #[serde(default)]
     pub history: HistoryConfig,
     pub storage: StorageConfig,
     #[serde(default, alias = "wxdb")]
@@ -59,6 +63,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub operations: OperationsConfig,
 }
 
 impl AgentConfig {
@@ -80,18 +86,81 @@ impl AgentConfig {
     }
 
     pub fn image_summary_enabled_for_room(&self, room_id: &str) -> bool {
-        self.room_capabilities
-            .get(room_id)
-            .and_then(|capabilities| capabilities.image_summary_enabled)
-            .unwrap_or(true)
+        self.room_policy(room_id).image_summary_enabled.unwrap_or(true)
+    }
+
+    pub fn room_policy(&self, room_id: &str) -> EffectiveRoomPolicy {
+        let explicit = self.room_capabilities.get(room_id);
+        let template = explicit
+            .and_then(|room| room.template.as_deref())
+            .and_then(|name| self.policy_templates.get(name));
+        EffectiveRoomPolicy {
+            text_summary_enabled: explicit.and_then(|value| value.text_summary_enabled).or_else(|| template.and_then(|value| value.text_summary_enabled)),
+            image_summary_enabled: explicit.and_then(|value| value.image_summary_enabled).or_else(|| template.and_then(|value| value.image_summary_enabled)),
+            image_caption_enabled: explicit.and_then(|value| value.image_caption_enabled).or_else(|| template.and_then(|value| value.image_caption_enabled)),
+            video_caption_enabled: explicit.and_then(|value| value.video_caption_enabled).or_else(|| template.and_then(|value| value.video_caption_enabled)),
+            voice_transcription_enabled: explicit.and_then(|value| value.voice_transcription_enabled).or_else(|| template.and_then(|value| value.voice_transcription_enabled)),
+            successful_request_cooldown_seconds: explicit.and_then(|value| value.successful_request_cooldown_seconds).or_else(|| template.and_then(|value| value.successful_request_cooldown_seconds)),
+            successful_image_cooldown_seconds: explicit.and_then(|value| value.successful_image_cooldown_seconds).or_else(|| template.and_then(|value| value.successful_image_cooldown_seconds)),
+            long_text_delivery: explicit.and_then(|value| value.long_text_delivery.clone()).or_else(|| template.and_then(|value| value.long_text_delivery.clone())),
+        }
     }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RoomCapabilityConfig {
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub text_summary_enabled: Option<bool>,
     /// `None` inherits the global image-generation configuration.
     #[serde(default)]
     pub image_summary_enabled: Option<bool>,
+    #[serde(default)]
+    pub image_caption_enabled: Option<bool>,
+    #[serde(default)]
+    pub video_caption_enabled: Option<bool>,
+    #[serde(default)]
+    pub voice_transcription_enabled: Option<bool>,
+    #[serde(default)]
+    pub successful_request_cooldown_seconds: Option<i64>,
+    #[serde(default)]
+    pub successful_image_cooldown_seconds: Option<i64>,
+    #[serde(default)]
+    pub long_text_delivery: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RoomPolicyTemplate {
+    #[serde(default)] pub text_summary_enabled: Option<bool>,
+    #[serde(default)] pub image_summary_enabled: Option<bool>,
+    #[serde(default)] pub image_caption_enabled: Option<bool>,
+    #[serde(default)] pub video_caption_enabled: Option<bool>,
+    #[serde(default)] pub voice_transcription_enabled: Option<bool>,
+    #[serde(default)] pub successful_request_cooldown_seconds: Option<i64>,
+    #[serde(default)] pub successful_image_cooldown_seconds: Option<i64>,
+    #[serde(default)] pub long_text_delivery: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EffectiveRoomPolicy {
+    pub text_summary_enabled: Option<bool>,
+    pub image_summary_enabled: Option<bool>,
+    pub image_caption_enabled: Option<bool>,
+    pub video_caption_enabled: Option<bool>,
+    pub voice_transcription_enabled: Option<bool>,
+    pub successful_request_cooldown_seconds: Option<i64>,
+    pub successful_image_cooldown_seconds: Option<i64>,
+    pub long_text_delivery: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ReportGroupConfig {
+    #[serde(default)] pub enabled: bool,
+    #[serde(default)] pub rooms: Vec<String>,
+    #[serde(default = "default_weekly_day")] pub weekday: u32,
+    #[serde(default = "default_scheduled_local_hour")] pub local_hour: u32,
+    #[serde(default)] pub local_minute: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -430,6 +499,18 @@ pub struct LlmConfig {
     pub system_prompt: String,
     #[serde(default)]
     pub request_body_overrides: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub fallbacks: Vec<ProviderFallbackConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProviderFallbackConfig {
+    pub provider: String,
+    #[serde(default)] pub api_key: Option<String>,
+    #[serde(default)] pub api_keys: Vec<String>,
+    #[serde(default)] pub base_url: Option<String>,
+    #[serde(default)] pub model: Option<String>,
+    #[serde(default)] pub request_body_overrides: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -535,6 +616,8 @@ pub struct ImageGenConfig {
     pub max_concurrent_per_key: usize,
     #[serde(default)]
     pub prompt_template: Option<String>,
+    #[serde(default)]
+    pub fallbacks: Vec<ProviderFallbackConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -600,6 +683,8 @@ pub struct ImageCaptionConfig {
     pub max_concurrent_per_key: usize,
     #[serde(default)]
     pub request_body_overrides: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub fallbacks: Vec<ProviderFallbackConfig>,
 }
 
 impl Default for ImageCaptionConfig {
@@ -625,6 +710,7 @@ impl Default for ImageCaptionConfig {
             max_concurrent_requests: default_image_caption_max_concurrent_requests(),
             max_concurrent_per_key: default_max_concurrent_per_key(),
             request_body_overrides: BTreeMap::new(),
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -677,6 +763,8 @@ pub struct VideoCaptionConfig {
     pub max_video_bytes: u64,
     #[serde(default)]
     pub request_body_overrides: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub fallbacks: Vec<ProviderFallbackConfig>,
 }
 
 impl Default for VideoCaptionConfig {
@@ -703,6 +791,7 @@ impl Default for VideoCaptionConfig {
             max_concurrent_per_key: default_max_concurrent_per_key(),
             max_video_bytes: default_video_caption_max_video_bytes(),
             request_body_overrides: BTreeMap::new(),
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -757,6 +846,8 @@ pub struct VoiceTranscriptionConfig {
     pub max_concurrent_per_key: usize,
     #[serde(default)]
     pub request_body_overrides: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub fallbacks: Vec<ProviderFallbackConfig>,
 }
 
 impl Default for VoiceTranscriptionConfig {
@@ -784,6 +875,7 @@ impl Default for VoiceTranscriptionConfig {
             max_concurrent_requests: default_voice_transcription_max_concurrent_requests(),
             max_concurrent_per_key: default_max_concurrent_per_key(),
             request_body_overrides: BTreeMap::new(),
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -813,9 +905,32 @@ pub struct RuntimeConfig {
     pub ai_trace_dir: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OperationsConfig {
+    #[serde(default = "default_operational_retention_days")]
+    pub retention_days: i64,
+    #[serde(default = "default_outbox_retry_seconds")]
+    pub outbox_retry_window_seconds: i64,
+}
+
+impl Default for OperationsConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_operational_retention_days(),
+            outbox_retry_window_seconds: default_outbox_retry_seconds(),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
+
+fn default_weekly_day() -> u32 { 0 }
+
+fn default_operational_retention_days() -> i64 { 30 }
+
+fn default_outbox_retry_seconds() -> i64 { 3600 }
 
 fn default_text_content_types() -> Vec<String> {
     vec!["text".to_string()]

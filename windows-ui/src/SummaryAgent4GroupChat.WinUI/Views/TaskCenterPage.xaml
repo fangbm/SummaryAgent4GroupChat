@@ -1,0 +1,67 @@
+<Page
+    x:Class="SummaryAgent4GroupChat.WinUI.Views.TaskCenterPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer Padding="28" VerticalScrollBarVisibility="Auto">
+        <StackPanel Spacing="16" MaxWidth="1220">
+            <StackPanel Spacing="4">
+                <TextBlock Text="任务中心" Style="{ThemeResource TitleTextBlockStyle}" />
+                <TextBlock Text="任务、可靠投递与来源索引均由本机控制层脱敏后提供。" Opacity="0.72" />
+            </StackPanel>
+            <InfoBar IsOpen="True" IsClosable="False" Severity="Informational" Message="{Binding TaskCenterStatus}" />
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <Button Content="刷新" Click="Refresh_Click" Style="{StaticResource AccentButtonStyle}" />
+                <Button Content="刷新供应商状态" Click="RefreshProviders_Click" />
+            </StackPanel>
+            <Border Style="{StaticResource StatusCard}">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="总结任务" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <ListView x:Name="TaskList" ItemsSource="{Binding Tasks}" SelectionChanged="TaskList_SelectionChanged" MaxHeight="380">
+                        <ListView.ItemTemplate>
+                            <DataTemplate>
+                                <Grid ColumnSpacing="12" Padding="6">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="2*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="2*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                    <StackPanel><TextBlock Text="{Binding RoomId}" TextTrimming="CharacterEllipsis" /><TextBlock Text="{Binding Source}" Opacity="0.65" FontSize="12" /></StackPanel>
+                                    <TextBlock Grid.Column="1" Text="{Binding State}" VerticalAlignment="Center" />
+                                    <TextBlock Grid.Column="2" Text="{Binding Stage}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Grid.Column="3" Text="{Binding Error}" Opacity="0.72" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                    <StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="8"><Button Content="取消" Tag="{Binding Id}" Click="CancelTask_Click" /><Button Content="重试" Tag="{Binding Id}" Click="RetryTask_Click" /></StackPanel>
+                                </Grid>
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource StatusCard}">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="来源索引" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <TextBlock Text="{Binding SelectedTaskDetails}" Opacity="0.72" TextWrapping="Wrap" />
+                    <ListView ItemsSource="{Binding SelectedTaskSources}" MaxHeight="220">
+                        <ListView.ItemTemplate>
+                            <DataTemplate>
+                                <Grid ColumnSpacing="12" Padding="6">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="2*" /></Grid.ColumnDefinitions>
+                                    <TextBlock Text="{Binding MessageIndex}" />
+                                    <TextBlock Grid.Column="1" Text="{Binding SenderLabel}" />
+                                    <TextBlock Grid.Column="2" Text="{Binding OccurredAt}" Opacity="0.72" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Grid.Column="3" Text="{Binding SourceId}" Opacity="0.55" TextTrimming="CharacterEllipsis" />
+                                </Grid>
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource StatusCard}">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="可靠投递" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <ListView ItemsSource="{Binding OutboxItems}" MaxHeight="300">
+                        <ListView.ItemTemplate><DataTemplate><Grid ColumnSpacing="12" Padding="6"><Grid.ColumnDefinitions><ColumnDefinition Width="2*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="2*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions><TextBlock Text="{Binding RoomId}" /><TextBlock Grid.Column="1" Text="{Binding Kind}" /><TextBlock Grid.Column="2" Text="{Binding State}" /><TextBlock Grid.Column="3" Text="{Binding Error}" TextTrimming="CharacterEllipsis" /><StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="8"><Button Content="重投" Tag="{Binding Id}" Click="RetryOutbox_Click" /><Button Content="确认停止" Tag="{Binding Id}" Click="ResolveOutbox_Click" /></StackPanel></Grid></DataTemplate></ListView.ItemTemplate>
+                    </ListView>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource StatusCard}">
+                <StackPanel Spacing="8"><TextBlock Text="供应商健康" Style="{ThemeResource SubtitleTextBlockStyle}" /><TextBlock Text="{Binding ProviderHealthStatus}" Opacity="0.72" /><ListView ItemsSource="{Binding ProviderHealthItems}" MaxHeight="220"><ListView.ItemTemplate><DataTemplate><Grid ColumnSpacing="16" Padding="6"><Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="2*" /></Grid.ColumnDefinitions><TextBlock Text="{Binding Capability}" /><TextBlock Grid.Column="1" Text="{Binding ProviderKey}" /><TextBlock Grid.Column="2" Text="{Binding ConsecutiveFailures}" /><TextBlock Grid.Column="3" Text="{Binding LastError}" TextTrimming="CharacterEllipsis" /></Grid></DataTemplate></ListView.ItemTemplate></ListView></StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

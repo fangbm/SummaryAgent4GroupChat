@@ -34,7 +34,14 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private bool _isMaintenanceOperationRunning;
     [ObservableProperty] private string _maintenanceStatus = "尚未运行维护操作。";
     [ObservableProperty] private string _maintenanceOutput = string.Empty;
+    [ObservableProperty] private string _taskCenterStatus = "正在加载任务…";
+    [ObservableProperty] private string _selectedTaskDetails = "选择任务后可查看脱敏来源索引。";
+    [ObservableProperty] private string _providerHealthStatus = "尚未检测供应商健康状态。";
     public ObservableCollection<UpdateCheckItem> UpdateItems { get; } = [];
+    public ObservableCollection<TaskCenterItem> Tasks { get; } = [];
+    public ObservableCollection<OutboxItem> OutboxItems { get; } = [];
+    public ObservableCollection<SourceReferenceItem> SelectedTaskSources { get; } = [];
+    public ObservableCollection<ProviderHealthItem> ProviderHealthItems { get; } = [];
     public event Action<string>? MaintenanceDialogRequested;
 
     [ObservableProperty] private string _platformKind = "wx";
@@ -44,6 +51,9 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _wxdbCacheDirectory = string.Empty;
     [ObservableProperty] private string _historyPageSize = "10000";
     [ObservableProperty] private string _disabledImageRooms = string.Empty;
+    [ObservableProperty] private string _policyTemplatesJson = "{}";
+    [ObservableProperty] private string _reportGroupsJson = "{}";
+    [ObservableProperty] private string _providerFallbacksJson = "{}";
 
     [ObservableProperty] private string _triggerCommands = "/总结, #总结";
     [ObservableProperty] private string _whitelistRooms = string.Empty;
@@ -103,9 +113,12 @@ public sealed partial class MainViewModel : ObservableObject
         {
             _client = await ControlBootstrap.ConnectAsync(_lifetime.Token);
             await RefreshAsync();
+            await RefreshTaskCenterAsync();
+            await RefreshProviderHealthAsync();
             _ = SubscribeOutputAsync(_lifetime.Token);
             _ = SubscribeOperationsAsync(_lifetime.Token);
             _ = PollLogsAsync(_lifetime.Token);
+            _ = PollTaskCenterAsync(_lifetime.Token);
             await CheckRuntimeDependenciesAsync();
             _ = CheckForUpdatesAsync(silent: true);
         }
@@ -169,13 +182,35 @@ public sealed partial class MainViewModel : ObservableObject
 
     public async Task SaveAsync()
     {
-        var operations = BuildFormOperations();
-        if (operations.Count == 0)
+        try
         {
-            Notice = "配置无变更";
-            return;
+            var operations = BuildFormOperations();
+            if (operations.Count == 0)
+            {
+                Notice = "配置无变更";
+                return;
+            }
+            await PatchConfigAsync(operations);
         }
-        await PatchConfigAsync(operations);
+        catch (Exception error)
+        {
+            ValidationMessage = $"配置格式无效：{error.Message}";
+        }
+    }
+
+    public async Task SavePoliciesAndReportsAsync()
+    {
+        try
+        {
+            var operations = new List<Dictionary<string, object?>>();
+            AddJsonTableOperations(operations, "policy_templates", PolicyTemplatesJson);
+            AddJsonTableOperations(operations, "report_groups", ReportGroupsJson);
+            await PatchConfigAsync(operations);
+        }
+        catch (Exception error)
+        {
+            ValidationMessage = $"策略或群组配置格式无效：{error.Message}";
+        }
     }
 
     public async Task SaveRawConfigAsync()
@@ -372,6 +407,9 @@ public sealed partial class MainViewModel : ObservableObject
         ImageCaptionEnabled = ReadBool("image_caption", "enabled", false);
         VideoCaptionEnabled = ReadBool("video_caption", "enabled", false);
         VoiceTranscriptionEnabled = ReadBool("voice_transcription", "enabled", false);
+        PolicyTemplatesJson = SerializeConfigSection("policy_templates");
+        ReportGroupsJson = SerializeConfigSection("report_groups");
+        ProviderFallbacksJson = SerializeProviderFallbacks();
     }
 
     private async Task AgentCommandAsync(string method, string success, object? parameters = null)
@@ -552,6 +590,19 @@ public sealed partial class MainViewModel : ObservableObject
         _ => operation,
     };
 
+    private static string ReadJson(JsonElement value, string property) =>
+        value.TryGetProperty(property, out var field) && field.ValueKind != JsonValueKind.Null
+            ? field.ToString()
+            : string.Empty;
+
+    private static string? ReadOptionalJson(JsonElement value, string property) =>
+        value.TryGetProperty(property, out var field) && field.ValueKind != JsonValueKind.Null
+            ? field.ToString()
+            : null;
+
+    private static ulong ReadUInt64(JsonElement value, string property) =>
+        value.TryGetProperty(property, out var field) && field.TryGetUInt64(out var number) ? number : 0;
+
     private static string ReadUpdateValue(JsonElement entry, string property, string fallback) =>
         entry.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(value.GetString())
             ? value.GetString()!
@@ -629,6 +680,91 @@ public sealed partial class MainViewModel : ObservableObject
 
     private string ReadList(string section, string key) =>
         string.Join(", ", ReadListValues(section, key));
+
+    private string SerializeConfigSection(string section)
+    {
+        var value = Section(section);
+        return value.ValueKind == JsonValueKind.Object
+            ? JsonSerializer.Serialize(value, new JsonSerializerOptions { WriteIndented = true })
+            : "{}";
+    }
+
+    private string SerializeProviderFallbacks()
+    {
+        var values = new Dictionary<string, JsonElement>();
+        foreach (var section in ProviderFallbackSections)
+        {
+            var value = Section(section);
+            if (value.ValueKind == JsonValueKind.Object && value.TryGetProperty("fallbacks", out var fallbacks))
+            {
+                values[section] = fallbacks.Clone();
+            }
+        }
+        return JsonSerializer.Serialize(values, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    private static readonly string[] ProviderFallbackSections = [
+        "llm", "image_gen", "image_caption", "video_caption", "voice_transcription"
+    ];
+
+    private static void AddProviderFallbackOperations(
+        List<Dictionary<string, object?>> operations,
+        string text)
+    {
+        using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(text) ? "{}" : text);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("备用供应商必须是 JSON 对象。");
+        }
+        foreach (var property in document.RootElement.EnumerateObject())
+        {
+            if (!ProviderFallbackSections.Contains(property.Name, StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException($"不支持的能力：{property.Name}");
+            }
+            if (property.Value.ValueKind != JsonValueKind.Array)
+            {
+                throw new InvalidOperationException($"{property.Name} 的备用供应商必须是 JSON 数组。");
+            }
+            operations.Add(new Dictionary<string, object?>
+            {
+                ["section"] = new[] { property.Name },
+                ["key"] = "fallbacks",
+                ["value"] = JsonSerializer.Deserialize<object>(property.Value.GetRawText()),
+            });
+        }
+    }
+
+    private static void AddJsonTableOperations(
+        List<Dictionary<string, object?>> operations,
+        string section,
+        string text)
+    {
+        using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(text) ? "{}" : text);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException($"{section} 必须是 JSON 对象。");
+        }
+        foreach (var property in document.RootElement.EnumerateObject())
+        {
+            operations.Add(new Dictionary<string, object?>
+            {
+                ["section"] = new[] { section },
+                ["key"] = property.Name,
+                ["value"] = JsonSerializer.Deserialize<object>(property.Value.GetRawText()),
+            });
+        }
+    }
+
+    private async Task PollTaskCenterAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await RefreshTaskCenterAsync();
+            await RefreshProviderHealthAsync();
+            await Task.Delay(TimeSpan.FromSeconds(4), cancellationToken);
+        }
+    }
 
     private List<string> ReadDisabledImageRooms()
     {
@@ -724,6 +860,7 @@ public sealed partial class MainViewModel : ObservableObject
         AddBoolIfChanged(operations, "image_caption", "enabled", ImageCaptionEnabled);
         AddBoolIfChanged(operations, "video_caption", "enabled", VideoCaptionEnabled);
         AddBoolIfChanged(operations, "voice_transcription", "enabled", VoiceTranscriptionEnabled);
+        AddProviderFallbackOperations(operations, ProviderFallbacksJson);
 
         AddRoomCapabilityOperations(operations);
         return operations;
@@ -804,6 +941,135 @@ public sealed partial class MainViewModel : ObservableObject
         {
             AddOperation(operations, [section], key, values);
         }
+    }
+
+    public async Task RefreshTaskCenterAsync()
+    {
+        if (_client is null) return;
+        try
+        {
+            var tasksReply = await _client.CallAsync("tasks.list", new { limit = 200 }, _lifetime.Token);
+            tasksReply.ThrowIfError();
+            var outboxReply = await _client.CallAsync("outbox.list", new { limit = 200 }, _lifetime.Token);
+            outboxReply.ThrowIfError();
+            Tasks.Clear();
+            foreach (var task in tasksReply.Result!.Value.GetProperty("tasks").EnumerateArray())
+            {
+                Tasks.Add(new TaskCenterItem(
+                    ReadJson(task, "id"), ReadJson(task, "room_id"), ReadJson(task, "source"),
+                    ReadJson(task, "state"), ReadJson(task, "stage"), ReadJson(task, "created_at"),
+                    ReadOptionalJson(task, "summary"), ReadOptionalJson(task, "error"),
+                    ReadUInt64(task, "message_count"), ReadUInt64(task, "media_count")));
+            }
+            OutboxItems.Clear();
+            foreach (var delivery in outboxReply.Result!.Value.GetProperty("deliveries").EnumerateArray())
+            {
+                OutboxItems.Add(new OutboxItem(
+                    ReadJson(delivery, "id"), ReadJson(delivery, "room_id"), ReadJson(delivery, "kind"),
+                    ReadJson(delivery, "state"), (uint)ReadUInt64(delivery, "attempts"),
+                    ReadJson(delivery, "next_attempt_at"), ReadOptionalJson(delivery, "error")));
+            }
+            var active = Tasks.Count(item => item.State is "queued" or "running");
+            var pending = OutboxItems.Count(item => item.State is "pending" or "sending");
+            TaskCenterStatus = $"任务 {Tasks.Count} 项，进行中 {active} 项，待投递 {pending} 项。";
+        }
+        catch (Exception error)
+        {
+            TaskCenterStatus = $"读取任务中心失败：{error.Message}";
+        }
+    }
+
+    public async Task SelectTaskAsync(string taskId)
+    {
+        if (_client is null || string.IsNullOrWhiteSpace(taskId)) return;
+        try
+        {
+            var reply = await _client.CallAsync("tasks.get", new { id = taskId }, _lifetime.Token);
+            reply.ThrowIfError();
+            var result = reply.Result!.Value;
+            var task = result.GetProperty("task");
+            SelectedTaskSources.Clear();
+            foreach (var source in result.GetProperty("sources").EnumerateArray())
+            {
+                SelectedTaskSources.Add(new SourceReferenceItem(
+                    (uint)ReadUInt64(source, "point_index"), ReadJson(source, "source_id"),
+                    ReadJson(source, "occurred_at"), ReadJson(source, "sender_label"),
+                    (uint)ReadUInt64(source, "message_index")));
+            }
+            SelectedTaskDetails = $"{ReadJson(task, "room_id")} · {ReadJson(task, "stage")} · 来源索引 {SelectedTaskSources.Count} 条。";
+        }
+        catch (Exception error)
+        {
+            SelectedTaskDetails = $"读取任务详情失败：{error.Message}";
+        }
+    }
+
+    public async Task CancelTaskAsync(string taskId)
+    {
+        if (_client is null) return;
+        try
+        {
+            var reply = await _client.CallAsync("tasks.cancel", new { id = taskId }, _lifetime.Token);
+            reply.ThrowIfError();
+            await RefreshTaskCenterAsync();
+        }
+        catch (Exception error) { TaskCenterStatus = $"取消失败：{error.Message}"; }
+    }
+
+    public async Task RetryTaskAsync(string taskId)
+    {
+        if (_client is null) return;
+        try
+        {
+            var reply = await _client.CallAsync("tasks.retry", new { id = taskId }, _lifetime.Token);
+            reply.ThrowIfError();
+            await RefreshTaskCenterAsync();
+        }
+        catch (Exception error) { TaskCenterStatus = $"重试失败：{error.Message}"; }
+    }
+
+    public async Task RetryOutboxAsync(string deliveryId)
+    {
+        if (_client is null) return;
+        try
+        {
+            var reply = await _client.CallAsync("outbox.retry", new { id = deliveryId }, _lifetime.Token);
+            reply.ThrowIfError();
+            await RefreshTaskCenterAsync();
+        }
+        catch (Exception error) { TaskCenterStatus = $"重新投递失败：{error.Message}"; }
+    }
+
+    public async Task ResolveOutboxAsync(string deliveryId)
+    {
+        if (_client is null) return;
+        try
+        {
+            var reply = await _client.CallAsync("outbox.resolve", new { id = deliveryId, action = "cancel" }, _lifetime.Token);
+            reply.ThrowIfError();
+            await RefreshTaskCenterAsync();
+        }
+        catch (Exception error) { TaskCenterStatus = $"确认处理失败：{error.Message}"; }
+    }
+
+    public async Task RefreshProviderHealthAsync()
+    {
+        if (_client is null) return;
+        try
+        {
+            var reply = await _client.CallAsync("providers.health", cancellationToken: _lifetime.Token);
+            reply.ThrowIfError();
+            ProviderHealthItems.Clear();
+            foreach (var provider in reply.Result!.Value.GetProperty("providers").EnumerateArray())
+            {
+                ProviderHealthItems.Add(new ProviderHealthItem(
+                    ReadJson(provider, "capability"), ReadJson(provider, "provider_key"),
+                    (uint)ReadUInt64(provider, "consecutive_failures"), ReadOptionalJson(provider, "circuit_open_until"),
+                    ReadOptionalJson(provider, "last_error"), ReadJson(provider, "updated_at")));
+            }
+            ProviderHealthStatus = ProviderHealthItems.Count == 0 ? "当前没有记录到供应商故障。" : $"已记录 {ProviderHealthItems.Count} 个供应商状态。";
+        }
+        catch (Exception error) { ProviderHealthStatus = $"读取供应商状态失败：{error.Message}"; }
     }
 
     private void AddSecretKeysIfEntered(List<Dictionary<string, object?>> operations, string section, string current)

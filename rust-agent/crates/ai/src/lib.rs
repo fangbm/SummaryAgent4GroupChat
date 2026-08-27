@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use wechat_summary_core::{
     config::{
-        ImageCaptionConfig, ImageGenConfig, LlmConfig, ProxyConfig, VideoCaptionConfig,
+        ImageCaptionConfig, ImageGenConfig, LlmConfig, ProviderFallbackConfig, ProxyConfig, VideoCaptionConfig,
         VoiceTranscriptionConfig,
     },
     ImageArtifact,
@@ -191,10 +191,12 @@ pub struct OpenAiCompatibleLlm {
     retry_notifier: Option<RetryNotifier>,
     trace_dir: Option<PathBuf>,
     trace_context: Option<AiTraceContext>,
+    fallbacks: Vec<OpenAiCompatibleLlm>,
 }
 
 impl OpenAiCompatibleLlm {
-    pub fn new(config: LlmConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
+    pub fn new(mut config: LlmConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
+        let fallback_specs = std::mem::take(&mut config.fallbacks);
         let keys = resolve_api_keys(
             &config.api_keys,
             config.api_key.as_deref(),
@@ -211,6 +213,19 @@ impl OpenAiCompatibleLlm {
             config_value_or_env(config.model.as_deref(), &config.model_env, "LLM model name")?;
         let client = http_client(config.timeout_seconds, proxy)?;
         let max_concurrent_per_key = config.max_concurrent_per_key;
+        let fallbacks = fallback_specs
+            .into_iter()
+            .filter_map(|fallback| {
+                let fallback_config = llm_config_for_fallback(&config, fallback);
+                match Self::new(fallback_config, proxy) {
+                    Ok(client) => Some(client),
+                    Err(error) => {
+                        warn!(error = %error, "LLM fallback configuration ignored because it could not initialize");
+                        None
+                    }
+                }
+            })
+            .collect();
         Ok(Self {
             config,
             client,
@@ -220,6 +235,7 @@ impl OpenAiCompatibleLlm {
             retry_notifier: None,
             trace_dir: None,
             trace_context: None,
+            fallbacks,
         })
     }
 
@@ -273,6 +289,35 @@ impl OpenAiCompatibleLlm {
     }
 
     async fn complete_with_max_tokens(
+        &self,
+        system_prompt: &str,
+        user_content: &str,
+        max_tokens: Option<u32>,
+    ) -> Result<String, AiError> {
+        match self
+            .complete_with_max_tokens_primary(system_prompt, user_content, max_tokens)
+            .await
+        {
+            Ok(output) => Ok(output),
+            Err(primary_error) if is_provider_failover_error(&primary_error) && !self.fallbacks.is_empty() => {
+                warn!(fallbacks = self.fallbacks.len(), error = %primary_error, "LLM primary failed; trying configured fallback providers");
+                let mut last_error = primary_error;
+                for fallback in &self.fallbacks {
+                    match fallback.complete_with_max_tokens_primary(system_prompt, user_content, max_tokens).await {
+                        Ok(output) => return Ok(output),
+                        Err(error) => {
+                            warn!(error = %error, "LLM fallback provider failed");
+                            last_error = error;
+                        }
+                    }
+                }
+                Err(last_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn complete_with_max_tokens_primary(
         &self,
         system_prompt: &str,
         user_content: &str,
@@ -684,6 +729,45 @@ impl OpenAiCompatibleLlm {
             return;
         };
         write_ai_http_trace(trace_dir, trace);
+    }
+}
+
+fn llm_config_for_fallback(base: &LlmConfig, fallback: ProviderFallbackConfig) -> LlmConfig {
+    let mut config = base.clone();
+    config.provider = fallback.provider;
+    config.api_key = fallback.api_key;
+    config.api_keys = fallback.api_keys;
+    config.base_url = fallback.base_url;
+    config.model = fallback.model;
+    if !fallback.request_body_overrides.is_empty() {
+        config.request_body_overrides = fallback.request_body_overrides;
+    }
+    config.fallbacks.clear();
+    config
+}
+
+fn image_gen_config_for_fallback(
+    base: &ImageGenConfig,
+    fallback: ProviderFallbackConfig,
+) -> ImageGenConfig {
+    let mut config = base.clone();
+    config.provider = fallback.provider;
+    config.api_key = fallback.api_key;
+    config.api_keys = fallback.api_keys;
+    config.base_url = fallback.base_url;
+    config.model = fallback.model;
+    config.fallbacks.clear();
+    config
+}
+
+fn is_provider_failover_error(error: &AiError) -> bool {
+    match error {
+        AiError::MissingApiKey { .. } | AiError::MissingEnv { .. } => false,
+        AiError::InvalidResponse(message) => {
+            let lower = message.to_ascii_lowercase();
+            !(lower.contains(" 400") || lower.contains(" 401") || lower.contains(" 403") || lower.contains(" 404") || lower.contains("invalid api key"))
+        }
+        _ => true,
     }
 }
 
@@ -2729,10 +2813,13 @@ pub struct OpenAiImageClient {
     retry_notifier: Option<RetryNotifier>,
     trace_dir: Option<PathBuf>,
     trace_context: Option<AiTraceContext>,
+    fallbacks: Vec<OpenAiImageClient>,
 }
 
 impl OpenAiImageClient {
-    pub fn new(config: ImageGenConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
+    pub fn new(mut config: ImageGenConfig, proxy: &ProxyConfig) -> Result<Self, AiError> {
+        let fallback_specs = std::mem::take(&mut config.fallbacks);
+        let fallback_base = config.clone();
         let keys = resolve_api_keys(
             &config.api_keys,
             config.api_key.as_deref(),
@@ -2752,7 +2839,7 @@ impl OpenAiImageClient {
         )?;
         let client = http_client(config.timeout_seconds, proxy)?;
         let max_concurrent_per_key = config.max_concurrent_per_key;
-        Ok(Self {
+        let mut client = Self {
             config,
             client,
             key_pool: shared_key_pool(keys, max_concurrent_per_key),
@@ -2761,21 +2848,39 @@ impl OpenAiImageClient {
             retry_notifier: None,
             trace_dir: None,
             trace_context: None,
-        })
+            fallbacks: Vec::new(),
+        };
+        for fallback in fallback_specs {
+            match Self::new(image_gen_config_for_fallback(&fallback_base, fallback), proxy) {
+                Ok(fallback_client) => client.fallbacks.push(fallback_client),
+                Err(error) => warn!(error = %error, "image generation fallback initialization failed; ignoring fallback"),
+            }
+        }
+        Ok(client)
     }
 
     pub fn with_retry_notifier(mut self, retry_notifier: RetryNotifier) -> Self {
-        self.retry_notifier = Some(retry_notifier);
+        self.retry_notifier = Some(Arc::clone(&retry_notifier));
+        for fallback in &mut self.fallbacks {
+            fallback.retry_notifier = Some(Arc::clone(&retry_notifier));
+        }
         self
     }
 
     pub fn with_trace_dir(mut self, trace_dir: impl Into<PathBuf>) -> Self {
-        self.trace_dir = Some(trace_dir.into());
+        let trace_dir = trace_dir.into();
+        self.trace_dir = Some(trace_dir.clone());
+        for fallback in &mut self.fallbacks {
+            fallback.trace_dir = Some(trace_dir.clone());
+        }
         self
     }
 
     pub fn with_trace_context(mut self, trace_context: AiTraceContext) -> Self {
-        self.trace_context = Some(trace_context);
+        self.trace_context = Some(trace_context.clone());
+        for fallback in &mut self.fallbacks {
+            fallback.trace_context = Some(trace_context.clone());
+        }
         self
     }
 
@@ -2797,6 +2902,35 @@ impl OpenAiImageClient {
         &self,
         prompt: &str,
         output_dir: impl AsRef<Path>,
+    ) -> Result<ImageArtifact, AiError> {
+        let output_dir = output_dir.as_ref();
+        match self.generate_from_prompt_primary(prompt, output_dir).await {
+            Ok(artifact) => Ok(artifact),
+            Err(error) if is_provider_failover_error(&error) && !self.fallbacks.is_empty() => {
+                let mut last_error = error;
+                for (index, fallback) in self.fallbacks.iter().enumerate() {
+                    warn!(
+                        fallback_index = index + 1,
+                        fallback_total = self.fallbacks.len(),
+                        error = %last_error,
+                        "image generation primary failed; trying fallback provider"
+                    );
+                    match fallback.generate_from_prompt_primary(prompt, output_dir).await {
+                        Ok(artifact) => return Ok(artifact),
+                        Err(error) if is_provider_failover_error(&error) => last_error = error,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(last_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn generate_from_prompt_primary(
+        &self,
+        prompt: &str,
+        output_dir: &Path,
     ) -> Result<ImageArtifact, AiError> {
         let endpoint = image_generations_endpoint(&self.base_url);
         let payload = self.image_generation_payload(prompt);
@@ -3990,6 +4124,7 @@ mod tests {
             retry_notifier: None,
             trace_dir: None,
             trace_context: None,
+            fallbacks: Vec::new(),
         }
     }
 
@@ -4151,6 +4286,7 @@ mod tests {
             max_concurrent_requests: 4,
             max_concurrent_per_key: 0,
             request_body_overrides: Default::default(),
+            fallbacks: Vec::new(),
         }
     }
 
@@ -4178,6 +4314,7 @@ mod tests {
             max_concurrent_requests: 2,
             max_concurrent_per_key: 0,
             request_body_overrides: Default::default(),
+            fallbacks: Vec::new(),
         }
     }
 
@@ -4203,6 +4340,7 @@ mod tests {
             retry_5xx_attempts: 5,
             max_concurrent_per_key: 0,
             prompt_template: None,
+            fallbacks: Vec::new(),
         }
     }
 
@@ -4219,6 +4357,28 @@ mod tests {
         assert_eq!(payload["size"], "16:9");
         assert_eq!(payload["resolution"], "2k");
         assert!(payload.get("quality").is_none());
+    }
+
+    #[test]
+    fn image_generation_fallback_inherits_shape_but_replaces_route() {
+        let mut base = image_config();
+        base.provider = "primary".into();
+        let fallback = image_gen_config_for_fallback(
+            &base,
+            ProviderFallbackConfig {
+                provider: "backup".into(),
+                api_key: Some("backup-key".into()),
+                api_keys: vec!["backup-key-2".into()],
+                base_url: Some("https://backup.example/v1".into()),
+                model: Some("backup-image".into()),
+                request_body_overrides: Default::default(),
+            },
+        );
+
+        assert_eq!(fallback.provider, "backup");
+        assert_eq!(fallback.model.as_deref(), Some("backup-image"));
+        assert_eq!(fallback.size, base.size);
+        assert!(fallback.fallbacks.is_empty());
     }
 
     #[test]
