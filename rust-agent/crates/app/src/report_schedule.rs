@@ -4,6 +4,28 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
 use wechat_summary_core::{config::ReportGroupConfig, AgentConfig};
+use wechat_summary_storage::{TaskRecord, TaskState};
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WeeklyStats {
+    pub(crate) tasks: usize,
+    pub(crate) succeeded: usize,
+    pub(crate) failed: usize,
+    pub(crate) messages: u64,
+    pub(crate) media: u64,
+}
+
+pub(crate) fn aggregate(tasks: impl IntoIterator<Item = impl std::borrow::Borrow<TaskRecord>>) -> WeeklyStats {
+    tasks.into_iter().fold(WeeklyStats::default(), |mut stats, task| {
+        let task = task.borrow();
+        stats.tasks += 1;
+        stats.succeeded += usize::from(task.state == TaskState::Succeeded);
+        stats.failed += usize::from(task.state == TaskState::Failed);
+        stats.messages += task.message_count;
+        stats.media += task.media_count;
+        stats
+    })
+}
 
 pub(crate) fn schedule(now: DateTime<Utc>, config: &AgentConfig) -> HashMap<String, DateTime<Utc>> {
     config.report_groups.iter()

@@ -5052,13 +5052,10 @@ async fn run_weekly_group_report(
         .iter()
         .filter(|task| group.rooms.contains(&task.room_id) && task.created_at >= since)
         .collect::<Vec<_>>();
-    let succeeded = tasks.iter().filter(|task| task.state == TaskState::Succeeded).count();
-    let failed = tasks.iter().filter(|task| task.state == TaskState::Failed).count();
-    let messages = tasks.iter().map(|task| task.message_count).sum::<u64>();
-    let media = tasks.iter().map(|task| task.media_count).sum::<u64>();
+    let weekly = report_schedule::aggregate(tasks.iter().copied());
     let stats = format!(
         "群组：{group_name}\n统计周期：最近 7 天\n成员群数量：{}\n总结任务：{}\n成功：{}\n失败：{}\n处理消息：{}\n处理媒体：{}\n请生成一张清晰、现代、中文可读的群聊运营统计图表。只呈现聚合指标，不呈现聊天正文、用户名、私人信息或敏感内容。",
-        group.rooms.len(), tasks.len(), succeeded, failed, messages, media
+        group.rooms.len(), weekly.tasks, weekly.succeeded, weekly.failed, weekly.messages, weekly.media
     );
     for room_id in &group.rooms {
         let report_id = store.create_weekly_metric(group_name, room_id)?;
@@ -5073,22 +5070,22 @@ async fn run_weekly_group_report(
             })?.id,
             store: store.clone(),
         };
-        task.set_stage(TaskState::Running, "weekly_chart", Some(&stats), None, tasks.len() as u64, media);
+        task.set_stage(TaskState::Running, "weekly_chart", Some(&stats), None, weekly.tasks as u64, weekly.media);
         let outcome = async {
             let artifact = generate_summary_image(config, room_id, &stats, None).await?;
             deliver_outboxed_image(config, &task, client, room_id, &artifact).await?;
-            let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。", tasks.len(), succeeded, failed);
+            let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。", weekly.tasks, weekly.succeeded, weekly.failed);
             deliver_outboxed_text(config, &task, client, room_id, &caption).await?;
             store.update_weekly_metric(&report_id, "succeeded", Some(&caption), Some(&artifact.path), None)?;
-            task.set_stage(TaskState::Succeeded, "weekly_chart_delivered", Some(&caption), None, tasks.len() as u64, media);
+            task.set_stage(TaskState::Succeeded, "weekly_chart_delivered", Some(&caption), None, weekly.tasks as u64, weekly.media);
             Ok::<(), anyhow::Error>(())
         }.await;
         if let Err(error) = outcome {
             let error_message = format_error_chain(&error);
-            let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。统计图生成失败，已降级为文字统计。", tasks.len(), succeeded, failed);
+            let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。统计图生成失败，已降级为文字统计。", weekly.tasks, weekly.succeeded, weekly.failed);
             let _ = deliver_outboxed_text(config, &task, client, room_id, &caption).await;
             store.update_weekly_metric(&report_id, "degraded", Some(&caption), None, Some(&error_message))?;
-            task.set_stage(TaskState::Succeeded, "weekly_text_fallback", Some(&caption), Some(&error_message), tasks.len() as u64, media);
+            task.set_stage(TaskState::Succeeded, "weekly_text_fallback", Some(&caption), Some(&error_message), weekly.tasks as u64, weekly.media);
         }
     }
     Ok(())
