@@ -22,6 +22,7 @@ mod platform;
 mod runtime_log;
 mod outbox;
 mod report_schedule;
+mod summary_input;
 
 use runtime_log::*;
 
@@ -42,7 +43,7 @@ use wechat_summary_core::{
     TriggerMatch, TriggerMatcher,
 };
 use wechat_summary_storage::{
-    NewTask, SourceReference, SqliteStateStore, TaskState,
+    NewTask, SqliteStateStore, TaskState,
 };
 
 use crate::platform::{
@@ -3009,26 +3010,10 @@ async fn run_summary_pipeline(
     let voice_transcription_count =
         apply_voice_transcriptions(config, &trigger.room_id, &mut history).await?;
 
-    let chat_messages = history
-        .into_iter()
-        .map(history_to_chat_message)
-        .collect::<Vec<_>>();
+    let prepared_input = summary_input::prepare(config, history);
+    let chat_messages = prepared_input.messages;
     if let Some(task) = task {
-        let references = chat_messages
-            .iter()
-            .enumerate()
-            .map(|(index, message)| SourceReference {
-                task_id: task.id.clone(),
-                point_index: 0,
-                source_id: format!("m-{}", index + 1),
-                occurred_at: message.timestamp,
-                sender_label: format!("成员-{:x}", md5::compute(message.sender_id.as_bytes())),
-                message_index: (index + 1) as u32,
-            })
-            .collect::<Vec<_>>();
-        if let Err(error) = task.store.add_source_references(&references) {
-            warn!(task_id = %task.id, error = %error, "failed to store task source references");
-        }
+        summary_input::persist_sources(task, &chat_messages);
         task.set_stage(
             TaskState::Running,
             "media_processing",
@@ -3038,8 +3023,7 @@ async fn run_summary_pipeline(
             (image_caption_count + video_caption_count + voice_transcription_count) as u64,
         );
     }
-    let formatted = ChatFormatter::format(&chat_messages);
-    if formatted.total_messages == 0 {
+    if prepared_input.total_messages == 0 {
         client
             .send_text(&trigger.room_id, "这段时间没有可总结的文本聊天记录。")
             .await
@@ -3047,12 +3031,12 @@ async fn run_summary_pipeline(
         return Ok(PipelineOutcome::NoSummary);
     }
 
-    let privacy = PrivacyFilter::new(config.privacy.clone());
-    let llm_input = privacy.apply(&formatted.merged_input);
+    let privacy = prepared_input.privacy;
+    let llm_input = prepared_input.llm_input;
     info!(
         room_id = %trigger.room_id,
         input_chars = llm_input.chars().count(),
-        total_messages = formatted.total_messages,
+        total_messages = prepared_input.total_messages,
         text_summary_enabled = options.text_summary_enabled,
         image_gen_enabled = options.image_gen_enabled,
         "LLM input prepared"
@@ -3063,7 +3047,7 @@ async fn run_summary_pipeline(
             "llm input prepared room={} input_chars={} messages={} text_enabled={} image_enabled={}",
             trigger.room_id,
             llm_input.chars().count(),
-            formatted.total_messages,
+            prepared_input.total_messages,
             options.text_summary_enabled,
             options.image_gen_enabled
         ),
@@ -3153,7 +3137,7 @@ async fn run_summary_pipeline(
                 summary.chars().count()
             ),
         );
-        let reply = format_summary_reply(&summary, range, formatted.total_messages);
+        let reply = format_summary_reply(&summary, range, prepared_input.total_messages);
         if options.defer_text_until_image_ready {
             pending_text_reply = Some(reply);
         } else {
@@ -6368,7 +6352,7 @@ fn ensure_image_pipeline_output_not_refusal(
     bail!("LLM returned refusal-like {stage}; skipped image generation");
 }
 
-fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
+pub(crate) fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
     ChatMessage {
         timestamp: message.timestamp,
         sender_id: message.sender_id,
