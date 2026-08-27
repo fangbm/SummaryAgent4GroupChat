@@ -24,6 +24,7 @@ mod outbox;
 mod report_schedule;
 mod summary_input;
 mod history_rules;
+mod media_rules;
 
 use runtime_log::*;
 
@@ -5367,10 +5368,10 @@ async fn apply_image_captions(
         if candidates.len() >= config.image_caption.max_images_per_summary {
             break;
         }
-        if !is_image_message_type(&message.msg_type) {
+        if !media_rules::is_image_type(&message.msg_type) {
             continue;
         }
-        let Some(source) = image_caption_source(message) else {
+        let Some(source) = media_rules::image_source(message) else {
             if let Some(error) = message.media_decode_error.as_deref() {
                 append_runtime_log(
                     config,
@@ -5451,7 +5452,7 @@ async fn apply_image_captions(
                         room_id, attempted, error
                     ),
                 );
-                if is_image_caption_auth_error(&error) {
+                if media_rules::is_auth_error(&error) {
                     warn!(
                         room_id = %room_id,
                         attempted,
@@ -5526,41 +5527,6 @@ fn spawn_image_caption_task(
     });
 }
 
-fn is_image_caption_auth_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("invalid_platform_key")
-        || lower.contains("missing or invalid platform key")
-}
-
-fn image_caption_source(message: &PlatformHistoryMessage) -> Option<String> {
-    message
-        .decoded_media_path
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            message
-                .media_path
-                .as_deref()
-                .filter(|path| {
-                    let path = path.trim();
-                    path.starts_with("http://")
-                        || path.starts_with("https://")
-                        || path.starts_with("data:")
-                })
-                .map(ToOwned::to_owned)
-        })
-}
-
-fn is_image_message_type(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "image" | "img" | "3" | "图片"
-    )
-}
-
 async fn apply_video_captions(
     config: &AgentConfig,
     room_id: &str,
@@ -5597,10 +5563,10 @@ async fn apply_video_captions(
         if candidates.len() >= config.video_caption.max_videos_per_summary {
             break;
         }
-        if !is_video_message_type(&message.msg_type) {
+        if !media_rules::is_video_type(&message.msg_type) {
             continue;
         }
-        let Some(source) = video_caption_source(message) else {
+        let Some(source) = media_rules::video_source(message) else {
             if let Some(error) = message.media_decode_error.as_deref() {
                 append_runtime_log(
                     config,
@@ -5681,7 +5647,7 @@ async fn apply_video_captions(
                         room_id, attempted, error
                     ),
                 );
-                if is_video_caption_auth_error(&error) {
+                if media_rules::is_auth_error(&error) {
                     warn!(
                         room_id = %room_id,
                         attempted,
@@ -5748,38 +5714,6 @@ fn spawn_video_caption_task(
     });
 }
 
-fn is_video_caption_auth_error(error: &str) -> bool {
-    is_image_caption_auth_error(error)
-}
-
-fn video_caption_source(message: &PlatformHistoryMessage) -> Option<String> {
-    message
-        .decoded_media_path
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            message
-                .media_path
-                .as_deref()
-                .filter(|path| {
-                    let path = path.trim();
-                    path.starts_with("http://")
-                        || path.starts_with("https://")
-                        || path.starts_with("data:")
-                        || !path.is_empty()
-                })
-                .map(ToOwned::to_owned)
-        })
-}
-
-fn is_video_message_type(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "video" | "视频" | "43"
-    )
-}
-
 async fn apply_voice_transcriptions(
     config: &AgentConfig,
     room_id: &str,
@@ -5823,10 +5757,10 @@ async fn apply_voice_transcriptions(
         if candidates.len() >= config.voice_transcription.max_voices_per_summary {
             break;
         }
-        if !is_voice_message_type(&message.msg_type) {
+        if !media_rules::is_voice_type(&message.msg_type) {
             continue;
         }
-        let Some(source) = voice_transcription_source(message) else {
+        let Some(source) = media_rules::voice_source(message) else {
             if let Some(error) = message.media_decode_error.as_deref() {
                 append_runtime_log(
                     config,
@@ -5908,7 +5842,7 @@ async fn apply_voice_transcriptions(
                         room_id, attempted, error
                     ),
                 );
-                if is_voice_transcription_auth_error(&error) {
+                if media_rules::is_auth_error(&error) {
                     warn!(
                         room_id = %room_id,
                         attempted,
@@ -6208,41 +6142,6 @@ fn first_non_empty_line(text: &str) -> Option<String> {
         .map(|line| line.chars().take(300).collect())
 }
 
-fn is_voice_transcription_auth_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("invalid_platform_key")
-        || lower.contains("missing or invalid platform key")
-}
-
-fn voice_transcription_source(message: &PlatformHistoryMessage) -> Option<String> {
-    message
-        .decoded_media_path
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            message
-                .media_path
-                .as_deref()
-                .filter(|path| {
-                    let path = path.trim();
-                    !path.starts_with("http://")
-                        && !path.starts_with("https://")
-                        && !path.starts_with("data:")
-                })
-                .map(ToOwned::to_owned)
-        })
-}
-
-fn is_voice_message_type(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "voice" | "语音" | "34"
-    )
-}
-
 fn looks_like_text_summary_refusal(summary: &str) -> bool {
     let normalized: String = summary.chars().filter(|c| !c.is_whitespace()).collect();
     if normalized.is_empty() || normalized.chars().count() > 160 {
@@ -6455,18 +6354,18 @@ mod tests {
         };
 
         assert_eq!(
-            image_caption_source(&message).as_deref(),
+            media_rules::image_source(&message).as_deref(),
             Some(r"D:\Temp\decoded.jpg")
         );
 
         message.decoded_media_path = None;
         assert_eq!(
-            image_caption_source(&message).as_deref(),
+            media_rules::image_source(&message).as_deref(),
             Some("https://cdn.example/image.png")
         );
 
         message.media_path = Some(r"D:\Temp\raw.dat".into());
-        assert_eq!(image_caption_source(&message), None);
+        assert_eq!(media_rules::image_source(&message), None);
     }
 
     #[test]
@@ -6587,13 +6486,13 @@ mod tests {
 
     #[test]
     fn image_caption_auth_errors_are_detected() {
-        assert!(is_image_caption_auth_error(
+        assert!(media_rules::is_auth_error(
             r#"invalid response: image caption API returned 401 Unauthorized: {"code":"INVALID_PLATFORM_KEY"}"#
         ));
-        assert!(is_image_caption_auth_error(
+        assert!(media_rules::is_auth_error(
             "missing or invalid platform key"
         ));
-        assert!(!is_image_caption_auth_error(
+        assert!(!media_rules::is_auth_error(
             "remote image download returned 404"
         ));
     }
