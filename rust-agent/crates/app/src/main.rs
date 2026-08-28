@@ -2517,6 +2517,14 @@ struct SummaryPipelineRequest<'a> {
     task: Option<&'a OperationalTask>,
 }
 
+struct PreparedPipelineInput {
+    chat_messages: Vec<ChatMessage>,
+    privacy: PrivacyFilter,
+    llm_input: String,
+    total_messages: usize,
+    media: media_service::MediaEnrichment,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PipelineOutcome {
     SummaryProduced,
@@ -2899,6 +2907,77 @@ async fn load_summary_history(
     Ok(None)
 }
 
+async fn prepare_pipeline_input(
+    config: &AgentConfig,
+    client: &PlatformWorker,
+    room_id: &str,
+    options: PipelineOptions,
+    task: Option<&OperationalTask>,
+    mut history: Vec<PlatformHistoryMessage>,
+) -> Result<Option<PreparedPipelineInput>> {
+    let media = media_service::enrich_history(config, room_id, &mut history).await?;
+    let prepared = summary_input::prepare(config, history);
+    let chat_messages = prepared.messages;
+    if let Some(task) = task {
+        summary_input::persist_sources(task, &chat_messages);
+        task.set_stage(
+            TaskState::Running,
+            "media_processing",
+            None,
+            None,
+            chat_messages.len() as u64,
+            media.total() as u64,
+        );
+    }
+    if prepared.total_messages == 0 {
+        client
+            .send_text(room_id, "这段时间没有可总结的文本聊天记录。")
+            .await
+            .context("sending empty-history message")?;
+        return Ok(None);
+    }
+
+    info!(
+        room_id,
+        input_chars = prepared.llm_input.chars().count(),
+        total_messages = prepared.total_messages,
+        text_summary_enabled = options.text_summary_enabled,
+        image_gen_enabled = options.image_gen_enabled,
+        "LLM input prepared"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm input prepared room={} input_chars={} messages={} text_enabled={} image_enabled={}",
+            room_id,
+            prepared.llm_input.chars().count(),
+            prepared.total_messages,
+            options.text_summary_enabled,
+            options.image_gen_enabled
+        ),
+    );
+    for (label, count) in [
+        ("image captions", media.images),
+        ("video captions", media.videos),
+        ("voice transcriptions", media.voices),
+    ] {
+        if count > 0 {
+            append_runtime_log(
+                config,
+                &format!("{} inserted room={} count={}", label, room_id, count),
+            );
+        }
+    }
+
+    Ok(Some(PreparedPipelineInput {
+        chat_messages,
+        privacy: prepared.privacy,
+        llm_input: prepared.llm_input,
+        total_messages: prepared.total_messages,
+        media,
+    }))
+}
+
 async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<PipelineOutcome> {
     let SummaryPipelineRequest {
         config,
@@ -3046,80 +3125,23 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
         ),
     );
 
-    let media = media_service::enrich_history(config, &trigger.room_id, &mut history).await?;
-    let image_caption_count = media.images;
-    let video_caption_count = media.videos;
-    let voice_transcription_count = media.voices;
-
-    let prepared_input = summary_input::prepare(config, history);
-    let chat_messages = prepared_input.messages;
-    if let Some(task) = task {
-        summary_input::persist_sources(task, &chat_messages);
-        task.set_stage(
-            TaskState::Running,
-            "media_processing",
-            None,
-            None,
-            chat_messages.len() as u64,
-            media.total() as u64,
-        );
-    }
-    if prepared_input.total_messages == 0 {
-        client
-            .send_text(&trigger.room_id, "这段时间没有可总结的文本聊天记录。")
-            .await
-            .context("sending empty-history message")?;
+    let Some(prepared_input) = prepare_pipeline_input(
+        config,
+        client,
+        &trigger.room_id,
+        options,
+        task,
+        history,
+    )
+    .await?
+    else {
         return Ok(PipelineOutcome::NoSummary);
-    }
-
+    };
+    let chat_messages = prepared_input.chat_messages;
     let privacy = prepared_input.privacy;
     let llm_input = prepared_input.llm_input;
-    info!(
-        room_id = %trigger.room_id,
-        input_chars = llm_input.chars().count(),
-        total_messages = prepared_input.total_messages,
-        text_summary_enabled = options.text_summary_enabled,
-        image_gen_enabled = options.image_gen_enabled,
-        "LLM input prepared"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "llm input prepared room={} input_chars={} messages={} text_enabled={} image_enabled={}",
-            trigger.room_id,
-            llm_input.chars().count(),
-            prepared_input.total_messages,
-            options.text_summary_enabled,
-            options.image_gen_enabled
-        ),
-    );
-    if image_caption_count > 0 {
-        append_runtime_log(
-            config,
-            &format!(
-                "image captions inserted room={} count={}",
-                trigger.room_id, image_caption_count
-            ),
-        );
-    }
-    if video_caption_count > 0 {
-        append_runtime_log(
-            config,
-            &format!(
-                "video captions inserted room={} count={}",
-                trigger.room_id, video_caption_count
-            ),
-        );
-    }
-    if voice_transcription_count > 0 {
-        append_runtime_log(
-            config,
-            &format!(
-                "voice transcriptions inserted room={} count={}",
-                trigger.room_id, voice_transcription_count
-            ),
-        );
-    }
+    let total_messages = prepared_input.total_messages;
+    let media = prepared_input.media;
     let mut llm = configure_llm_tracing(
         OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
             .context("initializing LLM client")?,
@@ -3178,7 +3200,7 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
                 summary.chars().count()
             ),
         );
-        let reply = format_summary_reply(&summary, range, prepared_input.total_messages);
+        let reply = format_summary_reply(&summary, range, total_messages);
         if options.defer_text_until_image_ready {
             pending_text_reply = Some(reply);
         } else {
