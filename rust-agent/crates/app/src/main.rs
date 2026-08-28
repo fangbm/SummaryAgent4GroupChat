@@ -2777,6 +2777,128 @@ fn media_decode_attempt_count(messages: &[PlatformHistoryMessage]) -> usize {
         .count()
 }
 
+async fn load_summary_history(
+    config: &AgentConfig,
+    client: &PlatformWorker,
+    incoming: &IncomingMessage,
+    trigger: &TriggerMatch,
+    range: &ResolvedTimeRange,
+    recent_observed_messages: Option<&RecentObservedMessages>,
+) -> Result<Option<Vec<PlatformHistoryMessage>>> {
+    let history_page_limit = config.history_message_limit();
+    let media_decode_limit = summary_media_decode_limit(config);
+    info!(
+        room_id = %trigger.room_id,
+        since = %range.since,
+        until = %range.until,
+        page_limit = history_page_limit,
+        media_decode_limit = ?media_decode_limit,
+        "querying platform history"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "history query started room={} since={} until={} page_limit={} media_decode_limit={}",
+            trigger.room_id,
+            range.since,
+            range.until,
+            history_page_limit,
+            format_media_decode_limit(media_decode_limit)
+        ),
+    );
+    let mut history = query_platform_history_paginated(
+        config,
+        client,
+        &trigger.room_id,
+        incoming.room_name.as_deref(),
+        range.since,
+        range.until,
+        history_page_limit,
+        media_decode_limit,
+    )
+    .await
+    .context("querying platform chat history")?;
+    if !history.is_empty() {
+        return Ok(Some(history));
+    }
+
+    let observed_count = recent_observed_messages
+        .map(|recent| {
+            recent.count_user_text_in_range(&trigger.room_id, range.since, range.until, incoming)
+        })
+        .unwrap_or(0);
+    if observed_count == 0 {
+        return Ok(Some(history));
+    }
+
+    warn!(
+        room_id = %trigger.room_id,
+        observed_count,
+        since = %range.since,
+        until = %range.until,
+        "platform history returned empty despite recent observed messages"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "history empty but recent listener saw messages room={} observed_count={} since={} until={}",
+            trigger.room_id, observed_count, range.since, range.until
+        ),
+    );
+    for (retry_index, delay_ms) in EMPTY_HISTORY_RETRY_DELAYS_MS.iter().copied().enumerate() {
+        append_runtime_log(
+            config,
+            &format!(
+                "history empty retry scheduled room={} retry={} delay_ms={}",
+                trigger.room_id,
+                retry_index + 1,
+                delay_ms
+            ),
+        );
+        tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
+        history = query_platform_history_paginated(
+            config,
+            client,
+            &trigger.room_id,
+            incoming.room_name.as_deref(),
+            range.since,
+            range.until,
+            history_page_limit,
+            media_decode_limit,
+        )
+        .await
+        .context("retrying platform chat history after suspicious empty result")?;
+        append_runtime_log(
+            config,
+            &format!(
+                "history empty retry completed room={} retry={} history_len={}",
+                trigger.room_id,
+                retry_index + 1,
+                history.len()
+            ),
+        );
+        if !history.is_empty() {
+            return Ok(Some(history));
+        }
+    }
+
+    client
+        .send_text(
+            &trigger.room_id,
+            "历史读取暂时为空，但刚刚监听到该群有消息。wxdb 可能还在同步，请稍后再试。",
+        )
+        .await
+        .context("sending suspicious empty-history message")?;
+    append_runtime_log(
+        config,
+        &format!(
+            "history suspicious empty after retries room={} observed_count={}",
+            trigger.room_id, observed_count
+        ),
+    );
+    Ok(None)
+}
+
 async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<PipelineOutcome> {
     let SummaryPipelineRequest {
         config,
@@ -2838,122 +2960,18 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
         .log_retry_attempts
         .then(|| retry_log_notifier(config, trigger.room_id.clone()));
 
-    let history_page_limit = config.history_message_limit();
-    let media_decode_limit = summary_media_decode_limit(config);
-    info!(
-        room_id = %trigger.room_id,
-        since = %range.since,
-        until = %range.until,
-        page_limit = history_page_limit,
-        media_decode_limit = ?media_decode_limit,
-        "querying platform history"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "history query started room={} since={} until={} page_limit={} media_decode_limit={}",
-            trigger.room_id,
-            range.since,
-            range.until,
-            history_page_limit,
-            format_media_decode_limit(media_decode_limit)
-        ),
-    );
-    let mut history = query_platform_history_paginated(
+    let Some(mut history) = load_summary_history(
         config,
         client,
-        &trigger.room_id,
-        incoming.room_name.as_deref(),
-        range.since,
-        range.until,
-        history_page_limit,
-        media_decode_limit,
+        incoming,
+        trigger,
+        range,
+        recent_observed_messages,
     )
-    .await
-    .context("querying platform chat history")?;
-    if history.is_empty() {
-        let observed_count = recent_observed_messages
-            .map(|recent| {
-                recent.count_user_text_in_range(
-                    &trigger.room_id,
-                    range.since,
-                    range.until,
-                    incoming,
-                )
-            })
-            .unwrap_or(0);
-        if observed_count > 0 {
-            warn!(
-                room_id = %trigger.room_id,
-                observed_count,
-                since = %range.since,
-                until = %range.until,
-                "platform history returned empty despite recent observed messages"
-            );
-            append_runtime_log(
-                config,
-                &format!(
-                    "history empty but recent listener saw messages room={} observed_count={} since={} until={}",
-                    trigger.room_id, observed_count, range.since, range.until
-                ),
-            );
-            for (retry_index, delay_ms) in EMPTY_HISTORY_RETRY_DELAYS_MS.iter().copied().enumerate()
-            {
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "history empty retry scheduled room={} retry={} delay_ms={}",
-                        trigger.room_id,
-                        retry_index + 1,
-                        delay_ms
-                    ),
-                );
-                tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
-                history = query_platform_history_paginated(
-                    config,
-                    client,
-                    &trigger.room_id,
-                    incoming.room_name.as_deref(),
-                    range.since,
-                    range.until,
-                    history_page_limit,
-                    media_decode_limit,
-                )
-                .await
-                .context("retrying platform chat history after suspicious empty result")?;
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "history empty retry completed room={} retry={} history_len={}",
-                        trigger.room_id,
-                        retry_index + 1,
-                        history.len()
-                    ),
-                );
-                if !history.is_empty() {
-                    break;
-                }
-            }
-
-            if history.is_empty() {
-                client
-                    .send_text(
-                        &trigger.room_id,
-                        "历史读取暂时为空，但刚刚监听到该群有消息。wxdb 可能还在同步，请稍后再试。",
-                    )
-                    .await
-                    .context("sending suspicious empty-history message")?;
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "history suspicious empty after retries room={} observed_count={}",
-                        trigger.room_id, observed_count
-                    ),
-                );
-                return Ok(PipelineOutcome::NoSummary);
-            }
-        }
-    }
+    .await?
+    else {
+        return Ok(PipelineOutcome::NoSummary);
+    };
     let platform_history_len = history.len();
     if let Some(task) = task {
         task.set_stage(TaskState::Running, "history", None, None, platform_history_len as u64, 0);
