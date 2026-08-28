@@ -5358,28 +5358,26 @@ pub(crate) async fn apply_image_captions(
     let captioner = Arc::new(captioner);
     let max_concurrent = config.image_caption.max_concurrent_requests.max(1);
 
-    let mut candidates = Vec::new();
-    for (history_index, message) in history.iter().enumerate() {
-        if candidates.len() >= config.image_caption.max_images_per_summary {
-            break;
-        }
-        if !media_rules::is_image_type(&message.msg_type) {
-            continue;
-        }
-        let Some(source) = media_rules::image_source(message) else {
-            if let Some(error) = message.media_decode_error.as_deref() {
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "image caption skipped room={} reason=decode_failed error={}",
-                        room_id, error
-                    ),
-                );
-            }
-            continue;
-        };
-        candidates.push((history_index, candidates.len() + 1, source));
+    let selection = media_service::select_candidates(
+        history,
+        config.image_caption.max_images_per_summary,
+        media_rules::is_image_type,
+        media_rules::image_source,
+    );
+    for error in &selection.decode_errors {
+        append_runtime_log(
+            config,
+            &format!(
+                "image caption skipped room={} reason=decode_failed error={}",
+                room_id, error
+            ),
+        );
     }
+    let candidates: Vec<_> = selection
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.history_index, candidate.attempted, candidate.source))
+        .collect();
 
     let attempted = candidates.len();
     if attempted == 0 {
@@ -5553,28 +5551,26 @@ pub(crate) async fn apply_video_captions(
     let captioner = Arc::new(captioner);
     let max_concurrent = config.video_caption.max_concurrent_requests.max(1);
 
-    let mut candidates = Vec::new();
-    for (history_index, message) in history.iter().enumerate() {
-        if candidates.len() >= config.video_caption.max_videos_per_summary {
-            break;
-        }
-        if !media_rules::is_video_type(&message.msg_type) {
-            continue;
-        }
-        let Some(source) = media_rules::video_source(message) else {
-            if let Some(error) = message.media_decode_error.as_deref() {
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "video caption skipped room={} reason=decode_failed error={}",
-                        room_id, error
-                    ),
-                );
-            }
-            continue;
-        };
-        candidates.push((history_index, candidates.len() + 1, source));
+    let selection = media_service::select_candidates(
+        history,
+        config.video_caption.max_videos_per_summary,
+        media_rules::is_video_type,
+        media_rules::video_source,
+    );
+    for error in &selection.decode_errors {
+        append_runtime_log(
+            config,
+            &format!(
+                "video caption skipped room={} reason=decode_failed error={}",
+                room_id, error
+            ),
+        );
     }
+    let candidates: Vec<_> = selection
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.history_index, candidate.attempted, candidate.source))
+        .collect();
 
     let attempted = candidates.len();
     if attempted == 0 {
@@ -5747,28 +5743,26 @@ pub(crate) async fn apply_voice_transcriptions(
     let max_concurrent = config.voice_transcription.max_concurrent_requests.max(1);
     let audio_prep = Arc::new(media_audio::VoiceTranscriptionAudioPrep::from_config(config));
 
-    let mut candidates = Vec::new();
-    for (history_index, message) in history.iter().enumerate() {
-        if candidates.len() >= config.voice_transcription.max_voices_per_summary {
-            break;
-        }
-        if !media_rules::is_voice_type(&message.msg_type) {
-            continue;
-        }
-        let Some(source) = media_rules::voice_source(message) else {
-            if let Some(error) = message.media_decode_error.as_deref() {
-                append_runtime_log(
-                    config,
-                    &format!(
-                        "voice transcription skipped room={} reason=decode_failed error={}",
-                        room_id, error
-                    ),
-                );
-            }
-            continue;
-        };
-        candidates.push((history_index, candidates.len() + 1, source));
+    let selection = media_service::select_candidates(
+        history,
+        config.voice_transcription.max_voices_per_summary,
+        media_rules::is_voice_type,
+        media_rules::voice_source,
+    );
+    for error in &selection.decode_errors {
+        append_runtime_log(
+            config,
+            &format!(
+                "voice transcription skipped room={} reason=decode_failed error={}",
+                room_id, error
+            ),
+        );
     }
+    let candidates: Vec<_> = selection
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.history_index, candidate.attempted, candidate.source))
+        .collect();
 
     let attempted = candidates.len();
     if attempted == 0 {
