@@ -15,6 +15,7 @@ use std::{
 
 mod llm_chunking;
 mod llm_output;
+mod summary_image;
 mod platform;
 mod runtime_log;
 mod outbox;
@@ -38,8 +39,8 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use wechat_summary_ai::{
-    AiError, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm,
-    OpenAiImageClient, OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
+    AiError, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm, OpenAiVideoCaptionClient,
+    OpenAiVisionCaptionClient,
 };
 use wechat_summary_core::{
     config::{ListenConfig, MatchMode, PlatformKindConfig, PrivacyConfig, TimeRangeMode},
@@ -3342,7 +3343,7 @@ async fn run_summary_pipeline(
             ),
         );
 
-        match generate_summary_image(
+        match summary_image::generate(
             config,
             &trigger.room_id,
             &image_prompt,
@@ -3363,7 +3364,7 @@ async fn run_summary_pipeline(
                 if let Some(task) = task {
                     deliver_outboxed_image(config, task, client, &trigger.room_id, &artifact).await?;
                 } else {
-                    send_summary_image(config, client, &trigger.room_id, &artifact).await?;
+                    summary_image::send_with_worker(config, client, &trigger.room_id, &artifact).await?;
                 }
                 record_image_cooldown_success(
                     config,
@@ -3595,9 +3596,8 @@ async fn run_background_image_pipeline_inner(
         ),
     );
 
-    let artifact =
-        generate_summary_image(config, room_id, &image_prompt, Some(retry_notifier)).await?;
-    send_summary_image_with_sender(config, sender, room_id, &artifact).await?;
+    let artifact = summary_image::generate(config, room_id, &image_prompt, Some(retry_notifier)).await?;
+    summary_image::send_with_sender(config, sender, room_id, &artifact).await?;
     record_image_cooldown_success(config, image_cooldown_recorder, room_id)?;
     append_runtime_log(
         config,
@@ -4380,71 +4380,6 @@ fn chat_input_for_followup_prompt(
     format!("[IMAGE_SUMMARY]\n{}", image_summary.trim())
 }
 
-async fn generate_summary_image(
-    config: &AgentConfig,
-    room_id: &str,
-    image_prompt: &str,
-    retry_notifier: Option<RetryNotifier>,
-) -> Result<ImageArtifact> {
-    let mut image_client = OpenAiImageClient::new(config.image_gen.clone(), &config.proxy)
-        .context("initializing image client")?;
-    if let Some(trace_dir) = ai_trace_dir(config)? {
-        image_client = image_client.with_trace_dir(trace_dir);
-    }
-    image_client =
-        image_client.with_trace_context(ai_trace_context(room_id, "summary image generation"));
-    if let Some(retry_notifier) = retry_notifier {
-        image_client = image_client.with_retry_notifier(retry_notifier);
-    }
-    info!(
-        room_id = %room_id,
-        prompt_chars = image_prompt.chars().count(),
-        "generating summary image"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "generating summary image room={} prompt_chars={}",
-            room_id,
-            image_prompt.chars().count()
-        ),
-    );
-    let artifact = image_client
-        .generate_from_prompt(image_prompt, &config.runtime.output_dir)
-        .await
-        .context("generating summary image")?;
-    info!(
-        room_id = %room_id,
-        path = %artifact.path,
-        size_bytes = artifact.size_bytes,
-        "summary image generated"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "summary image generated room={} path={} size_bytes={}",
-            room_id, artifact.path, artifact.size_bytes
-        ),
-    );
-    Ok(artifact)
-}
-
-async fn send_summary_image_with_sender(
-    config: &AgentConfig,
-    sender: &PlatformSender,
-    room_id: &str,
-    artifact: &ImageArtifact,
-) -> Result<()> {
-    info!(room_id = %room_id, path = %artifact.path, "sending summary image");
-    sender
-        .send_image(room_id, &artifact.path)
-        .await
-        .context("sending summary image")?;
-    info!(room_id = %room_id, "summary image sent");
-    append_runtime_log(config, &format!("summary image sent room={}", room_id));
-    Ok(())
-}
-
 async fn send_image_failure_message(
     config: &AgentConfig,
     client: &PlatformWorker,
@@ -4475,22 +4410,6 @@ async fn send_image_failure_message(
             ),
         );
     }
-}
-
-async fn send_summary_image(
-    config: &AgentConfig,
-    client: &PlatformWorker,
-    room_id: &str,
-    artifact: &ImageArtifact,
-) -> Result<()> {
-    info!(room_id = %room_id, path = %artifact.path, "sending summary image");
-    client
-        .send_image(room_id, &artifact.path)
-        .await
-        .context("sending summary image")?;
-    info!(room_id = %room_id, "summary image sent");
-    append_runtime_log(config, &format!("summary image sent room={}", room_id));
-    Ok(())
 }
 
 async fn deliver_outboxed_text(
@@ -4687,7 +4606,7 @@ async fn run_weekly_group_report(
         };
         task.set_stage(TaskState::Running, "weekly_chart", Some(&stats), None, weekly.tasks as u64, weekly.media);
         let outcome = async {
-            let artifact = generate_summary_image(config, room_id, &stats, None).await?;
+            let artifact = summary_image::generate(config, room_id, &stats, None).await?;
             deliver_outboxed_image(config, &task, client, room_id, &artifact).await?;
             let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。", weekly.tasks, weekly.succeeded, weekly.failed);
             deliver_outboxed_text(config, &task, client, room_id, &caption).await?;
