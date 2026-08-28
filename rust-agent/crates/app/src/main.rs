@@ -22,8 +22,10 @@ mod history_rules;
 mod media_rules;
 mod media_service;
 mod media_audio;
+mod ai_runtime;
 
 use runtime_log::*;
+use ai_runtime::*;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
@@ -32,7 +34,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use wechat_summary_ai::{
-    AiError, AiTraceContext, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm,
+    AiError, OpenAiAudioTranscriptionClient, OpenAiCompatibleLlm,
     OpenAiImageClient, OpenAiVideoCaptionClient, OpenAiVisionCaptionClient, RetryNotifier,
 };
 use wechat_summary_core::{
@@ -3636,68 +3638,6 @@ impl LlmOutputLimit {
             Self::Configured => "configured",
             Self::Unlimited => "unlimited",
         }
-    }
-}
-
-fn configure_llm_tracing(
-    llm: OpenAiCompatibleLlm,
-    config: &AgentConfig,
-) -> Result<OpenAiCompatibleLlm> {
-    Ok(match ai_trace_dir(config)? {
-        Some(trace_dir) => llm.with_trace_dir(trace_dir),
-        None => llm,
-    })
-}
-
-fn ai_trace_dir(config: &AgentConfig) -> Result<Option<PathBuf>> {
-    if !config.runtime.ai_trace_enabled {
-        return Ok(None);
-    }
-    let trace_dir = if config.runtime.ai_trace_dir.trim().is_empty() {
-        Path::new(&config.runtime.output_dir).join("ai-traces")
-    } else {
-        PathBuf::from(config.runtime.ai_trace_dir.trim())
-    };
-    fs::create_dir_all(&trace_dir)
-        .with_context(|| format!("creating AI trace directory {}", trace_dir.display()))?;
-    Ok(Some(trace_dir))
-}
-
-fn ai_trace_context(room_id: &str, stage: &str) -> AiTraceContext {
-    AiTraceContext {
-        room_id: Some(room_id.to_string()),
-        stage: Some(stage.to_string()),
-        ..Default::default()
-    }
-}
-
-fn ai_trace_context_for_chunk(
-    room_id: &str,
-    stage: &str,
-    chunk_index: usize,
-    chunk_total: usize,
-) -> AiTraceContext {
-    AiTraceContext {
-        room_id: Some(room_id.to_string()),
-        stage: Some(stage.to_string()),
-        chunk_index: Some(chunk_index),
-        chunk_total: Some(chunk_total),
-        ..Default::default()
-    }
-}
-
-fn ai_trace_context_for_item(
-    room_id: &str,
-    stage: &str,
-    item_index: usize,
-    item_total: usize,
-) -> AiTraceContext {
-    AiTraceContext {
-        room_id: Some(room_id.to_string()),
-        stage: Some(stage.to_string()),
-        item_index: Some(item_index),
-        item_total: Some(item_total),
-        ..Default::default()
     }
 }
 
