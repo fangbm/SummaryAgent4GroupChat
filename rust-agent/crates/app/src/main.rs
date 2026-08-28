@@ -1999,21 +1999,21 @@ async fn handle_platform_event(
         .lock()
         .ok()
         .map(|recent| recent.clone());
-    match run_summary_pipeline(
+    match run_summary_pipeline(SummaryPipelineRequest {
         config,
         client,
-        &incoming,
-        &trigger,
-        &range,
-        pipeline_options,
+        incoming: &incoming,
+        trigger: &trigger,
+        range: &range,
+        options: pipeline_options,
         image_pipeline_slots,
-        Some(ImageCooldownRecorder {
+        image_cooldown_recorder: Some(ImageCooldownRecorder {
             store: store.clone(),
             timestamp: incoming.timestamp,
         }),
-        recent_observed_snapshot.as_ref(),
-        Some(&task),
-    )
+        recent_observed_messages: recent_observed_snapshot.as_ref(),
+        task: Some(&task),
+    })
     .await
     {
         Ok(PipelineOutcome::SummaryProduced) => {
@@ -2370,11 +2370,18 @@ fn drain_manual_retry_tasks(
             };
             let trigger = TriggerMatch { room_id: room_id.clone(), trigger_symbol: "[task_retry]".to_string(), trigger_content: "[task_retry]".to_string() };
             let range = ResolvedTimeRange { since: record.since, until: record.until, mode: TimeRangeMode::FixedMinutes };
-            let result = run_summary_pipeline(
-                &task_config, &task_client, &incoming, &trigger, &range,
-                PipelineOptions::manual(&task_config, &room_id, false), &task_slots,
-                Some(ImageCooldownRecorder { store: task_for_future.store.clone(), timestamp: Utc::now() }), None, Some(&task_for_future),
-            ).await;
+            let result = run_summary_pipeline(SummaryPipelineRequest {
+                config: &task_config,
+                client: &task_client,
+                incoming: &incoming,
+                trigger: &trigger,
+                range: &range,
+                options: PipelineOptions::manual(&task_config, &room_id, false),
+                image_pipeline_slots: &task_slots,
+                image_cooldown_recorder: Some(ImageCooldownRecorder { store: task_for_future.store.clone(), timestamp: Utc::now() }),
+                recent_observed_messages: None,
+                task: Some(&task_for_future),
+            }).await;
             match &result {
                 Ok(PipelineOutcome::SummaryProduced) => task_for_future.set_stage(TaskState::Succeeded, "retry_completed", None, None, 0, 0),
                 Ok(PipelineOutcome::NoSummary) => task_for_future.set_stage(TaskState::Succeeded, "retry_completed_without_output", None, None, 0, 0),
@@ -2424,18 +2431,18 @@ async fn run_scheduled_summary_task(
         store: store.clone(),
     };
     task.set_stage(TaskState::Running, "accepted", None, None, 0, 0);
-    match run_summary_pipeline(
+    match run_summary_pipeline(SummaryPipelineRequest {
         config,
         client,
-        &incoming,
-        &trigger,
-        &range,
-        PipelineOptions::scheduled(config, &trigger.room_id),
+        incoming: &incoming,
+        trigger: &trigger,
+        range: &range,
+        options: PipelineOptions::scheduled(config, &trigger.room_id),
         image_pipeline_slots,
-        None,
-        None,
-        Some(&task),
-    )
+        image_cooldown_recorder: None,
+        recent_observed_messages: None,
+        task: Some(&task),
+    })
     .await
     {
         Ok(PipelineOutcome::SummaryProduced) => {
@@ -2495,6 +2502,19 @@ struct PipelineOptions {
 struct ImageCooldownRecorder {
     store: SqliteStateStore,
     timestamp: DateTime<Utc>,
+}
+
+struct SummaryPipelineRequest<'a> {
+    config: &'a AgentConfig,
+    client: &'a PlatformWorker,
+    incoming: &'a IncomingMessage,
+    trigger: &'a TriggerMatch,
+    range: &'a ResolvedTimeRange,
+    options: PipelineOptions,
+    image_pipeline_slots: &'a ImagePipelineSlotPool,
+    image_cooldown_recorder: Option<ImageCooldownRecorder>,
+    recent_observed_messages: Option<&'a RecentObservedMessages>,
+    task: Option<&'a OperationalTask>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2757,19 +2777,19 @@ fn media_decode_attempt_count(messages: &[PlatformHistoryMessage]) -> usize {
         .count()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_summary_pipeline(
-    config: &AgentConfig,
-    client: &PlatformWorker,
-    incoming: &IncomingMessage,
-    trigger: &TriggerMatch,
-    range: &ResolvedTimeRange,
-    options: PipelineOptions,
-    image_pipeline_slots: &ImagePipelineSlotPool,
-    image_cooldown_recorder: Option<ImageCooldownRecorder>,
-    recent_observed_messages: Option<&RecentObservedMessages>,
-    task: Option<&OperationalTask>,
-) -> Result<PipelineOutcome> {
+async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<PipelineOutcome> {
+    let SummaryPipelineRequest {
+        config,
+        client,
+        incoming,
+        trigger,
+        range,
+        options,
+        image_pipeline_slots,
+        image_cooldown_recorder,
+        recent_observed_messages,
+        task,
+    } = request;
     if task.is_some_and(OperationalTask::cancelled) {
         return Ok(PipelineOutcome::NoSummary);
     }
