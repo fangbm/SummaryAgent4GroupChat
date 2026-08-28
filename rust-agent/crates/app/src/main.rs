@@ -13,6 +13,7 @@ use std::{
     time::{Duration as StdDuration, Instant, SystemTime},
 };
 
+mod llm_chunking;
 mod platform;
 mod runtime_log;
 mod outbox;
@@ -26,6 +27,7 @@ mod ai_runtime;
 
 use runtime_log::*;
 use ai_runtime::*;
+use llm_chunking::*;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
@@ -40,7 +42,7 @@ use wechat_summary_ai::{
 use wechat_summary_core::{
     config::{ListenConfig, MatchMode, PlatformKindConfig, PrivacyConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
-    AgentConfig, ChatFormatter, PrivacyFilter, ResolvedTimeRange, TimeRangeCalculator,
+    AgentConfig, PrivacyFilter, ResolvedTimeRange, TimeRangeCalculator,
     TriggerMatch, TriggerMatcher,
 };
 use wechat_summary_storage::{
@@ -68,7 +70,6 @@ const WXDB_COMMAND_WATCH_LIMIT: usize = 300;
 const WXDB_COMMAND_WATCH_SEEN_IDS: usize = 2_048;
 const WXDB_COMMAND_WATCH_ERROR_LOG_INTERVAL_SECONDS: i64 = 5 * 60;
 const EMPTY_HISTORY_RETRY_DELAYS_MS: &[u64] = &[1_500, 3_000, 5_000];
-const CHUNK_PROMPT_HEADROOM_CHARS: usize = 4_096;
 const CONTEXT_LENGTH_SPLIT_MAX_DEPTH: usize = 12;
 const SUMMARY_MAX_CONCURRENCY: usize = 4;
 const SUMMARY_PENDING_CAPACITY: usize = 64;
@@ -3603,44 +3604,6 @@ async fn run_background_image_pipeline_inner(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct LongChatCompletion {
-    output: String,
-    followup_chat_input: String,
-}
-
-#[derive(Debug, Clone)]
-struct LlmChunkRequest {
-    index: usize,
-    message_count: usize,
-    input_chars: usize,
-    prompt_chars: usize,
-    messages: Vec<ChatMessage>,
-    prompt: String,
-}
-
-#[derive(Debug, Clone)]
-struct ChunkSummary {
-    index: usize,
-    message_count: usize,
-    output: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LlmOutputLimit {
-    Configured,
-    Unlimited,
-}
-
-impl LlmOutputLimit {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Configured => "configured",
-            Self::Unlimited => "unlimited",
-        }
-    }
-}
-
 async fn complete_text_summary_with_refusal_retry(
     config: &AgentConfig,
     llm: &OpenAiCompatibleLlm,
@@ -4292,36 +4255,6 @@ fn is_context_length_exceeded_error(error: &AiError) -> bool {
     }
 }
 
-fn split_llm_chunk_request(
-    chunk: &LlmChunkRequest,
-    privacy_config: &PrivacyConfig,
-    user_prompt_template: &str,
-) -> Option<(LlmChunkRequest, LlmChunkRequest)> {
-    if chunk.messages.len() <= 1 {
-        return None;
-    }
-
-    let midpoint = chunk.messages.len() / 2;
-    if midpoint == 0 || midpoint >= chunk.messages.len() {
-        return None;
-    }
-
-    let privacy = PrivacyFilter::new(privacy_config.clone());
-    let left = build_llm_chunk_request(
-        chunk.index,
-        chunk.messages[..midpoint].to_vec(),
-        &privacy,
-        user_prompt_template,
-    );
-    let right = build_llm_chunk_request(
-        chunk.index,
-        chunk.messages[midpoint..].to_vec(),
-        &privacy,
-        user_prompt_template,
-    );
-    Some((left, right))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn complete_llm_request_logged(
     config: &AgentConfig,
@@ -4388,150 +4321,6 @@ async fn complete_llm_request(
         LlmOutputLimit::Configured => llm.complete(system_prompt, prompt).await,
         LlmOutputLimit::Unlimited => llm.complete_without_max_tokens(system_prompt, prompt).await,
     }
-}
-
-fn build_llm_chunk_requests(
-    messages: &[ChatMessage],
-    privacy: &PrivacyFilter,
-    user_prompt_template: &str,
-    max_prompt_chars: usize,
-) -> Vec<LlmChunkRequest> {
-    let mut sorted = messages.to_vec();
-    sorted.sort_by_key(|message| message.timestamp);
-    let prompt_overhead = render_prompt_template(user_prompt_template, "", "", "")
-        .chars()
-        .count();
-    let line_budget = max_prompt_chars
-        .saturating_sub(prompt_overhead)
-        .saturating_sub(CHUNK_PROMPT_HEADROOM_CHARS)
-        .max(1);
-
-    let mut rough_chunks = Vec::<Vec<ChatMessage>>::new();
-    let mut current = Vec::<ChatMessage>::new();
-    let mut current_chars = 0usize;
-    for message in sorted {
-        let line_chars = formatted_chat_line_chars(&message);
-        if !current.is_empty()
-            && current_chars.saturating_add(line_chars).saturating_add(1) > line_budget
-        {
-            rough_chunks.push(std::mem::take(&mut current));
-            current_chars = 0;
-        }
-        current_chars = current_chars.saturating_add(line_chars).saturating_add(1);
-        current.push(message);
-    }
-    if !current.is_empty() {
-        rough_chunks.push(current);
-    }
-
-    let mut fitted_chunks = Vec::<Vec<ChatMessage>>::new();
-    for chunk in rough_chunks {
-        push_fitted_llm_chunks(
-            chunk,
-            privacy,
-            user_prompt_template,
-            max_prompt_chars,
-            &mut fitted_chunks,
-        );
-    }
-
-    fitted_chunks
-        .into_iter()
-        .enumerate()
-        .map(|(index, chunk_messages)| {
-            build_llm_chunk_request(index, chunk_messages, privacy, user_prompt_template)
-        })
-        .collect()
-}
-
-fn build_llm_chunk_request(
-    index: usize,
-    messages: Vec<ChatMessage>,
-    privacy: &PrivacyFilter,
-    user_prompt_template: &str,
-) -> LlmChunkRequest {
-    let input = private_formatted_chat_input(&messages, privacy);
-    let prompt = render_prompt_template(user_prompt_template, &input, "", "");
-    LlmChunkRequest {
-        index,
-        message_count: messages.len(),
-        input_chars: input.chars().count(),
-        prompt_chars: prompt.chars().count(),
-        messages,
-        prompt,
-    }
-}
-
-fn push_fitted_llm_chunks(
-    chunk: Vec<ChatMessage>,
-    privacy: &PrivacyFilter,
-    user_prompt_template: &str,
-    max_prompt_chars: usize,
-    output: &mut Vec<Vec<ChatMessage>>,
-) {
-    if chunk.len() <= 1 {
-        output.push(chunk);
-        return;
-    }
-
-    let input = private_formatted_chat_input(&chunk, privacy);
-    let prompt_chars = render_prompt_template(user_prompt_template, &input, "", "")
-        .chars()
-        .count();
-    if prompt_chars <= max_prompt_chars {
-        output.push(chunk);
-        return;
-    }
-
-    let midpoint = chunk.len() / 2;
-    let right = chunk[midpoint..].to_vec();
-    let left = chunk[..midpoint].to_vec();
-    push_fitted_llm_chunks(
-        left,
-        privacy,
-        user_prompt_template,
-        max_prompt_chars,
-        output,
-    );
-    push_fitted_llm_chunks(
-        right,
-        privacy,
-        user_prompt_template,
-        max_prompt_chars,
-        output,
-    );
-}
-
-fn private_formatted_chat_input(messages: &[ChatMessage], privacy: &PrivacyFilter) -> String {
-    privacy.apply(&ChatFormatter::format(messages).merged_input)
-}
-
-fn formatted_chat_line_chars(message: &ChatMessage) -> usize {
-    format!(
-        "[{}] {}: {}",
-        format_local_time(message.timestamp),
-        message.display_sender(),
-        message.content.trim()
-    )
-    .chars()
-    .count()
-}
-
-fn format_chunk_summaries_for_output(summaries: &[ChunkSummary]) -> String {
-    let mut parts = vec![
-        "[CHUNK_SUMMARIES]".to_string(),
-        "以下是同一段群聊按时间顺序切分后的分段总结。".to_string(),
-    ];
-    for summary in summaries {
-        parts.push(format!(
-            "===== 分段 {}/{}，{} 条 =====\n{}",
-            summary.index + 1,
-            summaries.len(),
-            summary.message_count,
-            summary.output.trim()
-        ));
-    }
-    parts.join("\n\n")
 }
 
 fn sanitize_llm_visible_output_with_log(
@@ -5025,7 +4814,7 @@ fn scheduled_rooms(config: &AgentConfig, platform_rooms: &[String]) -> Vec<Strin
         .collect()
 }
 
-fn render_prompt_template(
+pub(crate) fn render_prompt_template(
     template: &str,
     chat_input: &str,
     text_summary: &str,
@@ -5232,7 +5021,7 @@ fn format_summary_reply(summary: &str, range: &ResolvedTimeRange, total_messages
     )
 }
 
-fn format_local_time(value: DateTime<Utc>) -> String {
+pub(crate) fn format_local_time(value: DateTime<Utc>) -> String {
     value
         .with_timezone(&Local)
         .format("%m-%d %H:%M")
