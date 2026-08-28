@@ -8,6 +8,44 @@ pub(crate) fn sanitize_llm_visible_output(output: &str) -> String {
         .to_string()
 }
 
+pub(crate) fn looks_like_text_summary_refusal(summary: &str) -> bool {
+    let normalized: String = summary.chars().filter(|c| !c.is_whitespace()).collect();
+    if normalized.is_empty() || normalized.chars().count() > 160 {
+        return false;
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let starts_like_refusal = [
+        "抱歉",
+        "对不起",
+        "不好意思",
+        "sorry",
+        "i'msorry",
+        "iamsorry",
+    ]
+    .iter()
+    .any(|marker| lower.starts_with(marker));
+    let contains_refusal = [
+        "我无法",
+        "我不能",
+        "无法给出总结",
+        "无法给到相关内容",
+        "无法提供相关内容",
+        "无法提供该内容",
+        "不能提供相关内容",
+        "不能协助",
+        "无法协助",
+        "can'tassist",
+        "cannotassist",
+        "can'tprovide",
+        "cannotprovide",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+
+    starts_like_refusal || contains_refusal
+}
+
 fn strip_tag_blocks_case_insensitive(input: &str, tag: &str) -> String {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");

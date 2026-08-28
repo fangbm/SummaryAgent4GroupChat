@@ -32,6 +32,7 @@ use runtime_log::*;
 use ai_runtime::*;
 use llm_chunking::*;
 use llm_service::*;
+use llm_output::looks_like_text_summary_refusal;
 use summary_image::{ImagePipelineSlotPool, ImagePipelineStage};
 #[cfg(test)]
 use llm_output::sanitize_llm_visible_output;
@@ -3127,12 +3128,12 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
     }
 
     if options.image_gen_enabled {
-        let image_summary_result = match run_image_pipeline_llm_stage(
+        let image_summary_result = match summary_image::run_llm_stage(
             config,
             image_pipeline_slots,
             &trigger.room_id,
             ImagePipelineStage::Summary,
-            complete_image_summary_with_refusal_retry(
+            summary_image::complete_summary_with_refusal_retry(
                 config,
                 &image_llm,
                 &trigger.room_id,
@@ -3141,6 +3142,7 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
                 &config.image_summary.user_prompt_template,
                 &chat_messages,
                 &privacy,
+                IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
             ),
         )
         .await
@@ -3218,18 +3220,19 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
                 image_prompt_request.chars().count()
             ),
         );
-        let image_prompt = match run_image_pipeline_llm_stage(
+        let image_prompt = match summary_image::run_llm_stage(
             config,
             image_pipeline_slots,
             &trigger.room_id,
             ImagePipelineStage::Prompt,
-            complete_image_prompt_with_refusal_retry(
+            summary_image::complete_prompt_with_refusal_retry(
                 config,
                 &image_llm,
                 &trigger.room_id,
                 "image prompt",
                 &config.image_prompt.system_prompt,
                 &image_prompt_request,
+                IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
             ),
         )
         .await
@@ -3445,12 +3448,12 @@ async fn run_background_image_pipeline_inner(
     // image-preparation completions on normal JSON responses as well.
     .with_streaming(false);
     let privacy = PrivacyFilter::new(config.privacy.clone());
-    let image_summary_result = run_image_pipeline_llm_stage(
+    let image_summary_result = summary_image::run_llm_stage(
         config,
         image_pipeline_slots,
         room_id,
         ImagePipelineStage::Summary,
-        complete_image_summary_with_refusal_retry(
+        summary_image::complete_summary_with_refusal_retry(
             config,
             &llm,
             room_id,
@@ -3459,6 +3462,7 @@ async fn run_background_image_pipeline_inner(
             &config.image_summary.user_prompt_template,
             chat_messages,
             &privacy,
+            IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
         ),
     )
     .await
@@ -3504,18 +3508,19 @@ async fn run_background_image_pipeline_inner(
             image_prompt_request.chars().count()
         ),
     );
-    let image_prompt = run_image_pipeline_llm_stage(
+    let image_prompt = summary_image::run_llm_stage(
         config,
         image_pipeline_slots,
         room_id,
         ImagePipelineStage::Prompt,
-        complete_image_prompt_with_refusal_retry(
+        summary_image::complete_prompt_with_refusal_retry(
             config,
             &llm,
             room_id,
             "background image prompt",
             &config.image_prompt.system_prompt,
             &image_prompt_request,
+            IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
         ),
     )
     .await
@@ -3604,193 +3609,6 @@ async fn complete_text_summary_with_refusal_retry(
     }
 
     Ok(retry_result)
-}
-
-async fn run_image_pipeline_llm_stage<T, F>(
-    config: &AgentConfig,
-    image_pipeline_slots: &ImagePipelineSlotPool,
-    room_id: &str,
-    stage: ImagePipelineStage,
-    future: F,
-) -> Result<T>
-where
-    F: Future<Output = Result<T>>,
-{
-    let total_timeout_seconds = match stage {
-        ImagePipelineStage::Summary => config.image_pipeline.summary_total_timeout_seconds,
-        ImagePipelineStage::Prompt => config.image_pipeline.prompt_total_timeout_seconds,
-    }
-    .max(1);
-    let wait_started = Instant::now();
-    let lease = image_pipeline_slots.acquire(room_id, stage).await?;
-    let wait_ms = wait_started.elapsed().as_millis();
-    info!(
-        room_id = %room_id,
-        stage = stage.as_str(),
-        wait_ms,
-        total_timeout_seconds,
-        "image pipeline LLM stage started"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "image pipeline llm stage started room={} stage={} wait_ms={} total_timeout_seconds={}",
-            room_id,
-            stage.as_str(),
-            wait_ms,
-            total_timeout_seconds
-        ),
-    );
-    let result = tokio::time::timeout(StdDuration::from_secs(total_timeout_seconds), future).await;
-    drop(lease);
-    match result {
-        Ok(result) => result,
-        Err(_) => bail!(
-            "image pipeline {} exceeded total timeout of {} seconds",
-            stage.as_str(),
-            total_timeout_seconds
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn complete_image_summary_with_refusal_retry(
-    config: &AgentConfig,
-    llm: &OpenAiCompatibleLlm,
-    room_id: &str,
-    stage: &str,
-    system_prompt: &str,
-    user_prompt_template: &str,
-    chat_messages: &[ChatMessage],
-    privacy: &PrivacyFilter,
-) -> Result<LongChatCompletion> {
-    let summary_result = complete_chat_summary_with_fallback(
-        config,
-        llm,
-        room_id,
-        stage,
-        system_prompt,
-        user_prompt_template,
-        chat_messages,
-        LlmOutputLimit::Unlimited,
-        privacy,
-    )
-    .await?;
-    if !looks_like_text_summary_refusal(&summary_result.output) {
-        return Ok(summary_result);
-    }
-
-    log_image_pipeline_refusal_retry(
-        config,
-        room_id,
-        stage,
-        summary_result.output.chars().count(),
-    );
-    let retry_system_prompt = image_pipeline_retry_system_prompt(system_prompt);
-    let retry_stage = format!("{stage} safety retry");
-    let retry_result = complete_chat_summary_with_fallback(
-        config,
-        llm,
-        room_id,
-        &retry_stage,
-        &retry_system_prompt,
-        user_prompt_template,
-        chat_messages,
-        LlmOutputLimit::Unlimited,
-        privacy,
-    )
-    .await?;
-
-    if looks_like_text_summary_refusal(&retry_result.output) {
-        let retry_failure_stage = format!("{stage} after safety-aware retry");
-        ensure_image_pipeline_output_not_refusal(
-            config,
-            room_id,
-            &retry_failure_stage,
-            &retry_result.output,
-        )?;
-    }
-
-    Ok(retry_result)
-}
-
-async fn complete_image_prompt_with_refusal_retry(
-    config: &AgentConfig,
-    llm: &OpenAiCompatibleLlm,
-    room_id: &str,
-    stage: &str,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<String> {
-    let prompt = complete_llm_request_logged(
-        config,
-        llm,
-        room_id,
-        stage,
-        system_prompt,
-        user_prompt.to_string(),
-        LlmOutputLimit::Unlimited,
-        None,
-    )
-    .await?;
-    if !looks_like_text_summary_refusal(&prompt) {
-        return Ok(prompt);
-    }
-
-    log_image_pipeline_refusal_retry(config, room_id, stage, prompt.chars().count());
-    let retry_system_prompt = image_pipeline_retry_system_prompt(system_prompt);
-    let retry_stage = format!("{stage} safety_retry");
-    let retry_prompt = complete_llm_request_logged(
-        config,
-        llm,
-        room_id,
-        &retry_stage,
-        &retry_system_prompt,
-        user_prompt.to_string(),
-        LlmOutputLimit::Unlimited,
-        None,
-    )
-    .await?;
-    if looks_like_text_summary_refusal(&retry_prompt) {
-        let retry_failure_stage = format!("{stage} after safety-aware retry");
-        ensure_image_pipeline_output_not_refusal(
-            config,
-            room_id,
-            &retry_failure_stage,
-            &retry_prompt,
-        )?;
-    }
-
-    Ok(retry_prompt)
-}
-
-fn image_pipeline_retry_system_prompt(system_prompt: &str) -> String {
-    format!(
-        "{}\n\n{}",
-        system_prompt.trim(),
-        IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT.trim()
-    )
-}
-
-fn log_image_pipeline_refusal_retry(
-    config: &AgentConfig,
-    room_id: &str,
-    stage: &str,
-    output_chars: usize,
-) {
-    warn!(
-        room_id = %room_id,
-        stage,
-        output_chars,
-        "LLM image pipeline output looked like a refusal; retrying with safety-aware prompt"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "llm image pipeline refusal detected room={} stage={} output_chars={} retry=safety_prompt",
-            room_id, stage, output_chars
-        ),
-    );
 }
 
 async fn send_image_failure_message(
@@ -4877,71 +4695,6 @@ fn spawn_voice_transcription_task(
     });
 }
 
-fn looks_like_text_summary_refusal(summary: &str) -> bool {
-    let normalized: String = summary.chars().filter(|c| !c.is_whitespace()).collect();
-    if normalized.is_empty() || normalized.chars().count() > 160 {
-        return false;
-    }
-
-    let lower = normalized.to_ascii_lowercase();
-    let starts_like_refusal = [
-        "抱歉",
-        "对不起",
-        "不好意思",
-        "sorry",
-        "i'msorry",
-        "iamsorry",
-    ]
-    .iter()
-    .any(|marker| lower.starts_with(marker));
-    let contains_refusal = [
-        "我无法",
-        "我不能",
-        "无法给出总结",
-        "无法给到相关内容",
-        "无法提供相关内容",
-        "无法提供该内容",
-        "不能提供相关内容",
-        "不能协助",
-        "无法协助",
-        "can'tassist",
-        "cannotassist",
-        "can'tprovide",
-        "cannotprovide",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-
-    starts_like_refusal || contains_refusal
-}
-
-fn ensure_image_pipeline_output_not_refusal(
-    config: &AgentConfig,
-    room_id: &str,
-    stage: &str,
-    output: &str,
-) -> Result<()> {
-    if !looks_like_text_summary_refusal(output) {
-        return Ok(());
-    }
-
-    let output_chars = output.chars().count();
-    warn!(
-        room_id = %room_id,
-        stage,
-        output_chars,
-        "LLM image pipeline output looked like a refusal; skipping image generation"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "llm image pipeline refusal detected room={} stage={} output_chars={} action=skip_image_generation",
-            room_id, stage, output_chars
-        ),
-    );
-    bail!("LLM returned refusal-like {stage}; skipped image generation");
-}
-
 pub(crate) fn history_to_chat_message(message: PlatformHistoryMessage) -> ChatMessage {
     ChatMessage {
         timestamp: message.timestamp,
@@ -5035,7 +4788,7 @@ mod tests {
     #[test]
     fn rejects_refusal_like_image_pipeline_outputs() {
         let config = test_config();
-        let error = ensure_image_pipeline_output_not_refusal(
+        let error = summary_image::ensure_output_not_refusal(
             &config,
             "测试群",
             "image prompt",
@@ -5044,7 +4797,7 @@ mod tests {
         .unwrap_err();
 
         assert!(format_error_chain(&error).contains("skipped image generation"));
-        assert!(ensure_image_pipeline_output_not_refusal(
+        assert!(summary_image::ensure_output_not_refusal(
             &config,
             "测试群",
             "image prompt",
