@@ -33,9 +33,11 @@ use ai_runtime::*;
 use llm_chunking::*;
 use llm_service::*;
 use llm_output::looks_like_text_summary_refusal;
-use summary_image::{ImagePipelineSlotPool, ImagePipelineStage};
+use summary_image::ImagePipelineSlotPool;
 #[cfg(test)]
 use llm_output::sanitize_llm_visible_output;
+#[cfg(test)]
+use summary_image::ImagePipelineStage;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
@@ -3128,28 +3130,20 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
     }
 
     if options.image_gen_enabled {
-        let image_summary_result = match summary_image::run_llm_stage(
+        let image_prompt = match summary_image::prepare_foreground_prompt(
             config,
-            image_pipeline_slots,
+            &image_llm,
             &trigger.room_id,
-            ImagePipelineStage::Summary,
-            summary_image::complete_summary_with_refusal_retry(
-                config,
-                &image_llm,
-                &trigger.room_id,
-                "image summary",
-                &config.image_summary.system_prompt,
-                &config.image_summary.user_prompt_template,
-                &chat_messages,
-                &privacy,
-                IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
-            ),
+            &llm_input,
+            &chat_messages,
+            &privacy,
+            image_pipeline_slots,
+            IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
         )
         .await
-        .context("calling LLM for image summary")
         {
-            Ok(summary) => summary,
-            Err(error) => {
+            Ok(prompt) => prompt,
+            Err(summary_image::ForegroundPromptPreparationError::Summary(error)) => {
                 let error_message = format_error_chain(&error);
                 warn!(
                     room_id = %trigger.room_id,
@@ -3179,67 +3173,7 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
                 }
                 return Err(error);
             }
-        };
-        let image_summary = image_summary_result.output;
-        let image_prompt_chat_input = chat_input_for_followup_prompt(
-            config,
-            &config.image_prompt.user_prompt_template,
-            &llm_input,
-            &image_summary_result.followup_chat_input,
-            &image_summary,
-        );
-        info!(
-            room_id = %trigger.room_id,
-            output_chars = image_summary.chars().count(),
-            "LLM image summary completed"
-        );
-        append_runtime_log(
-            config,
-            &format!(
-                "llm image summary completed room={} output_chars={}",
-                trigger.room_id,
-                image_summary.chars().count()
-            ),
-        );
-        let image_prompt_request = render_prompt_template(
-            &config.image_prompt.user_prompt_template,
-            &image_prompt_chat_input,
-            "",
-            &image_summary,
-        );
-        info!(
-            room_id = %trigger.room_id,
-            prompt_chars = image_prompt_request.chars().count(),
-            "calling LLM for image prompt"
-        );
-        append_runtime_log(
-            config,
-            &format!(
-                "calling llm image prompt room={} prompt_chars={}",
-                trigger.room_id,
-                image_prompt_request.chars().count()
-            ),
-        );
-        let image_prompt = match summary_image::run_llm_stage(
-            config,
-            image_pipeline_slots,
-            &trigger.room_id,
-            ImagePipelineStage::Prompt,
-            summary_image::complete_prompt_with_refusal_retry(
-                config,
-                &image_llm,
-                &trigger.room_id,
-                "image prompt",
-                &config.image_prompt.system_prompt,
-                &image_prompt_request,
-                IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
-            ),
-        )
-        .await
-        .context("calling LLM for image prompt")
-        {
-            Ok(prompt) => prompt,
-            Err(error) => {
+            Err(summary_image::ForegroundPromptPreparationError::Prompt(error)) => {
                 let error_message = format_error_chain(&error);
                 warn!(
                     room_id = %trigger.room_id,
@@ -3270,19 +3204,6 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
                 return Err(error);
             }
         };
-        info!(
-            room_id = %trigger.room_id,
-            output_chars = image_prompt.chars().count(),
-            "LLM image prompt completed"
-        );
-        append_runtime_log(
-            config,
-            &format!(
-                "llm image prompt completed room={} output_chars={}",
-                trigger.room_id,
-                image_prompt.chars().count()
-            ),
-        );
 
         match summary_image::generate(
             config,

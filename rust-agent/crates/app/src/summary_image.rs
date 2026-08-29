@@ -6,7 +6,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Error, Result};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::{info, warn};
 use wechat_summary_ai::{OpenAiCompatibleLlm, OpenAiImageClient, RetryNotifier};
@@ -29,6 +29,11 @@ use crate::{
 pub(crate) enum ImagePipelineStage {
     Summary,
     Prompt,
+}
+
+pub(crate) enum ForegroundPromptPreparationError {
+    Summary(Error),
+    Prompt(Error),
 }
 
 impl ImagePipelineStage {
@@ -349,6 +354,111 @@ pub(crate) fn ensure_output_not_refusal(
         ),
     );
     bail!("LLM returned refusal-like {stage}; skipped image generation");
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_foreground_prompt(
+    config: &AgentConfig,
+    llm: &OpenAiCompatibleLlm,
+    room_id: &str,
+    llm_input: &str,
+    chat_messages: &[ChatMessage],
+    privacy: &PrivacyFilter,
+    image_pipeline_slots: &ImagePipelineSlotPool,
+    refusal_retry_prompt: &str,
+) -> std::result::Result<String, ForegroundPromptPreparationError> {
+    let image_summary_result = run_llm_stage(
+        config,
+        image_pipeline_slots,
+        room_id,
+        ImagePipelineStage::Summary,
+        complete_summary_with_refusal_retry(
+            config,
+            llm,
+            room_id,
+            "image summary",
+            &config.image_summary.system_prompt,
+            &config.image_summary.user_prompt_template,
+            chat_messages,
+            privacy,
+            refusal_retry_prompt,
+        ),
+    )
+    .await
+    .context("calling LLM for image summary")
+    .map_err(ForegroundPromptPreparationError::Summary)?;
+    let image_summary = image_summary_result.output;
+    let image_prompt_chat_input = chat_input_for_followup_prompt(
+        config,
+        &config.image_prompt.user_prompt_template,
+        llm_input,
+        &image_summary_result.followup_chat_input,
+        &image_summary,
+    );
+    info!(
+        room_id = %room_id,
+        output_chars = image_summary.chars().count(),
+        "LLM image summary completed"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm image summary completed room={} output_chars={}",
+            room_id,
+            image_summary.chars().count()
+        ),
+    );
+    let image_prompt_request = render_prompt_template(
+        &config.image_prompt.user_prompt_template,
+        &image_prompt_chat_input,
+        "",
+        &image_summary,
+    );
+    info!(
+        room_id = %room_id,
+        prompt_chars = image_prompt_request.chars().count(),
+        "calling LLM for image prompt"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "calling llm image prompt room={} prompt_chars={}",
+            room_id,
+            image_prompt_request.chars().count()
+        ),
+    );
+    let image_prompt = run_llm_stage(
+        config,
+        image_pipeline_slots,
+        room_id,
+        ImagePipelineStage::Prompt,
+        complete_prompt_with_refusal_retry(
+            config,
+            llm,
+            room_id,
+            "image prompt",
+            &config.image_prompt.system_prompt,
+            &image_prompt_request,
+            refusal_retry_prompt,
+        ),
+    )
+    .await
+    .context("calling LLM for image prompt")
+    .map_err(ForegroundPromptPreparationError::Prompt)?;
+    info!(
+        room_id = %room_id,
+        output_chars = image_prompt.chars().count(),
+        "LLM image prompt completed"
+    );
+    append_runtime_log(
+        config,
+        &format!(
+            "llm image prompt completed room={} output_chars={}",
+            room_id,
+            image_prompt.chars().count()
+        ),
+    );
+    Ok(image_prompt)
 }
 
 #[allow(clippy::too_many_arguments)]
