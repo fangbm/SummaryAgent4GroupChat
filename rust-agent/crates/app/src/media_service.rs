@@ -5,7 +5,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
-use wechat_summary_ai::{AiError, OpenAiVideoCaptionClient, OpenAiVisionCaptionClient};
+use wechat_summary_ai::{
+    AiError, OpenAiAudioTranscriptionClient, OpenAiVideoCaptionClient, OpenAiVisionCaptionClient,
+};
 use wechat_summary_core::AgentConfig;
 
 use crate::{
@@ -36,7 +38,7 @@ pub(crate) async fn enrich_history(
     Ok(MediaEnrichment {
         images: apply_image_captions(config, room_id, history).await?,
         videos: apply_video_captions(config, room_id, history).await?,
-        voices: crate::apply_voice_transcriptions(config, room_id, history).await?,
+        voices: apply_voice_transcriptions(config, room_id, history).await?,
     })
 }
 
@@ -418,6 +420,211 @@ fn spawn_video_caption_task(
             history_index,
             attempted,
             result: captioner.caption_video(&source).await,
+        }
+    });
+}
+
+pub(crate) async fn apply_voice_transcriptions(
+    config: &AgentConfig,
+    room_id: &str,
+    history: &mut [PlatformHistoryMessage],
+) -> Result<usize> {
+    if !config.voice_transcription.enabled || config.voice_transcription.max_voices_per_summary == 0
+    {
+        return Ok(0);
+    }
+    let transcriber = match OpenAiAudioTranscriptionClient::new(
+        config.voice_transcription.clone(),
+        &config.proxy,
+    ) {
+        Ok(client) => match ai_trace_dir(config)? {
+            Some(trace_dir) => client.with_trace_dir(trace_dir),
+            None => client,
+        },
+        Err(error) => {
+            let error = error.to_string();
+            warn!(
+                room_id = %room_id,
+                error = %error,
+                "voice transcription client initialization failed; continuing without transcriptions"
+            );
+            append_runtime_log(
+                config,
+                &format!(
+                    "voice transcription init failed room={} error={}",
+                    room_id, error
+                ),
+            );
+            return Ok(0);
+        }
+    };
+    let transcriber = Arc::new(transcriber);
+    let max_concurrent = config.voice_transcription.max_concurrent_requests.max(1);
+    let audio_prep = Arc::new(crate::media_audio::VoiceTranscriptionAudioPrep::from_config(config));
+
+    let selection = select_candidates(
+        history,
+        config.voice_transcription.max_voices_per_summary,
+        media_rules::is_voice_type,
+        media_rules::voice_source,
+    );
+    for error in &selection.decode_errors {
+        append_runtime_log(
+            config,
+            &format!(
+                "voice transcription skipped room={} reason=decode_failed error={}",
+                room_id, error
+            ),
+        );
+    }
+    let candidates: Vec<_> = selection
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.history_index, candidate.attempted, candidate.source))
+        .collect();
+
+    let attempted = candidates.len();
+    if attempted == 0 {
+        return Ok(0);
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "voice transcription batch started room={} attempted={} max_concurrent={} transcode_to_mp3={}",
+            room_id, attempted, max_concurrent, audio_prep.transcode_to_mp3
+        ),
+    );
+
+    let mut inserted = 0usize;
+    let mut next_candidate = 0usize;
+    let mut join_set = JoinSet::new();
+    while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+        spawn_voice_transcription_task(
+            &mut join_set,
+            Arc::clone(&transcriber),
+            Arc::clone(&audio_prep),
+            &candidates[next_candidate],
+            attempted,
+            room_id,
+        );
+        next_candidate += 1;
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let VoiceTranscriptionTaskResult {
+            history_index,
+            attempted,
+            result,
+        } = joined.context("joining voice transcription request task")?;
+        match result {
+            Ok(transcription) => {
+                let transcription = transcription.trim();
+                if !transcription.is_empty() {
+                    history[history_index].content = format!(
+                        "{}（语音转写：{}）",
+                        history[history_index].content.trim(),
+                        transcription
+                    );
+                    inserted += 1;
+                    info!(
+                        room_id = %room_id,
+                        inserted,
+                        attempted,
+                        "voice transcription inserted into history"
+                    );
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                warn!(
+                    room_id = %room_id,
+                    attempted,
+                    error = %error,
+                    "voice transcription failed; keeping voice placeholder"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "voice transcription failed room={} attempted={} error={}",
+                        room_id, attempted, error
+                    ),
+                );
+                if media_rules::is_auth_error(&error) {
+                    warn!(
+                        room_id = %room_id,
+                        attempted,
+                        "voice transcription stopped after authentication failure"
+                    );
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "voice transcription stopped room={} reason=authentication_failed attempted={}",
+                            room_id, attempted
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+
+        while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+            spawn_voice_transcription_task(
+                &mut join_set,
+                Arc::clone(&transcriber),
+                Arc::clone(&audio_prep),
+                &candidates[next_candidate],
+                attempted,
+                room_id,
+            );
+            next_candidate += 1;
+        }
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "voice transcription completed room={} attempted={} inserted={}",
+            room_id, attempted, inserted
+        ),
+    );
+    Ok(inserted)
+}
+
+struct VoiceTranscriptionTaskResult {
+    history_index: usize,
+    attempted: usize,
+    result: std::result::Result<String, AiError>,
+}
+
+fn spawn_voice_transcription_task(
+    join_set: &mut JoinSet<VoiceTranscriptionTaskResult>,
+    transcriber: Arc<OpenAiAudioTranscriptionClient>,
+    audio_prep: Arc<crate::media_audio::VoiceTranscriptionAudioPrep>,
+    candidate: &(usize, usize, String),
+    item_total: usize,
+    room_id: &str,
+) {
+    let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
+    let room_id = room_id.to_string();
+    join_set.spawn(async move {
+        let transcriber = transcriber
+            .as_ref()
+            .clone()
+            .with_trace_context(ai_trace_context_for_item(
+                &room_id,
+                "voice transcription",
+                attempted,
+                item_total,
+            ));
+        let result = match crate::media_audio::prepare_voice_transcription_audio(audio_prep, source).await {
+            Ok(source) => transcriber.transcribe_audio(&source).await,
+            Err(error) => Err(error),
+        };
+        VoiceTranscriptionTaskResult {
+            history_index,
+            attempted,
+            result,
         }
     });
 }
