@@ -1,11 +1,18 @@
 //! Media enrichment boundary for summary history.
 
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use tokio::task::JoinSet;
+use tracing::{info, warn};
+use wechat_summary_ai::{AiError, OpenAiVisionCaptionClient};
 use wechat_summary_core::AgentConfig;
 
 use crate::{
-    apply_image_captions, apply_video_captions, apply_voice_transcriptions,
+    ai_runtime::{ai_trace_context_for_item, ai_trace_dir},
+    media_rules,
     platform::PlatformHistoryMessage,
+    runtime_log::append_runtime_log,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -28,9 +35,200 @@ pub(crate) async fn enrich_history(
 ) -> Result<MediaEnrichment> {
     Ok(MediaEnrichment {
         images: apply_image_captions(config, room_id, history).await?,
-        videos: apply_video_captions(config, room_id, history).await?,
-        voices: apply_voice_transcriptions(config, room_id, history).await?,
+        videos: crate::apply_video_captions(config, room_id, history).await?,
+        voices: crate::apply_voice_transcriptions(config, room_id, history).await?,
     })
+}
+
+pub(crate) async fn apply_image_captions(
+    config: &AgentConfig,
+    room_id: &str,
+    history: &mut [PlatformHistoryMessage],
+) -> Result<usize> {
+    if !config.image_caption.enabled || config.image_caption.max_images_per_summary == 0 {
+        return Ok(0);
+    }
+    let captioner =
+        match OpenAiVisionCaptionClient::new(config.image_caption.clone(), &config.proxy) {
+            Ok(client) => match ai_trace_dir(config)? {
+                Some(trace_dir) => client.with_trace_dir(trace_dir),
+                None => client,
+            },
+            Err(error) => {
+                let error = error.to_string();
+                warn!(
+                    room_id = %room_id,
+                    error = %error,
+                    "image caption client initialization failed; continuing without captions"
+                );
+                append_runtime_log(
+                    config,
+                    &format!("image caption init failed room={} error={}", room_id, error),
+                );
+                return Ok(0);
+            }
+        };
+    let captioner = Arc::new(captioner);
+    let max_concurrent = config.image_caption.max_concurrent_requests.max(1);
+
+    let selection = select_candidates(
+        history,
+        config.image_caption.max_images_per_summary,
+        media_rules::is_image_type,
+        media_rules::image_source,
+    );
+    for error in &selection.decode_errors {
+        append_runtime_log(
+            config,
+            &format!(
+                "image caption skipped room={} reason=decode_failed error={}",
+                room_id, error
+            ),
+        );
+    }
+    let candidates: Vec<_> = selection
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.history_index, candidate.attempted, candidate.source))
+        .collect();
+
+    let attempted = candidates.len();
+    if attempted == 0 {
+        return Ok(0);
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "image caption batch started room={} attempted={} max_concurrent={}",
+            room_id, attempted, max_concurrent
+        ),
+    );
+
+    let mut inserted = 0usize;
+    let mut next_candidate = 0usize;
+    let mut join_set = JoinSet::new();
+    while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+        spawn_image_caption_task(
+            &mut join_set,
+            Arc::clone(&captioner),
+            &candidates[next_candidate],
+            attempted,
+            room_id,
+        );
+        next_candidate += 1;
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let ImageCaptionTaskResult {
+            history_index,
+            attempted,
+            result,
+        } = joined.context("joining image caption request task")?;
+        match result {
+            Ok(caption) => {
+                let caption = caption.trim();
+                if !caption.is_empty() {
+                    history[history_index].content = format!(
+                        "{}（图片转述：{}）",
+                        history[history_index].content.trim(),
+                        caption
+                    );
+                    inserted += 1;
+                    info!(
+                        room_id = %room_id,
+                        inserted,
+                        attempted,
+                        "image caption inserted into history"
+                    );
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                warn!(
+                    room_id = %room_id,
+                    attempted,
+                    error = %error,
+                    "image caption failed; keeping image placeholder"
+                );
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "image caption failed room={} attempted={} error={}",
+                        room_id, attempted, error
+                    ),
+                );
+                if media_rules::is_auth_error(&error) {
+                    warn!(
+                        room_id = %room_id,
+                        attempted,
+                        "image caption stopped after authentication failure"
+                    );
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "image caption stopped room={} reason=authentication_failed attempted={}",
+                            room_id, attempted
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+
+        while next_candidate < candidates.len() && join_set.len() < max_concurrent {
+            spawn_image_caption_task(
+                &mut join_set,
+                Arc::clone(&captioner),
+                &candidates[next_candidate],
+                attempted,
+                room_id,
+            );
+            next_candidate += 1;
+        }
+    }
+
+    append_runtime_log(
+        config,
+        &format!(
+            "image caption completed room={} attempted={} inserted={}",
+            room_id, attempted, inserted
+        ),
+    );
+    Ok(inserted)
+}
+
+struct ImageCaptionTaskResult {
+    history_index: usize,
+    attempted: usize,
+    result: std::result::Result<String, AiError>,
+}
+
+fn spawn_image_caption_task(
+    join_set: &mut JoinSet<ImageCaptionTaskResult>,
+    captioner: Arc<OpenAiVisionCaptionClient>,
+    candidate: &(usize, usize, String),
+    item_total: usize,
+    room_id: &str,
+) {
+    let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
+    let room_id = room_id.to_string();
+    join_set.spawn(async move {
+        let captioner = captioner
+            .as_ref()
+            .clone()
+            .with_trace_context(ai_trace_context_for_item(
+                &room_id,
+                "image caption",
+                attempted,
+                item_total,
+            ));
+        ImageCaptionTaskResult {
+            history_index,
+            attempted,
+            result: captioner.caption_image(&source).await,
+        }
+    });
 }
 
 #[derive(Debug, Clone)]
