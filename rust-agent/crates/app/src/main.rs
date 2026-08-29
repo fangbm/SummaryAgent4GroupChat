@@ -30,16 +30,17 @@ mod ai_runtime;
 
 use runtime_log::*;
 use ai_runtime::*;
-use llm_chunking::*;
-use llm_service::*;
-use llm_output::looks_like_text_summary_refusal;
 use summary_image::ImagePipelineSlotPool;
 #[cfg(test)]
-use llm_output::sanitize_llm_visible_output;
+use llm_chunking::*;
+#[cfg(test)]
+use llm_service::*;
+#[cfg(test)]
+use llm_output::{looks_like_text_summary_refusal, sanitize_llm_visible_output};
 #[cfg(test)]
 use summary_image::ImagePipelineStage;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -3048,12 +3049,13 @@ async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<Pip
                 media.total() as u64,
             );
         }
-        let summary_result = complete_text_summary_with_refusal_retry(
+        let summary_result = llm_service::complete_text_summary_with_refusal_retry(
             config,
             &llm,
             &trigger.room_id,
             &chat_messages,
             &privacy,
+            TEXT_SUMMARY_REFUSAL_RETRY_PROMPT,
         )
         .await
         .context("calling LLM for text summary")?;
@@ -3350,68 +3352,6 @@ async fn run_background_image_pipeline(
         return false;
     }
     true
-}
-
-async fn complete_text_summary_with_refusal_retry(
-    config: &AgentConfig,
-    llm: &OpenAiCompatibleLlm,
-    room_id: &str,
-    chat_messages: &[ChatMessage],
-    privacy: &PrivacyFilter,
-) -> Result<LongChatCompletion> {
-    let summary_result = complete_chat_summary_with_fallback(
-        config,
-        llm,
-        room_id,
-        "text summary",
-        &config.text_summary.system_prompt,
-        &config.text_summary.user_prompt_template,
-        chat_messages,
-        LlmOutputLimit::Configured,
-        privacy,
-    )
-    .await?;
-    if !looks_like_text_summary_refusal(&summary_result.output) {
-        return Ok(summary_result);
-    }
-
-    warn!(
-        room_id = %room_id,
-        output_chars = summary_result.output.chars().count(),
-        "LLM text summary looked like a refusal; retrying with safety-aware prompt"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "llm text summary refusal detected room={} output_chars={} retry=safety_prompt",
-            room_id,
-            summary_result.output.chars().count()
-        ),
-    );
-
-    let retry_system_prompt = format!(
-        "{}\n\n{}",
-        config.text_summary.system_prompt.trim(),
-        TEXT_SUMMARY_REFUSAL_RETRY_PROMPT.trim()
-    );
-    let retry_result = complete_chat_summary_with_fallback(
-        config,
-        llm,
-        room_id,
-        "text summary safety retry",
-        &retry_system_prompt,
-        &config.text_summary.user_prompt_template,
-        chat_messages,
-        LlmOutputLimit::Configured,
-        privacy,
-    )
-    .await?;
-
-    if looks_like_text_summary_refusal(&retry_result.output) {
-        bail!("LLM returned refusal-like text summary after safety-aware retry");
-    }
-
-    Ok(retry_result)
 }
 
 async fn send_image_failure_message(
