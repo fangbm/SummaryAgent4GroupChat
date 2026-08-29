@@ -3381,15 +3381,19 @@ async fn run_background_image_pipeline(
     image_pipeline_slots: ImagePipelineSlotPool,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
 ) -> bool {
-    let result = run_background_image_pipeline_inner(
-        &config,
-        &sender,
-        &room_id,
-        &llm_input,
-        &chat_messages,
-        &image_pipeline_slots,
-        image_cooldown_recorder.as_ref(),
-    )
+    let result: Result<()> = async {
+        summary_image::run_background(
+            &config,
+            &sender,
+            &room_id,
+            &llm_input,
+            &chat_messages,
+            &image_pipeline_slots,
+            IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
+        )
+        .await?;
+        record_image_cooldown_success(&config, image_cooldown_recorder.as_ref(), &room_id)
+    }
     .await;
     if let Err(error) = result {
         let error_message = format_error_chain(&error);
@@ -3425,128 +3429,6 @@ async fn run_background_image_pipeline(
         return false;
     }
     true
-}
-
-async fn run_background_image_pipeline_inner(
-    config: &AgentConfig,
-    sender: &PlatformSender,
-    room_id: &str,
-    llm_input: &str,
-    chat_messages: &[ChatMessage],
-    image_pipeline_slots: &ImagePipelineSlotPool,
-    image_cooldown_recorder: Option<&ImageCooldownRecorder>,
-) -> Result<()> {
-    let retry_notifier = retry_log_notifier(config, room_id.to_string());
-    let llm = configure_llm_tracing(
-        OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
-            .context("initializing LLM client for background image pipeline")?,
-        config,
-    )
-    .context("configuring LLM trace output for background image pipeline")?
-    .with_retry_notifier(retry_notifier.clone())
-    // This background path is used after manual text summaries. Keep its
-    // image-preparation completions on normal JSON responses as well.
-    .with_streaming(false);
-    let privacy = PrivacyFilter::new(config.privacy.clone());
-    let image_summary_result = summary_image::run_llm_stage(
-        config,
-        image_pipeline_slots,
-        room_id,
-        ImagePipelineStage::Summary,
-        summary_image::complete_summary_with_refusal_retry(
-            config,
-            &llm,
-            room_id,
-            "background image summary",
-            &config.image_summary.system_prompt,
-            &config.image_summary.user_prompt_template,
-            chat_messages,
-            &privacy,
-            IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
-        ),
-    )
-    .await
-    .context("calling LLM for background image summary")?;
-    let image_summary = image_summary_result.output;
-    info!(
-        room_id = %room_id,
-        output_chars = image_summary.chars().count(),
-        "LLM background image summary completed"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "llm background image summary completed room={} output_chars={}",
-            room_id,
-            image_summary.chars().count()
-        ),
-    );
-
-    let image_prompt_chat_input = chat_input_for_followup_prompt(
-        config,
-        &config.image_prompt.user_prompt_template,
-        llm_input,
-        &image_summary_result.followup_chat_input,
-        &image_summary,
-    );
-    let image_prompt_request = render_prompt_template(
-        &config.image_prompt.user_prompt_template,
-        &image_prompt_chat_input,
-        "",
-        &image_summary,
-    );
-    info!(
-        room_id = %room_id,
-        prompt_chars = image_prompt_request.chars().count(),
-        "calling LLM for background image prompt"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "calling llm background image prompt room={} prompt_chars={}",
-            room_id,
-            image_prompt_request.chars().count()
-        ),
-    );
-    let image_prompt = summary_image::run_llm_stage(
-        config,
-        image_pipeline_slots,
-        room_id,
-        ImagePipelineStage::Prompt,
-        summary_image::complete_prompt_with_refusal_retry(
-            config,
-            &llm,
-            room_id,
-            "background image prompt",
-            &config.image_prompt.system_prompt,
-            &image_prompt_request,
-            IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
-        ),
-    )
-    .await
-    .context("calling LLM for background image prompt")?;
-    info!(
-        room_id = %room_id,
-        output_chars = image_prompt.chars().count(),
-        "LLM background image prompt completed"
-    );
-    append_runtime_log(
-        config,
-        &format!(
-            "llm background image prompt completed room={} output_chars={}",
-            room_id,
-            image_prompt.chars().count()
-        ),
-    );
-
-    let artifact = summary_image::generate(config, room_id, &image_prompt, Some(retry_notifier)).await?;
-    summary_image::send_with_sender(config, sender, room_id, &artifact).await?;
-    record_image_cooldown_success(config, image_cooldown_recorder, room_id)?;
-    append_runtime_log(
-        config,
-        &format!("background image pipeline completed room={}", room_id),
-    );
-    Ok(())
 }
 
 async fn complete_text_summary_with_refusal_retry(
