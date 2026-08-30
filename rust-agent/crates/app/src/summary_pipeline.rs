@@ -10,6 +10,9 @@ pub(crate) struct PipelineOptions {
     pub(crate) defer_text_until_image_ready: bool,
     pub(crate) send_disabled_message: bool,
     pub(crate) log_retry_attempts: bool,
+    pub(crate) preview_only: bool,
+    pub(crate) detail: wechat_summary_core::config::SummaryDetail,
+    pub(crate) media_decode_limit: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -46,18 +49,30 @@ pub(crate) enum PipelineOutcome {
 }
 
 impl PipelineOptions {
-    pub(crate) fn manual(config: &AgentConfig, room_id: &str, image_token_present: bool) -> Self {
+    pub(crate) fn manual(
+        config: &AgentConfig,
+        room_id: &str,
+        image_token_present: bool,
+        preview_only: bool,
+    ) -> Self {
         let image_enabled_for_request =
             config.manual_summary.image_by_default ^ image_token_present;
         Self {
             text_summary_enabled: config.text_summary.enabled,
-            image_gen_enabled: config.image_gen.enabled
+            image_gen_enabled: !preview_only
+                && config.image_gen.enabled
                 && config.image_summary_enabled_for_room(room_id)
                 && image_enabled_for_request,
-            send_progress: true,
+            send_progress: !preview_only,
             defer_text_until_image_ready: false,
             send_disabled_message: true,
             log_retry_attempts: true,
+            preview_only,
+            detail: config
+                .room_policy(room_id)
+                .summary_detail
+                .unwrap_or(config.text_summary.detail),
+            media_decode_limit: None,
         }
     }
 
@@ -71,11 +86,20 @@ impl PipelineOptions {
             defer_text_until_image_ready: true,
             send_disabled_message: false,
             log_retry_attempts: false,
+            preview_only: false,
+            detail: config
+                .room_policy(room_id)
+                .summary_detail
+                .unwrap_or(config.text_summary.detail),
+            media_decode_limit: None,
         }
     }
 }
 
-pub(crate) fn image_pipeline_slot_capacity(config: &AgentConfig, platform_rooms: &[String]) -> usize {
+pub(crate) fn image_pipeline_slot_capacity(
+    config: &AgentConfig,
+    platform_rooms: &[String],
+) -> usize {
     let enabled_rooms = if config.scheduled_summary.enabled
         && config.scheduled_summary.send_image
         && config.image_gen.enabled
@@ -299,7 +323,9 @@ pub(crate) fn media_decode_attempt_count(messages: &[PlatformHistoryMessage]) ->
         .count()
 }
 
-pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) -> Result<PipelineOutcome> {
+pub(crate) async fn run_summary_pipeline(
+    request: SummaryPipelineRequest<'_>,
+) -> Result<PipelineOutcome> {
     let SummaryPipelineRequest {
         config,
         client,
@@ -367,6 +393,7 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
         trigger,
         range,
         recent_observed_messages,
+        options.media_decode_limit,
     )
     .await?
     else {
@@ -374,7 +401,14 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
     };
     let platform_history_len = history.len();
     if let Some(task) = task {
-        task.set_stage(TaskState::Running, "history", None, None, platform_history_len as u64, 0);
+        task.set_stage(
+            TaskState::Running,
+            "history",
+            None,
+            None,
+            platform_history_len as u64,
+            0,
+        );
     }
     let first_platform_ts = history.iter().map(|message| message.timestamp).min();
     let last_platform_ts = history.iter().map(|message| message.timestamp).max();
@@ -427,7 +461,8 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
         }
     }
     history.retain(|message| {
-        !history_rules::is_current_trigger(message, incoming) && !history_rules::is_agent_status(message)
+        !history_rules::is_current_trigger(message, incoming)
+            && !history_rules::is_agent_status(message)
     });
     let filtered_history_len = history.len();
     let removed_history_len = raw_history_len.saturating_sub(filtered_history_len);
@@ -463,8 +498,19 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
     let llm_input = prepared_input.llm_input;
     let total_messages = prepared_input.total_messages;
     let media = prepared_input.media;
+    let (llm_config, circuit_bypassed) = routed_llm_config(config, task.map(|task| &task.store));
+    if circuit_bypassed {
+        info!(room_id = %trigger.room_id, provider = %llm_config.provider, "primary LLM circuit is open; using configured fallback");
+        append_runtime_log(
+            config,
+            &format!(
+                "llm primary circuit open room={} fallback_provider={}",
+                trigger.room_id, llm_config.provider
+            ),
+        );
+    }
     let mut llm = configure_llm_tracing(
-        OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
+        OpenAiCompatibleLlm::new(llm_config.clone(), &config.proxy)
             .context("initializing LLM client")?,
         config,
     )
@@ -495,6 +541,7 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
             &chat_messages,
             &privacy,
             TEXT_SUMMARY_REFUSAL_RETRY_PROMPT,
+            options.detail,
         )
         .await
         .context("calling LLM for text summary")?;
@@ -523,6 +570,23 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
             ),
         );
         let reply = format_summary_reply(&summary, range, total_messages);
+        if options.preview_only {
+            if let Some(task) = task {
+                task.set_stage(
+                    TaskState::Succeeded,
+                    "preview_ready",
+                    Some(&summary),
+                    None,
+                    chat_messages.len() as u64,
+                    media.total() as u64,
+                );
+            }
+            append_runtime_log(
+                config,
+                &format!("summary preview ready room={}", trigger.room_id),
+            );
+            return Ok(PipelineOutcome::SummaryProduced);
+        }
         if options.defer_text_until_image_ready {
             pending_text_reply = Some(reply);
         } else {
@@ -552,6 +616,7 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
             options.text_summary_enabled,
             image_pipeline_slots.clone(),
             image_cooldown_recorder,
+            llm_config,
         )
         .await;
         info!(
@@ -614,7 +679,7 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
                         &trigger.room_id,
                         &error_message,
                     )
-                        .await;
+                    .await;
                     return Ok(PipelineOutcome::SummaryProduced);
                 }
                 return Err(error);
@@ -649,7 +714,7 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
                         &trigger.room_id,
                         &error_message,
                     )
-                        .await;
+                    .await;
                     return Ok(PipelineOutcome::SummaryProduced);
                 }
                 return Err(error);
@@ -675,9 +740,11 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
                 )
                 .await?;
                 if let Some(task) = task {
-                    deliver_outboxed_image(config, task, client, &trigger.room_id, &artifact).await?;
+                    deliver_outboxed_image(config, task, client, &trigger.room_id, &artifact)
+                        .await?;
                 } else {
-                    summary_image::send_with_worker(config, client, &trigger.room_id, &artifact).await?;
+                    summary_image::send_with_worker(config, client, &trigger.room_id, &artifact)
+                        .await?;
                 }
                 record_image_cooldown_success(
                     config,
@@ -711,7 +778,7 @@ pub(crate) async fn run_summary_pipeline(request: SummaryPipelineRequest<'_>) ->
                         &trigger.room_id,
                         &error_message,
                     )
-                        .await;
+                    .await;
                     return Ok(PipelineOutcome::SummaryProduced);
                 }
                 let prefix = if options.text_summary_enabled {

@@ -13,10 +13,7 @@ use crate::{
     EMPTY_HISTORY_RETRY_DELAYS_MS,
 };
 use crate::{
-    media_service,
-    platform::PlatformWorker,
-    runtime_log::append_runtime_log,
-    summary_input,
+    media_service, platform::PlatformWorker, runtime_log::append_runtime_log, summary_input,
 };
 
 pub(super) async fn load_summary_history(
@@ -26,9 +23,17 @@ pub(super) async fn load_summary_history(
     trigger: &TriggerMatch,
     range: &ResolvedTimeRange,
     recent_observed_messages: Option<&RecentObservedMessages>,
+    media_decode_limit_override: Option<usize>,
 ) -> Result<Option<Vec<crate::platform::PlatformHistoryMessage>>> {
     let history_page_limit = config.history_message_limit();
-    let media_decode_limit = summary_media_decode_limit(config);
+    let media_decode_limit = match (
+        summary_media_decode_limit(config),
+        media_decode_limit_override,
+    ) {
+        (Some(configured), Some(remaining)) => Some(configured.min(remaining)),
+        (None, Some(remaining)) => Some(remaining),
+        (configured, None) => configured,
+    };
     info!(
         room_id = %trigger.room_id,
         since = %range.since,

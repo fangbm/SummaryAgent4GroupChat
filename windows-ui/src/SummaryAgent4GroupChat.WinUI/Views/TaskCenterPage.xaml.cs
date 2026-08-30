@@ -20,6 +20,7 @@ public sealed partial class TaskCenterPage : Page
     private async void TaskList_SelectionChanged(object sender, SelectionChangedEventArgs e) { if (ViewModel is not null && TaskList.SelectedItem is TaskCenterItem task) await ViewModel.SelectTaskAsync(task.Id); }
     private async void CancelTask_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null && sender is FrameworkElement { Tag: string id }) await ViewModel.CancelTaskAsync(id); }
     private async void RetryTask_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null && sender is FrameworkElement { Tag: string id }) await ViewModel.RetryTaskAsync(id); }
+    private async void TaskDiagnostic_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null && sender is FrameworkElement { Tag: string id }) await ViewModel.CreateTaskDiagnosticBundleAsync(id); }
     private async void RetryOutbox_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null && sender is FrameworkElement { Tag: string id }) await ViewModel.RetryOutboxAsync(id); }
     private async void ResolveOutbox_Click(object sender, RoutedEventArgs e) { if (ViewModel is not null && sender is FrameworkElement { Tag: string id }) await ViewModel.ResolveOutboxAsync(id); }
 }

@@ -103,6 +103,14 @@ jobs:
             if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
             throw "Installer did not place the WinUI executable at $installedExe."
           }
+          $gui = Start-Process -FilePath $installedExe -PassThru
+          Start-Sleep -Seconds 5
+          $gui.Refresh()
+          if ($gui.HasExited) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
+            throw "Installed WinUI executable exited during the launch smoke test: $($gui.ExitCode)."
+          }
+          Stop-Process -Id $gui.Id -Force
           Write-Host "Installer smoke check passed: $($installer.FullName)"
 
       - name: Locate release assets

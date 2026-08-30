@@ -1,4 +1,4 @@
-//! Parsing for `/总结 [platform] [time] [img]` commands.
+//! Parsing for `/总结 [platform] [time] [img] [preview]` commands.
 
 use wechat_summary_core::{config::PlatformKindConfig, TriggerMatch};
 
@@ -7,6 +7,7 @@ pub(crate) struct SummaryCommand {
     pub(crate) target_platform: PlatformKindConfig,
     pub(crate) range_minutes: Option<i64>,
     pub(crate) image_token_present: bool,
+    pub(crate) preview_only: bool,
 }
 
 pub(crate) fn parse(
@@ -31,17 +32,21 @@ pub(crate) fn parse_args(
             target_platform: default_platform,
             range_minutes: None,
             image_token_present: false,
+            preview_only: false,
         });
     }
 
     let mut target_platform = default_platform;
     let mut image_token_present = false;
+    let mut preview_only = false;
     let mut range_tokens: Vec<&str> = Vec::new();
     for token in args.split_whitespace() {
         if let Some(platform) = PlatformKindConfig::parse_alias(token) {
             target_platform = platform;
         } else if is_image_token(token) {
             image_token_present = true;
+        } else if is_preview_token(token) {
+            preview_only = true;
         } else {
             range_tokens.push(token);
         }
@@ -57,12 +62,20 @@ pub(crate) fn parse_args(
         target_platform,
         range_minutes,
         image_token_present,
+        preview_only,
     })
 }
 
 fn is_image_token(token: &str) -> bool {
     let token = token.trim();
     matches!(token, "图片") || matches!(token.to_ascii_lowercase().as_str(), "image" | "img")
+}
+
+fn is_preview_token(token: &str) -> bool {
+    matches!(
+        token.trim().to_ascii_lowercase().as_str(),
+        "preview" | "dry-run"
+    ) || matches!(token.trim(), "预览" | "试运行")
 }
 
 fn parse_time_range_minutes(tokens: &[&str]) -> Option<Option<i64>> {

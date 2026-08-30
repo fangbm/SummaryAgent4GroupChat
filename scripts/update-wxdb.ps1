@@ -171,9 +171,9 @@ try {
         }
         Write-Step "wxdb 压缩包 SHA256 校验通过。"
     }
-    else {
-        Write-Warning "wxdb Release 未提供 SHA256 校验值，本次下载跳过完整性校验。建议在 wxdb Release 中附带 .sha256 文件。"
-    }
+        else {
+            throw "wxdb Release 未提供 SHA256 校验值，已拒绝更新未校验的数据库读取程序。请在 wxdb Release 附带 <asset>.sha256，或提供已验证的 SHA256。"
+        }
 
     Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
     $downloaded = Get-ChildItem -LiteralPath $extractDir -Filter "wxdb.exe" -Recurse | Select-Object -First 1

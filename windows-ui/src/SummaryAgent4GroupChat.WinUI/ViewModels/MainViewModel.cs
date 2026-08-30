@@ -57,10 +57,17 @@ public sealed partial class MainViewModel : ObservableObject
 
     [ObservableProperty] private string _triggerCommands = "/总结, #总结";
     [ObservableProperty] private string _whitelistRooms = string.Empty;
+    [ObservableProperty] private bool _requireAllowedUsers;
+    [ObservableProperty] private string _allowedUsers = string.Empty;
     [ObservableProperty] private bool _ignoreSelf = true;
     [ObservableProperty] private string _requestCooldownSeconds = "300";
     [ObservableProperty] private string _imageCooldownSeconds = "0";
     [ObservableProperty] private bool _manualImagesByDefault;
+    [ObservableProperty] private string _summaryDetail = "standard";
+    [ObservableProperty] private bool _budgetEnabled;
+    [ObservableProperty] private string _dailySummaryLimit = "0";
+    [ObservableProperty] private string _dailyImageLimit = "0";
+    [ObservableProperty] private string _dailyMediaLimit = "0";
 
     [ObservableProperty] private bool _scheduleEnabled = true;
     [ObservableProperty] private string _scheduleTime = "22:00";
@@ -363,10 +370,17 @@ public sealed partial class MainViewModel : ObservableObject
 
         TriggerCommands = ReadList("listen", "triggers");
         WhitelistRooms = ReadList("listen", "whitelist_rooms");
+        RequireAllowedUsers = ReadBool("listen", "require_allowed_users", false);
+        AllowedUsers = ReadList("listen", "allowed_users");
         IgnoreSelf = ReadBool("listen", "ignore_self", true);
         RequestCooldownSeconds = ReadString("rate_limit", "successful_request_cooldown_seconds", "300");
         ImageCooldownSeconds = ReadString("rate_limit", "successful_image_cooldown_seconds", "0");
         ManualImagesByDefault = ReadBool("manual_summary", "image_by_default", false);
+        SummaryDetail = ReadString("text_summary", "detail", "standard");
+        BudgetEnabled = ReadBool("budget", "enabled", false);
+        DailySummaryLimit = ReadString("budget", "daily_summary_limit", "0");
+        DailyImageLimit = ReadString("budget", "daily_image_limit", "0");
+        DailyMediaLimit = ReadString("budget", "daily_media_limit", "0");
 
         ScheduleEnabled = ReadBool("scheduled_summary", "enabled", true);
         var hour = ReadString("scheduled_summary", "local_hour", "22");
@@ -816,10 +830,17 @@ public sealed partial class MainViewModel : ObservableObject
 
         AddListIfChanged(operations, "listen", "triggers", TriggerCommands);
         AddListIfChanged(operations, "listen", "whitelist_rooms", WhitelistRooms);
+        AddBoolIfChanged(operations, "listen", "require_allowed_users", RequireAllowedUsers);
+        AddListIfChanged(operations, "listen", "allowed_users", AllowedUsers);
         AddBoolIfChanged(operations, "listen", "ignore_self", IgnoreSelf);
         AddNumberIfChanged(operations, "rate_limit", "successful_request_cooldown_seconds", RequestCooldownSeconds, 300);
         AddNumberIfChanged(operations, "rate_limit", "successful_image_cooldown_seconds", ImageCooldownSeconds, 0);
         AddBoolIfChanged(operations, "manual_summary", "image_by_default", ManualImagesByDefault);
+        AddIfChanged(operations, "text_summary", "detail", SummaryDetail);
+        AddBoolIfChanged(operations, "budget", "enabled", BudgetEnabled);
+        AddNumberIfChanged(operations, "budget", "daily_summary_limit", DailySummaryLimit, 0);
+        AddNumberIfChanged(operations, "budget", "daily_image_limit", DailyImageLimit, 0);
+        AddNumberIfChanged(operations, "budget", "daily_media_limit", DailyMediaLimit, 0);
 
         AddBoolIfChanged(operations, "scheduled_summary", "enabled", ScheduleEnabled);
         var scheduleParts = ScheduleTime.Split(':', StringSplitOptions.TrimEntries);
@@ -1026,6 +1047,19 @@ public sealed partial class MainViewModel : ObservableObject
             await RefreshTaskCenterAsync();
         }
         catch (Exception error) { TaskCenterStatus = $"重试失败：{error.Message}"; }
+    }
+
+    public async Task CreateTaskDiagnosticBundleAsync(string taskId)
+    {
+        if (_client is null) return;
+        try
+        {
+            var reply = await _client.CallAsync("tasks.diagnostic_bundle", new { id = taskId }, _lifetime.Token);
+            reply.ThrowIfError();
+            var path = ReadJson(reply.Result!.Value, "path");
+            TaskCenterStatus = $"已生成任务诊断包：{path}";
+        }
+        catch (Exception error) { TaskCenterStatus = $"生成诊断包失败：{error.Message}"; }
     }
 
     public async Task RetryOutboxAsync(string deliveryId)

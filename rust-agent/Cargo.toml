@@ -14,7 +14,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 publish = false
-version = "0.2.4"
+version = "0.2.5"
 # usize::is_multiple_of and other std APIs used by the workspace require 1.87.
 rust-version = "1.87"
 
@@ -44,4 +44,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4"] }
 zstd = "0.13"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading"] }

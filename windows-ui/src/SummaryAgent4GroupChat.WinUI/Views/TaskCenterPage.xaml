@@ -25,7 +25,7 @@
                                     <TextBlock Grid.Column="1" Text="{Binding State}" VerticalAlignment="Center" />
                                     <TextBlock Grid.Column="2" Text="{Binding Stage}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
                                     <TextBlock Grid.Column="3" Text="{Binding Error}" Opacity="0.72" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
-                                    <StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="8"><Button Content="取消" Tag="{Binding Id}" Click="CancelTask_Click" /><Button Content="重试" Tag="{Binding Id}" Click="RetryTask_Click" /></StackPanel>
+                                    <StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="8"><Button Content="取消" Tag="{Binding Id}" Click="CancelTask_Click" /><Button Content="重试" Tag="{Binding Id}" Click="RetryTask_Click" /><Button Content="诊断包" Tag="{Binding Id}" Click="TaskDiagnostic_Click" /></StackPanel>
                                 </Grid>
                             </DataTemplate>
                         </ListView.ItemTemplate>

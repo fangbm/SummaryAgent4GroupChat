@@ -108,6 +108,8 @@ mod tests {
             blacklist_users: vec!["wxid_blocked".into()],
             content_types: vec!["text".into()],
             ignore_self: true,
+            require_allowed_users: false,
+            allowed_users: Vec::new(),
         }
     }
 

@@ -19,6 +19,17 @@ pub(crate) async fn handle_platform_event(
     let Some(trigger) = matcher.match_message(&incoming) else {
         return Ok(());
     };
+    if !config.trigger_user_allowed(&trigger.room_id, &incoming.sender_id) {
+        info!(room_id = %trigger.room_id, "trigger ignored because sender is not in the allowed-user policy");
+        append_runtime_log(
+            config,
+            &format!(
+                "trigger ignored room={} reason=sender_not_allowed",
+                trigger.room_id
+            ),
+        );
+        return Ok(());
+    }
     let trigger_content_len = trigger.trigger_content.chars().count();
     info!(
         platform = source_platform.as_str(),
@@ -150,8 +161,12 @@ pub(crate) async fn handle_platform_event(
         return Ok(());
     }
 
-    let mut pipeline_options =
-        PipelineOptions::manual(config, &trigger.room_id, command.image_token_present);
+    let mut pipeline_options = PipelineOptions::manual(
+        config,
+        &trigger.room_id,
+        command.image_token_present,
+        command.preview_only,
+    );
     if config.image_gen.enabled && !config.image_summary_enabled_for_room(&trigger.room_id) {
         info!(room_id = %trigger.room_id, "image summary disabled by room capability");
         append_runtime_log(
@@ -187,6 +202,28 @@ pub(crate) async fn handle_platform_event(
         }
     }
 
+    match daily_budget_state(
+        config,
+        store,
+        &trigger.room_id,
+        incoming.timestamp,
+        pipeline_options.image_gen_enabled,
+    ) {
+        Ok(budget) => pipeline_options.media_decode_limit = budget.media_decode_limit,
+        Err(error) => {
+            let message = format!("本群今日总结额度限制：{error}");
+            append_runtime_log(
+                config,
+                &format!(
+                    "trigger rejected room={} reason=budget error={error}",
+                    trigger.room_id
+                ),
+            );
+            let _ = client.send_text(&trigger.room_id, &message).await;
+            return Ok(());
+        }
+    }
+
     let range = TimeRangeCalculator::resolve_with_override(
         incoming.timestamp,
         last_trigger,
@@ -219,12 +256,13 @@ pub(crate) async fn handle_platform_event(
         until = %range.until,
         command_range_minutes = ?command.range_minutes,
         image_token_present = command.image_token_present,
+        preview_only = command.preview_only,
         "trigger accepted; running summary pipeline"
     );
     append_runtime_log(
         config,
         &format!(
-            "trigger accepted room={} source_platform={} target_platform={} since={} until={} command_range_minutes={:?} image_token_present={}",
+            "trigger accepted room={} source_platform={} target_platform={} since={} until={} command_range_minutes={:?} image_token_present={} preview_only={}",
             trigger.room_id,
             source_platform.as_str(),
             command.target_platform.as_str(),
@@ -232,6 +270,7 @@ pub(crate) async fn handle_platform_event(
             range.until,
             command.range_minutes,
             command.image_token_present
+            ,command.preview_only
         ),
     );
 
@@ -267,7 +306,14 @@ pub(crate) async fn handle_platform_event(
             );
         }
         Ok(PipelineOutcome::NoSummary) => {
-            task.set_stage(TaskState::Succeeded, "completed_without_output", None, None, 0, 0);
+            task.set_stage(
+                TaskState::Succeeded,
+                "completed_without_output",
+                None,
+                None,
+                0,
+                0,
+            );
             info!(room_id = %trigger.room_id, "summary pipeline completed without summary output");
             append_runtime_log(
                 config,
@@ -280,7 +326,14 @@ pub(crate) async fn handle_platform_event(
         Err(error) => {
             let error_message = format_error_chain(&error);
             record_primary_llm_health(store, config, Some(&error_message));
-            task.set_stage(TaskState::Failed, "failed", None, Some(&error_message), 0, 0);
+            task.set_stage(
+                TaskState::Failed,
+                "failed",
+                None,
+                Some(&error_message),
+                0,
+                0,
+            );
             error!(room_id = %trigger.room_id, error = %error_message, "summary pipeline failed");
             append_runtime_log(
                 config,

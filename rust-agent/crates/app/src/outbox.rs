@@ -7,6 +7,8 @@ use wechat_summary_storage::{DeliveryRecord, DeliveryState, SqliteStateStore};
 
 use crate::{format_error_chain, platform::PlatformWorker, OperationalTask};
 
+const DELIVERY_LEASE_SECONDS: i64 = 10 * 60;
+
 pub(crate) async fn deliver_text(
     config: &AgentConfig,
     task: &OperationalTask,
@@ -15,12 +17,29 @@ pub(crate) async fn deliver_text(
     text: &str,
 ) -> Result<()> {
     let payload = redact_payload(config, text);
-    let delivery = task.store.enqueue_delivery(Some(&task.id), room_id, "text", &payload)
+    let delivery = task
+        .store
+        .enqueue_delivery(Some(&task.id), room_id, "text", &payload)
         .context("enqueueing summary text delivery")?;
-    task.store.update_delivery(&delivery.id, DeliveryState::Sending, 1, Utc::now(), None)?;
+    if !task.store.claim_delivery(
+        &delivery.id,
+        delivery.attempts.saturating_add(1),
+        DELIVERY_LEASE_SECONDS,
+    )? {
+        return Ok(());
+    }
     match client.send_text(room_id, &payload).await {
-        Ok(()) => task.store.update_delivery(&delivery.id, DeliveryState::Delivered, 1, Utc::now(), None)?,
-        Err(error) => { schedule_failure(config, &task.store, &delivery, &error)?; return Err(error).context("sending outboxed summary text"); }
+        Ok(()) => task.store.update_delivery(
+            &delivery.id,
+            DeliveryState::Delivered,
+            1,
+            Utc::now(),
+            None,
+        )?,
+        Err(error) => {
+            schedule_failure(config, &task.store, &delivery, &error)?;
+            return Err(error).context("sending outboxed summary text");
+        }
     }
     Ok(())
 }
@@ -32,46 +51,107 @@ pub(crate) async fn deliver_image(
     room_id: &str,
     artifact: &ImageArtifact,
 ) -> Result<()> {
-    let delivery = task.store.enqueue_delivery(Some(&task.id), room_id, "image", &artifact.path)
+    let delivery = task
+        .store
+        .enqueue_delivery(Some(&task.id), room_id, "image", &artifact.path)
         .context("enqueueing summary image delivery")?;
-    task.store.update_delivery(&delivery.id, DeliveryState::Sending, 1, Utc::now(), None)?;
+    if !task.store.claim_delivery(
+        &delivery.id,
+        delivery.attempts.saturating_add(1),
+        DELIVERY_LEASE_SECONDS,
+    )? {
+        return Ok(());
+    }
     match client.send_image(room_id, &artifact.path).await {
-        Ok(()) => task.store.update_delivery(&delivery.id, DeliveryState::Delivered, 1, Utc::now(), None)?,
-        Err(error) => { schedule_failure(config, &task.store, &delivery, &error)?; return Err(error).context("sending outboxed summary image"); }
+        Ok(()) => task.store.update_delivery(
+            &delivery.id,
+            DeliveryState::Delivered,
+            1,
+            Utc::now(),
+            None,
+        )?,
+        Err(error) => {
+            schedule_failure(config, &task.store, &delivery, &error)?;
+            return Err(error).context("sending outboxed summary image");
+        }
     }
     Ok(())
 }
 
-pub(crate) async fn drain(config: &AgentConfig, store: &SqliteStateStore, client: &PlatformWorker) -> Result<()> {
+pub(crate) async fn drain(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    client: &PlatformWorker,
+) -> Result<()> {
     for delivery in store.due_deliveries(8)? {
         let attempts = delivery.attempts.saturating_add(1);
-        store.update_delivery(&delivery.id, DeliveryState::Sending, attempts, Utc::now(), None)?;
+        if !store.claim_delivery(&delivery.id, attempts, DELIVERY_LEASE_SECONDS)? {
+            continue;
+        }
         let result = match delivery.kind.as_str() {
             "text" => client.send_text(&delivery.room_id, &delivery.payload).await,
-            "image" => client.send_image(&delivery.room_id, &delivery.payload).await,
-            _ => Err(anyhow::anyhow!("unsupported outbox delivery kind {}", delivery.kind)),
+            "image" => {
+                client
+                    .send_image(&delivery.room_id, &delivery.payload)
+                    .await
+            }
+            _ => Err(anyhow::anyhow!(
+                "unsupported outbox delivery kind {}",
+                delivery.kind
+            )),
         };
         match result {
-            Ok(()) => store.update_delivery(&delivery.id, DeliveryState::Delivered, attempts, Utc::now(), None)?,
+            Ok(()) => store.update_delivery(
+                &delivery.id,
+                DeliveryState::Delivered,
+                attempts,
+                Utc::now(),
+                None,
+            )?,
             Err(error) => schedule_failure(config, store, &delivery, &error)?,
         }
     }
     Ok(())
 }
 
-fn schedule_failure(config: &AgentConfig, store: &SqliteStateStore, delivery: &DeliveryRecord, error: &anyhow::Error) -> Result<()> {
+fn schedule_failure(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    delivery: &DeliveryRecord,
+    error: &anyhow::Error,
+) -> Result<()> {
     let message = format_error_chain(error);
     let now = Utc::now();
     if may_have_reached_platform(&message) {
-        store.update_delivery(&delivery.id, DeliveryState::Uncertain, delivery.attempts.saturating_add(1), now, Some(&message))?;
+        store.update_delivery(
+            &delivery.id,
+            DeliveryState::Uncertain,
+            delivery.attempts.saturating_add(1),
+            now,
+            Some(&message),
+        )?;
         return Ok(());
     }
-    if now - delivery.created_at >= Duration::seconds(config.operations.outbox_retry_window_seconds.max(1)) {
-        store.update_delivery(&delivery.id, DeliveryState::Failed, delivery.attempts.saturating_add(1), now, Some(&message))?;
+    if now - delivery.created_at
+        >= Duration::seconds(config.operations.outbox_retry_window_seconds.max(1))
+    {
+        store.update_delivery(
+            &delivery.id,
+            DeliveryState::Failed,
+            delivery.attempts.saturating_add(1),
+            now,
+            Some(&message),
+        )?;
         return Ok(());
     }
     let delay = (5_i64 * (1_i64 << delivery.attempts.min(6))).min(300);
-    store.update_delivery(&delivery.id, DeliveryState::Pending, delivery.attempts.saturating_add(1), now + Duration::seconds(delay), Some(&message))?;
+    store.update_delivery(
+        &delivery.id,
+        DeliveryState::Pending,
+        delivery.attempts.saturating_add(1),
+        now + Duration::seconds(delay),
+        Some(&message),
+    )?;
     Ok(())
 }
 

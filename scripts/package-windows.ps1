@@ -8,6 +8,11 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $RustRoot = Join-Path $RepoRoot "rust-agent"
 $WinUiProject = Join-Path $RepoRoot "windows-ui\src\SummaryAgent4GroupChat.WinUI\SummaryAgent4GroupChat.WinUI.csproj"
+$WorkspaceVersion = (Select-String -LiteralPath (Join-Path $RustRoot "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' |
+    Select-Object -First 1).Matches[0].Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($WorkspaceVersion)) {
+    throw "Could not read workspace version from $RustRoot\Cargo.toml"
+}
 $WinUiPublishDir = Join-Path $RepoRoot ".artifacts\winui-publish"
 $BuildCacheDir = Join-Path $RepoRoot ".artifacts\build-cache"
 if ([string]::IsNullOrWhiteSpace($OutDir)) {
@@ -37,7 +42,8 @@ if (-not $SkipBuild) {
     if (Test-Path -LiteralPath $WinUiPublishDir) {
         Remove-Item -LiteralPath $WinUiPublishDir -Recurse -Force
     }
-    dotnet publish $WinUiProject -c Release -r win-x64 --self-contained true -p:Platform=x64 -o $WinUiPublishDir
+    dotnet publish $WinUiProject -c Release -r win-x64 --self-contained true -p:Platform=x64 `
+        -p:Version=$WorkspaceVersion -p:InformationalVersion=$WorkspaceVersion -o $WinUiPublishDir
 }
 
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $RustRoot "target" }

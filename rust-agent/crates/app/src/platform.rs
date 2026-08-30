@@ -879,6 +879,8 @@ mod tests {
             blacklist_users: Vec::new(),
             content_types: vec!["text".into()],
             ignore_self: true,
+            require_allowed_users: false,
+            allowed_users: Vec::new(),
         };
 
         assert_eq!(listen_groups(&[], &listen), vec!["room-a".to_string()]);
@@ -893,6 +895,8 @@ mod tests {
             blacklist_users: Vec::new(),
             content_types: vec!["text".into()],
             ignore_self: true,
+            require_allowed_users: false,
+            allowed_users: Vec::new(),
         };
 
         assert_eq!(
@@ -910,6 +914,8 @@ mod tests {
             blacklist_users: Vec::new(),
             content_types: vec!["text".into()],
             ignore_self: true,
+            require_allowed_users: false,
+            allowed_users: Vec::new(),
         };
 
         assert_eq!(

@@ -134,14 +134,20 @@ pub(crate) fn drain_manual_retry_tasks(
     let retries = match store.queued_retry_tasks(8) {
         Ok(tasks) => tasks,
         Err(error) => {
-            append_runtime_log(config, &format!("manual retry task query failed error={error}"));
+            append_runtime_log(
+                config,
+                &format!("manual retry task query failed error={error}"),
+            );
             return;
         }
     };
     for record in retries {
         let room_id = record.room_id.clone();
         let scheduler_room_id = room_id.clone();
-        let task = OperationalTask { id: record.id.clone(), store: store.clone() };
+        let task = OperationalTask {
+            id: record.id.clone(),
+            store: store.clone(),
+        };
         let task_config = config.clone();
         let task_client = client.clone();
         let task_slots = image_pipeline_slots.clone();
@@ -149,28 +155,67 @@ pub(crate) fn drain_manual_retry_tasks(
         let future = Box::pin(async move {
             task_for_future.set_stage(TaskState::Running, "retry_accepted", None, None, 0, 0);
             let incoming = IncomingMessage {
-                room_id: room_id.clone(), room_name: Some(room_id.clone()), stable_id: None,
-                sender_id: "task_center".to_string(), sender_name: Some("任务中心重试".to_string()),
-                content: "[task_retry]".to_string(), msg_type: "text".to_string(), timestamp: Utc::now(), is_self: true,
+                room_id: room_id.clone(),
+                room_name: Some(room_id.clone()),
+                stable_id: None,
+                sender_id: "task_center".to_string(),
+                sender_name: Some("任务中心重试".to_string()),
+                content: "[task_retry]".to_string(),
+                msg_type: "text".to_string(),
+                timestamp: Utc::now(),
+                is_self: true,
             };
-            let trigger = TriggerMatch { room_id: room_id.clone(), trigger_symbol: "[task_retry]".to_string(), trigger_content: "[task_retry]".to_string() };
-            let range = ResolvedTimeRange { since: record.since, until: record.until, mode: TimeRangeMode::FixedMinutes };
+            let trigger = TriggerMatch {
+                room_id: room_id.clone(),
+                trigger_symbol: "[task_retry]".to_string(),
+                trigger_content: "[task_retry]".to_string(),
+            };
+            let range = ResolvedTimeRange {
+                since: record.since,
+                until: record.until,
+                mode: TimeRangeMode::FixedMinutes,
+            };
             let result = run_summary_pipeline(SummaryPipelineRequest {
                 config: &task_config,
                 client: &task_client,
                 incoming: &incoming,
                 trigger: &trigger,
                 range: &range,
-                options: PipelineOptions::manual(&task_config, &room_id, false),
+                options: PipelineOptions::manual(&task_config, &room_id, false, false),
                 image_pipeline_slots: &task_slots,
-                image_cooldown_recorder: Some(ImageCooldownRecorder { store: task_for_future.store.clone(), timestamp: Utc::now() }),
+                image_cooldown_recorder: Some(ImageCooldownRecorder {
+                    store: task_for_future.store.clone(),
+                    timestamp: Utc::now(),
+                }),
                 recent_observed_messages: None,
                 task: Some(&task_for_future),
-            }).await;
+            })
+            .await;
             match &result {
-                Ok(PipelineOutcome::SummaryProduced) => task_for_future.set_stage(TaskState::Succeeded, "retry_completed", None, None, 0, 0),
-                Ok(PipelineOutcome::NoSummary) => task_for_future.set_stage(TaskState::Succeeded, "retry_completed_without_output", None, None, 0, 0),
-                Err(error) => task_for_future.set_stage(TaskState::Failed, "retry_failed", None, Some(&format_error_chain(error)), 0, 0),
+                Ok(PipelineOutcome::SummaryProduced) => task_for_future.set_stage(
+                    TaskState::Succeeded,
+                    "retry_completed",
+                    None,
+                    None,
+                    0,
+                    0,
+                ),
+                Ok(PipelineOutcome::NoSummary) => task_for_future.set_stage(
+                    TaskState::Succeeded,
+                    "retry_completed_without_output",
+                    None,
+                    None,
+                    0,
+                    0,
+                ),
+                Err(error) => task_for_future.set_stage(
+                    TaskState::Failed,
+                    "retry_failed",
+                    None,
+                    Some(&format_error_chain(error)),
+                    0,
+                    0,
+                ),
             }
             result.map(|_| ())
         });
@@ -202,6 +247,26 @@ async fn run_scheduled_summary_task(
             ),
         );
     }
+    let mut options = PipelineOptions::scheduled(config, &trigger.room_id);
+    match daily_budget_state(
+        config,
+        store,
+        &trigger.room_id,
+        now,
+        options.image_gen_enabled,
+    ) {
+        Ok(budget) => options.media_decode_limit = budget.media_decode_limit,
+        Err(error) => {
+            append_runtime_log(
+                config,
+                &format!(
+                    "scheduled summary skipped room={} reason=budget error={error}",
+                    trigger.room_id
+                ),
+            );
+            return Ok(());
+        }
+    }
     let task = OperationalTask {
         id: store
             .create_task(NewTask {
@@ -222,7 +287,7 @@ async fn run_scheduled_summary_task(
         incoming: &incoming,
         trigger: &trigger,
         range: &range,
-        options: PipelineOptions::scheduled(config, &trigger.room_id),
+        options,
         image_pipeline_slots,
         image_cooldown_recorder: None,
         recent_observed_messages: None,
@@ -241,7 +306,14 @@ async fn run_scheduled_summary_task(
             Ok(())
         }
         Ok(PipelineOutcome::NoSummary) => {
-            task.set_stage(TaskState::Succeeded, "completed_without_output", None, None, 0, 0);
+            task.set_stage(
+                TaskState::Succeeded,
+                "completed_without_output",
+                None,
+                None,
+                0,
+                0,
+            );
             append_runtime_log(
                 config,
                 &format!(
@@ -254,7 +326,14 @@ async fn run_scheduled_summary_task(
         Err(error) => {
             let error_message = format_error_chain(&error);
             record_primary_llm_health(store, config, Some(&error_message));
-            task.set_stage(TaskState::Failed, "failed", None, Some(&error_message), 0, 0);
+            task.set_stage(
+                TaskState::Failed,
+                "failed",
+                None,
+                Some(&error_message),
+                0,
+                0,
+            );
             append_runtime_log(
                 config,
                 &format!(

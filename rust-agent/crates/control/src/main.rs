@@ -388,8 +388,13 @@ async fn serve_connection(
     }
     let is_subscription = matches!(
         request.method.as_str(),
-        "output.subscribe" | "logs.subscribe" | "status.subscribe" | "operation.subscribe"
-            | "tasks.subscribe" | "outbox.subscribe" | "providers.subscribe"
+        "output.subscribe"
+            | "logs.subscribe"
+            | "status.subscribe"
+            | "operation.subscribe"
+            | "tasks.subscribe"
+            | "outbox.subscribe"
+            | "providers.subscribe"
     );
     let response = match dispatch(&state, &request.method, &request.params).await {
         Ok(result) => Response {
@@ -479,15 +484,19 @@ async fn dispatch(
         "tasks.get" => task_get(state, params),
         "tasks.cancel" => task_cancel(state, params),
         "tasks.retry" => task_retry(state, params),
+        "tasks.diagnostic_bundle" => task_diagnostic_bundle(state, params),
         "outbox.list" => outbox_list(state, params),
         "outbox.retry" => outbox_retry(state, params),
         "outbox.resolve" => outbox_resolve(state, params),
         "providers.health" => providers_health(state),
         "report-groups.read" => report_groups_read(state),
-        "output.subscribe" | "logs.subscribe" | "status.subscribe" | "operation.subscribe"
-        | "tasks.subscribe" | "outbox.subscribe" | "providers.subscribe" => {
-            Ok(json!({ "subscribed": true }))
-        }
+        "output.subscribe"
+        | "logs.subscribe"
+        | "status.subscribe"
+        | "operation.subscribe"
+        | "tasks.subscribe"
+        | "outbox.subscribe"
+        | "providers.subscribe" => Ok(json!({ "subscribed": true })),
         _ => {
             return Err(ApiError::invalid(format!(
                 "unsupported control method: {method}"
@@ -499,12 +508,15 @@ async fn dispatch(
 
 fn operational_store(state: &ControlState) -> Result<SqliteStateStore> {
     let config = AgentConfig::from_path(&state.paths.config_path)?;
-    SqliteStateStore::open(&config.storage.sqlite_path)
-        .context("opening operational state store")
+    SqliteStateStore::open(&config.storage.sqlite_path).context("opening operational state store")
 }
 
 fn requested_limit(params: &Value) -> usize {
-    params.get("limit").and_then(Value::as_u64).unwrap_or(100).clamp(1, 500) as usize
+    params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .clamp(1, 500) as usize
 }
 
 fn task_to_json(task: &wechat_summary_storage::TaskRecord) -> Value {
@@ -528,7 +540,10 @@ fn delivery_to_json(delivery: &wechat_summary_storage::DeliveryRecord) -> Value 
 }
 
 fn required_id(params: &Value) -> Result<&str> {
-    params.get("id").and_then(Value::as_str).filter(|value| !value.trim().is_empty())
+    params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("params.id must be a non-empty string"))
 }
 
@@ -536,9 +551,12 @@ fn tasks_list(state: &ControlState, params: &Value) -> Result<Value> {
     let store = operational_store(state)?;
     let room_id = params.get("room_id").and_then(Value::as_str);
     let state_filter = match params.get("state").and_then(Value::as_str) {
-        Some("queued") => Some(TaskState::Queued), Some("running") => Some(TaskState::Running),
-        Some("succeeded") => Some(TaskState::Succeeded), Some("failed") => Some(TaskState::Failed),
-        Some("cancelled") => Some(TaskState::Cancelled), _ => None,
+        Some("queued") => Some(TaskState::Queued),
+        Some("running") => Some(TaskState::Running),
+        Some("succeeded") => Some(TaskState::Succeeded),
+        Some("failed") => Some(TaskState::Failed),
+        Some("cancelled") => Some(TaskState::Cancelled),
+        _ => None,
     };
     let tasks = store.tasks(requested_limit(params), room_id, state_filter)?;
     Ok(json!({ "tasks": tasks.iter().map(task_to_json).collect::<Vec<_>>() }))
@@ -548,11 +566,17 @@ fn task_get(state: &ControlState, params: &Value) -> Result<Value> {
     let store = operational_store(state)?;
     let id = required_id(params)?;
     let task = store.task(id)?.ok_or_else(|| anyhow!("task not found"))?;
-    let sources = store.source_references(id)?.into_iter().map(|source| json!({
-        "point_index": source.point_index, "source_id": source.source_id,
-        "occurred_at": source.occurred_at, "sender_label": source.sender_label,
-        "message_index": source.message_index,
-    })).collect::<Vec<_>>();
+    let sources = store
+        .source_references(id)?
+        .into_iter()
+        .map(|source| {
+            json!({
+                "point_index": source.point_index, "source_id": source.source_id,
+                "occurred_at": source.occurred_at, "sender_label": source.sender_label,
+                "message_index": source.message_index,
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({ "task": task_to_json(&task), "sources": sources }))
 }
 
@@ -560,20 +584,94 @@ fn task_cancel(state: &ControlState, params: &Value) -> Result<Value> {
     let store = operational_store(state)?;
     let id = required_id(params)?;
     let task = store.task(id)?.ok_or_else(|| anyhow!("task not found"))?;
-    store.update_task(&task.id, TaskState::Cancelled, "cancelled", None, Some("cancelled from task center"), task.message_count, task.media_count)?;
-    emit(state, "task.changed", json!({ "id": id, "state": "cancelled" }));
+    store.update_task(
+        &task.id,
+        TaskState::Cancelled,
+        "cancelled",
+        None,
+        Some("cancelled from task center"),
+        task.message_count,
+        task.media_count,
+    )?;
+    emit(
+        state,
+        "task.changed",
+        json!({ "id": id, "state": "cancelled" }),
+    );
     Ok(json!({ "cancelled": true }))
 }
 
 fn task_retry(state: &ControlState, params: &Value) -> Result<Value> {
     let store = operational_store(state)?;
-    let original = store.task(required_id(params)?)?.ok_or_else(|| anyhow!("task not found"))?;
+    let original = store
+        .task(required_id(params)?)?
+        .ok_or_else(|| anyhow!("task not found"))?;
     let retry = store.create_task(NewTask {
-        room_id: &original.room_id, source: "manual_retry", since: original.since, until: original.until,
-        config_revision: &original.config_revision, retry_of: Some(&original.id),
+        room_id: &original.room_id,
+        source: "manual_retry",
+        since: original.since,
+        until: original.until,
+        config_revision: &original.config_revision,
+        retry_of: Some(&original.id),
     })?;
-    emit(state, "task.changed", json!({ "id": retry.id, "state": "queued", "retry_of": original.id }));
+    emit(
+        state,
+        "task.changed",
+        json!({ "id": retry.id, "state": "queued", "retry_of": original.id }),
+    );
     Ok(json!({ "task": task_to_json(&retry) }))
+}
+
+fn task_diagnostic_bundle(state: &ControlState, params: &Value) -> Result<Value> {
+    use std::io::Write;
+    use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+    let store = operational_store(state)?;
+    let id = required_id(params)?;
+    let task = store.task(id)?.ok_or_else(|| anyhow!("task not found"))?;
+    let sources = store.source_references(id)?;
+    let deliveries = store.deliveries_for_task(id)?;
+    let providers = store.provider_health()?;
+    let output_dir = runtime_output_dir(&state.paths)?.join("diagnostics");
+    fs::create_dir_all(&output_dir)?;
+    let archive_path = output_dir.join(format!(
+        "task-{}-{}.zip",
+        task.id,
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    let file = fs::File::create(&archive_path)?;
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let diagnostic = json!({
+        "generated_at": chrono::Utc::now(),
+        "task": task_to_json(&task),
+        "sources": sources.into_iter().map(|source| json!({
+            "point_index": source.point_index, "source_id": source.source_id,
+            "occurred_at": source.occurred_at, "sender_label": source.sender_label,
+            "message_index": source.message_index,
+        })).collect::<Vec<_>>(),
+        "deliveries": deliveries.iter().map(delivery_to_json).collect::<Vec<_>>(),
+        "providers": providers.into_iter().map(|entry| json!({
+            "capability": entry.capability, "provider_key": entry.provider_key,
+            "consecutive_failures": entry.consecutive_failures,
+            "circuit_open_until": entry.circuit_open_until, "last_error": entry.last_error,
+            "updated_at": entry.updated_at,
+        })).collect::<Vec<_>>(),
+    });
+    zip.start_file("task-diagnostic.json", options)?;
+    zip.write_all(serde_json::to_string_pretty(&diagnostic)?.as_bytes())?;
+    zip.start_file("config.redacted.toml", options)?;
+    zip.write_all(redact_toml_secrets(&fs::read_to_string(&state.paths.config_path)?)?.as_bytes())?;
+    zip.start_file("wechat-summary-app.log.tail.txt", options)?;
+    zip.write_all(
+        read_log_tail(
+            &runtime_output_dir(&state.paths)?.join("wechat-summary-app.log"),
+            400,
+        )
+        .as_bytes(),
+    )?;
+    zip.finish()?;
+    Ok(json!({ "path": archive_path }))
 }
 
 fn outbox_list(state: &ControlState, params: &Value) -> Result<Value> {
@@ -585,17 +683,37 @@ fn outbox_list(state: &ControlState, params: &Value) -> Result<Value> {
 fn outbox_retry(state: &ControlState, params: &Value) -> Result<Value> {
     let store = operational_store(state)?;
     store.retry_delivery(required_id(params)?)?;
-    emit(state, "outbox.changed", json!({ "id": required_id(params)?, "state": "pending" }));
+    emit(
+        state,
+        "outbox.changed",
+        json!({ "id": required_id(params)?, "state": "pending" }),
+    );
     Ok(json!({ "queued": true }))
 }
 
 fn outbox_resolve(state: &ControlState, params: &Value) -> Result<Value> {
     let store = operational_store(state)?;
     let id = required_id(params)?;
-    let action = params.get("action").and_then(Value::as_str).unwrap_or("cancel");
-    if action == "retry" { store.retry_delivery(id)?; }
-    else { store.update_delivery(id, DeliveryState::Cancelled, 0, chrono::Utc::now(), Some("resolved from task center"))?; }
-    emit(state, "outbox.changed", json!({ "id": id, "action": action }));
+    let action = params
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("cancel");
+    if action == "retry" {
+        store.retry_delivery(id)?;
+    } else {
+        store.update_delivery(
+            id,
+            DeliveryState::Cancelled,
+            0,
+            chrono::Utc::now(),
+            Some("resolved from task center"),
+        )?;
+    }
+    emit(
+        state,
+        "outbox.changed",
+        json!({ "id": id, "action": action }),
+    );
     Ok(json!({ "resolved": true }))
 }
 
@@ -610,10 +728,12 @@ fn providers_health(state: &ControlState) -> Result<Value> {
 
 fn report_groups_read(state: &ControlState) -> Result<Value> {
     let config = AgentConfig::from_path(&state.paths.config_path)?;
-    Ok(json!({ "groups": config.report_groups.iter().map(|(name, group)| json!({
+    Ok(
+        json!({ "groups": config.report_groups.iter().map(|(name, group)| json!({
         "name": name, "enabled": group.enabled, "rooms": group.rooms,
         "weekday": group.weekday, "local_hour": group.local_hour, "local_minute": group.local_minute,
-    })).collect::<Vec<_>>() }))
+    })).collect::<Vec<_>>() }),
+    )
 }
 
 fn status_payload(state: &ControlState) -> Result<Value> {
@@ -1500,6 +1620,21 @@ fn logs_tail(state: &ControlState) -> Result<Value> {
         Err(error) => format!("暂无日志：{error}"),
     };
     Ok(json!({ "path": path, "text": text }))
+}
+
+fn read_log_tail(path: &Path, max_lines: usize) -> String {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let lines = text
+                .lines()
+                .rev()
+                .take(max_lines.max(1))
+                .collect::<Vec<_>>();
+            redact_secret_like_tokens(&lines.into_iter().rev().collect::<Vec<_>>().join("\n"))
+        }
+        Err(error) => format!("暂无日志：{error}"),
+    }
 }
 
 async fn runtime_check(state: &ControlState) -> Result<Value> {

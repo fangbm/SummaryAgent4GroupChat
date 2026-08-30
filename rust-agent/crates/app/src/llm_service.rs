@@ -6,14 +6,17 @@ use anyhow::{bail, Context, Result};
 use tokio::task::JoinSet;
 use tracing::warn;
 use wechat_summary_ai::{AiError, OpenAiCompatibleLlm};
-use wechat_summary_core::{config::PrivacyConfig, models::ChatMessage, AgentConfig, PrivacyFilter};
+use wechat_summary_core::{
+    config::{PrivacyConfig, SummaryDetail},
+    models::ChatMessage,
+    AgentConfig, PrivacyFilter,
+};
 
 use crate::{
     ai_runtime::{ai_trace_context, ai_trace_context_for_chunk},
     llm_chunking::{
         build_llm_chunk_requests, format_chunk_summaries_for_output, private_formatted_chat_input,
-        split_llm_chunk_request, ChunkSummary, LlmChunkRequest, LlmOutputLimit,
-        LongChatCompletion,
+        split_llm_chunk_request, ChunkSummary, LlmChunkRequest, LlmOutputLimit, LongChatCompletion,
     },
     llm_output::{looks_like_text_summary_refusal, sanitize_llm_visible_output},
     render_prompt_template,
@@ -29,13 +32,19 @@ pub(crate) async fn complete_text_summary_with_refusal_retry(
     chat_messages: &[ChatMessage],
     privacy: &PrivacyFilter,
     refusal_retry_prompt: &str,
+    detail: SummaryDetail,
 ) -> Result<LongChatCompletion> {
+    let system_prompt = format!(
+        "{}{}",
+        config.text_summary.system_prompt,
+        detail.prompt_suffix()
+    );
     let summary_result = complete_chat_summary_with_fallback(
         config,
         llm,
         room_id,
         "text summary",
-        &config.text_summary.system_prompt,
+        &system_prompt,
         &config.text_summary.user_prompt_template,
         chat_messages,
         LlmOutputLimit::Configured,
@@ -62,7 +71,7 @@ pub(crate) async fn complete_text_summary_with_refusal_retry(
 
     let retry_system_prompt = format!(
         "{}\n\n{}",
-        config.text_summary.system_prompt.trim(),
+        system_prompt.trim(),
         refusal_retry_prompt.trim()
     );
     let retry_result = complete_chat_summary_with_fallback(
@@ -389,7 +398,8 @@ async fn complete_llm_chunk_request_with_context_split(
             chunk.index + 1,
             chunk_total,
         ));
-        match complete_llm_request(&traced_llm, system_prompt, &current.prompt, output_limit).await {
+        match complete_llm_request(&traced_llm, system_prompt, &current.prompt, output_limit).await
+        {
             Ok(output) => {
                 append_runtime_log(
                     config,

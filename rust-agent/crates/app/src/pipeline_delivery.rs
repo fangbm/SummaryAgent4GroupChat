@@ -2,14 +2,17 @@
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
-use wechat_summary_core::{models::ChatMessage, AgentConfig};
+use wechat_summary_core::{config::LlmConfig, models::ChatMessage, AgentConfig};
 
 use crate::{
     deliver_outboxed_text, format_error_chain, format_failure_message_for_chat,
     record_image_cooldown_success, summary_image, ImageCooldownRecorder, OperationalTask,
     IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
 };
-use crate::{platform::{PlatformSender, PlatformWorker}, summary_image::ImagePipelineSlotPool};
+use crate::{
+    platform::{PlatformSender, PlatformWorker},
+    summary_image::ImagePipelineSlotPool,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_background_image_pipeline(
@@ -21,6 +24,7 @@ pub(super) async fn run_background_image_pipeline(
     text_summary_enabled: bool,
     image_pipeline_slots: ImagePipelineSlotPool,
     image_cooldown_recorder: Option<ImageCooldownRecorder>,
+    llm_config: LlmConfig,
 ) -> bool {
     let result: Result<()> = async {
         summary_image::run_background(
@@ -31,6 +35,7 @@ pub(super) async fn run_background_image_pipeline(
             &chat_messages,
             &image_pipeline_slots,
             IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
+            llm_config,
         )
         .await?;
         record_image_cooldown_success(&config, image_cooldown_recorder.as_ref(), &room_id)

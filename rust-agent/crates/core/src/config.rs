@@ -65,6 +65,8 @@ pub struct AgentConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub operations: OperationsConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
 }
 
 impl AgentConfig {
@@ -86,7 +88,25 @@ impl AgentConfig {
     }
 
     pub fn image_summary_enabled_for_room(&self, room_id: &str) -> bool {
-        self.room_policy(room_id).image_summary_enabled.unwrap_or(true)
+        self.room_policy(room_id)
+            .image_summary_enabled
+            .unwrap_or(true)
+    }
+
+    pub fn trigger_user_allowed(&self, room_id: &str, sender_id: &str) -> bool {
+        let policy = self.room_policy(room_id);
+        if !policy
+            .require_allowed_users
+            .unwrap_or(self.listen.require_allowed_users)
+        {
+            return true;
+        }
+        policy
+            .allowed_users
+            .as_deref()
+            .unwrap_or(&self.listen.allowed_users)
+            .iter()
+            .any(|user| user == sender_id)
     }
 
     pub fn room_policy(&self, room_id: &str) -> EffectiveRoomPolicy {
@@ -95,14 +115,48 @@ impl AgentConfig {
             .and_then(|room| room.template.as_deref())
             .and_then(|name| self.policy_templates.get(name));
         EffectiveRoomPolicy {
-            text_summary_enabled: explicit.and_then(|value| value.text_summary_enabled).or_else(|| template.and_then(|value| value.text_summary_enabled)),
-            image_summary_enabled: explicit.and_then(|value| value.image_summary_enabled).or_else(|| template.and_then(|value| value.image_summary_enabled)),
-            image_caption_enabled: explicit.and_then(|value| value.image_caption_enabled).or_else(|| template.and_then(|value| value.image_caption_enabled)),
-            video_caption_enabled: explicit.and_then(|value| value.video_caption_enabled).or_else(|| template.and_then(|value| value.video_caption_enabled)),
-            voice_transcription_enabled: explicit.and_then(|value| value.voice_transcription_enabled).or_else(|| template.and_then(|value| value.voice_transcription_enabled)),
-            successful_request_cooldown_seconds: explicit.and_then(|value| value.successful_request_cooldown_seconds).or_else(|| template.and_then(|value| value.successful_request_cooldown_seconds)),
-            successful_image_cooldown_seconds: explicit.and_then(|value| value.successful_image_cooldown_seconds).or_else(|| template.and_then(|value| value.successful_image_cooldown_seconds)),
-            long_text_delivery: explicit.and_then(|value| value.long_text_delivery.clone()).or_else(|| template.and_then(|value| value.long_text_delivery.clone())),
+            text_summary_enabled: explicit
+                .and_then(|value| value.text_summary_enabled)
+                .or_else(|| template.and_then(|value| value.text_summary_enabled)),
+            image_summary_enabled: explicit
+                .and_then(|value| value.image_summary_enabled)
+                .or_else(|| template.and_then(|value| value.image_summary_enabled)),
+            image_caption_enabled: explicit
+                .and_then(|value| value.image_caption_enabled)
+                .or_else(|| template.and_then(|value| value.image_caption_enabled)),
+            video_caption_enabled: explicit
+                .and_then(|value| value.video_caption_enabled)
+                .or_else(|| template.and_then(|value| value.video_caption_enabled)),
+            voice_transcription_enabled: explicit
+                .and_then(|value| value.voice_transcription_enabled)
+                .or_else(|| template.and_then(|value| value.voice_transcription_enabled)),
+            successful_request_cooldown_seconds: explicit
+                .and_then(|value| value.successful_request_cooldown_seconds)
+                .or_else(|| template.and_then(|value| value.successful_request_cooldown_seconds)),
+            successful_image_cooldown_seconds: explicit
+                .and_then(|value| value.successful_image_cooldown_seconds)
+                .or_else(|| template.and_then(|value| value.successful_image_cooldown_seconds)),
+            long_text_delivery: explicit
+                .and_then(|value| value.long_text_delivery.clone())
+                .or_else(|| template.and_then(|value| value.long_text_delivery.clone())),
+            require_allowed_users: explicit
+                .and_then(|value| value.require_allowed_users)
+                .or_else(|| template.and_then(|value| value.require_allowed_users)),
+            allowed_users: explicit
+                .and_then(|value| value.allowed_users.clone())
+                .or_else(|| template.and_then(|value| value.allowed_users.clone())),
+            summary_detail: explicit
+                .and_then(|value| value.summary_detail)
+                .or_else(|| template.and_then(|value| value.summary_detail)),
+            daily_summary_limit: explicit
+                .and_then(|value| value.daily_summary_limit)
+                .or_else(|| template.and_then(|value| value.daily_summary_limit)),
+            daily_image_limit: explicit
+                .and_then(|value| value.daily_image_limit)
+                .or_else(|| template.and_then(|value| value.daily_image_limit)),
+            daily_media_limit: explicit
+                .and_then(|value| value.daily_media_limit)
+                .or_else(|| template.and_then(|value| value.daily_media_limit)),
         }
     }
 }
@@ -128,18 +182,50 @@ pub struct RoomCapabilityConfig {
     pub successful_image_cooldown_seconds: Option<i64>,
     #[serde(default)]
     pub long_text_delivery: Option<String>,
+    #[serde(default)]
+    pub require_allowed_users: Option<bool>,
+    #[serde(default)]
+    pub allowed_users: Option<Vec<String>>,
+    #[serde(default)]
+    pub summary_detail: Option<SummaryDetail>,
+    #[serde(default)]
+    pub daily_summary_limit: Option<u32>,
+    #[serde(default)]
+    pub daily_image_limit: Option<u32>,
+    #[serde(default)]
+    pub daily_media_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RoomPolicyTemplate {
-    #[serde(default)] pub text_summary_enabled: Option<bool>,
-    #[serde(default)] pub image_summary_enabled: Option<bool>,
-    #[serde(default)] pub image_caption_enabled: Option<bool>,
-    #[serde(default)] pub video_caption_enabled: Option<bool>,
-    #[serde(default)] pub voice_transcription_enabled: Option<bool>,
-    #[serde(default)] pub successful_request_cooldown_seconds: Option<i64>,
-    #[serde(default)] pub successful_image_cooldown_seconds: Option<i64>,
-    #[serde(default)] pub long_text_delivery: Option<String>,
+    #[serde(default)]
+    pub text_summary_enabled: Option<bool>,
+    #[serde(default)]
+    pub image_summary_enabled: Option<bool>,
+    #[serde(default)]
+    pub image_caption_enabled: Option<bool>,
+    #[serde(default)]
+    pub video_caption_enabled: Option<bool>,
+    #[serde(default)]
+    pub voice_transcription_enabled: Option<bool>,
+    #[serde(default)]
+    pub successful_request_cooldown_seconds: Option<i64>,
+    #[serde(default)]
+    pub successful_image_cooldown_seconds: Option<i64>,
+    #[serde(default)]
+    pub long_text_delivery: Option<String>,
+    #[serde(default)]
+    pub require_allowed_users: Option<bool>,
+    #[serde(default)]
+    pub allowed_users: Option<Vec<String>>,
+    #[serde(default)]
+    pub summary_detail: Option<SummaryDetail>,
+    #[serde(default)]
+    pub daily_summary_limit: Option<u32>,
+    #[serde(default)]
+    pub daily_image_limit: Option<u32>,
+    #[serde(default)]
+    pub daily_media_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -152,15 +238,45 @@ pub struct EffectiveRoomPolicy {
     pub successful_request_cooldown_seconds: Option<i64>,
     pub successful_image_cooldown_seconds: Option<i64>,
     pub long_text_delivery: Option<String>,
+    pub require_allowed_users: Option<bool>,
+    pub allowed_users: Option<Vec<String>>,
+    pub summary_detail: Option<SummaryDetail>,
+    pub daily_summary_limit: Option<u32>,
+    pub daily_image_limit: Option<u32>,
+    pub daily_media_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryDetail {
+    Concise,
+    #[default]
+    Standard,
+    Detailed,
+}
+
+impl SummaryDetail {
+    pub fn prompt_suffix(self) -> &'static str {
+        match self {
+            Self::Concise => "\n\n输出要求：保持简洁，只保留最重要的结论与待办。",
+            Self::Standard => "",
+            Self::Detailed => "\n\n输出要求：尽量保留讨论脉络、时间线、分歧观点、结论与待办；不要为了简短而省略重要上下文。",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ReportGroupConfig {
-    #[serde(default)] pub enabled: bool,
-    #[serde(default)] pub rooms: Vec<String>,
-    #[serde(default = "default_weekly_day")] pub weekday: u32,
-    #[serde(default = "default_scheduled_local_hour")] pub local_hour: u32,
-    #[serde(default)] pub local_minute: u32,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rooms: Vec<String>,
+    #[serde(default = "default_weekly_day")]
+    pub weekday: u32,
+    #[serde(default = "default_scheduled_local_hour")]
+    pub local_hour: u32,
+    #[serde(default)]
+    pub local_minute: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -279,6 +395,11 @@ pub struct ListenConfig {
     pub whitelist_rooms: Vec<String>,
     #[serde(default)]
     pub blacklist_users: Vec<String>,
+    /// Defaults to false so existing rooms keep accepting commands from all members.
+    #[serde(default)]
+    pub require_allowed_users: bool,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
     #[serde(default = "default_text_content_types")]
     pub content_types: Vec<String>,
     #[serde(default = "default_true")]
@@ -506,11 +627,16 @@ pub struct LlmConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProviderFallbackConfig {
     pub provider: String,
-    #[serde(default)] pub api_key: Option<String>,
-    #[serde(default)] pub api_keys: Vec<String>,
-    #[serde(default)] pub base_url: Option<String>,
-    #[serde(default)] pub model: Option<String>,
-    #[serde(default)] pub request_body_overrides: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub request_body_overrides: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -521,6 +647,8 @@ pub struct TextSummaryConfig {
     pub system_prompt: String,
     #[serde(default = "default_text_summary_user_prompt_template")]
     pub user_prompt_template: String,
+    #[serde(default)]
+    pub detail: SummaryDetail,
 }
 
 impl Default for TextSummaryConfig {
@@ -529,6 +657,7 @@ impl Default for TextSummaryConfig {
             enabled: true,
             system_prompt: default_text_summary_system_prompt(),
             user_prompt_template: default_text_summary_user_prompt_template(),
+            detail: SummaryDetail::Standard,
         }
     }
 }
@@ -913,6 +1042,30 @@ pub struct OperationsConfig {
     pub outbox_retry_window_seconds: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Zero means unlimited for the respective counter.
+    #[serde(default)]
+    pub daily_summary_limit: u32,
+    #[serde(default)]
+    pub daily_image_limit: u32,
+    #[serde(default)]
+    pub daily_media_limit: u32,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            daily_summary_limit: 0,
+            daily_image_limit: 0,
+            daily_media_limit: 0,
+        }
+    }
+}
+
 impl Default for OperationsConfig {
     fn default() -> Self {
         Self {
@@ -926,11 +1079,17 @@ fn default_true() -> bool {
     true
 }
 
-fn default_weekly_day() -> u32 { 0 }
+fn default_weekly_day() -> u32 {
+    0
+}
 
-fn default_operational_retention_days() -> i64 { 30 }
+fn default_operational_retention_days() -> i64 {
+    30
+}
 
-fn default_outbox_retry_seconds() -> i64 { 3600 }
+fn default_outbox_retry_seconds() -> i64 {
+    3600
+}
 
 fn default_text_content_types() -> Vec<String> {
     vec!["text".to_string()]
@@ -1352,6 +1511,19 @@ mod tests {
     fn manual_summary_can_enable_images_by_default() {
         let cfg: ManualSummaryConfig = toml::from_str("image_by_default = true").unwrap();
         assert!(cfg.image_by_default);
+    }
+
+    #[test]
+    fn trigger_authorization_and_budgets_default_to_disabled() {
+        let listen: ListenConfig = toml::from_str("triggers = [\"/总结\"]").unwrap();
+        let budget: BudgetConfig = toml::from_str("").unwrap();
+        let text: TextSummaryConfig = toml::from_str("").unwrap();
+
+        assert!(!listen.require_allowed_users);
+        assert!(listen.allowed_users.is_empty());
+        assert!(!budget.enabled);
+        assert_eq!(budget.daily_summary_limit, 0);
+        assert_eq!(text.detail, SummaryDetail::Standard);
     }
 
     #[test]

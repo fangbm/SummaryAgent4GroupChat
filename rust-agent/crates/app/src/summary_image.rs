@@ -10,7 +10,11 @@ use anyhow::{bail, Context, Error, Result};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::{info, warn};
 use wechat_summary_ai::{OpenAiCompatibleLlm, OpenAiImageClient, RetryNotifier};
-use wechat_summary_core::{models::{ChatMessage, ImageArtifact}, AgentConfig, PrivacyFilter};
+use wechat_summary_core::{
+    config::LlmConfig,
+    models::{ChatMessage, ImageArtifact},
+    AgentConfig, PrivacyFilter,
+};
 
 use crate::{
     ai_runtime::{ai_trace_context, ai_trace_dir, configure_llm_tracing},
@@ -231,7 +235,12 @@ pub(crate) async fn complete_summary_with_refusal_retry(
         return Ok(summary_result);
     }
 
-    log_refusal_retry(config, room_id, stage, summary_result.output.chars().count());
+    log_refusal_retry(
+        config,
+        room_id,
+        stage,
+        summary_result.output.chars().count(),
+    );
     let retry_system_prompt = retry_system_prompt(system_prompt, refusal_retry_prompt);
     let retry_stage = format!("{stage} safety retry");
     let retry_result = complete_chat_summary_with_fallback(
@@ -310,7 +319,11 @@ pub(crate) async fn complete_prompt_with_refusal_retry(
 }
 
 fn retry_system_prompt(system_prompt: &str, refusal_retry_prompt: &str) -> String {
-    format!("{}\n\n{}", system_prompt.trim(), refusal_retry_prompt.trim())
+    format!(
+        "{}\n\n{}",
+        system_prompt.trim(),
+        refusal_retry_prompt.trim()
+    )
 }
 
 fn log_refusal_retry(config: &AgentConfig, room_id: &str, stage: &str, output_chars: usize) {
@@ -470,10 +483,11 @@ pub(crate) async fn run_background(
     chat_messages: &[ChatMessage],
     image_pipeline_slots: &ImagePipelineSlotPool,
     refusal_retry_prompt: &str,
+    llm_config: LlmConfig,
 ) -> Result<()> {
     let retry_notifier = retry_log_notifier(config, room_id.to_string());
     let llm = configure_llm_tracing(
-        OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
+        OpenAiCompatibleLlm::new(llm_config, &config.proxy)
             .context("initializing LLM client for background image pipeline")?,
         config,
     )
@@ -594,7 +608,8 @@ pub(crate) async fn generate(
     if let Some(trace_dir) = ai_trace_dir(config)? {
         image_client = image_client.with_trace_dir(trace_dir);
     }
-    image_client = image_client.with_trace_context(ai_trace_context(room_id, "summary image generation"));
+    image_client =
+        image_client.with_trace_context(ai_trace_context(room_id, "summary image generation"));
     if let Some(retry_notifier) = retry_notifier {
         image_client = image_client.with_retry_notifier(retry_notifier);
     }

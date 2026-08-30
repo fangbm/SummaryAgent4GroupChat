@@ -7,83 +7,81 @@ use std::{
     time::{Duration as StdDuration, Instant, SystemTime},
 };
 
-mod llm_chunking;
-mod llm_service;
-mod llm_output;
-mod summary_image;
-mod platform;
-mod runtime_log;
-mod outbox;
-mod operational_task;
-mod report_schedule;
-mod summary_input;
-mod history_rules;
-mod media_rules;
-mod media_service;
-mod media_audio;
 mod ai_runtime;
 mod config_reloader;
-mod event_handler;
 mod event_dispatcher;
+mod event_handler;
+mod history_rules;
+mod llm_chunking;
+mod llm_output;
+mod llm_service;
+mod media_audio;
+mod media_rules;
+mod media_service;
+mod operational_task;
+mod outbox;
 mod pipeline_delivery;
 mod pipeline_input;
+mod platform;
 mod platform_runtime;
-mod wxdb_watcher;
+mod report_schedule;
 mod runtime_artifacts;
-mod summary_command;
-mod summary_pipeline;
-mod summary_scheduler;
+mod runtime_log;
 mod scheduled_backlog;
 mod scheduled_runner;
+mod summary_command;
+mod summary_image;
+mod summary_input;
+mod summary_pipeline;
+mod summary_scheduler;
 mod trigger_state;
+mod wxdb_watcher;
 
-use runtime_log::*;
 use ai_runtime::*;
 use config_reloader::ConfigReloader;
-use event_handler::handle_platform_event;
 use event_dispatcher::{enqueue_platform_event, PlatformEventSource};
-use platform_runtime::{PlatformConnectionFingerprint, PlatformRuntime, WxdbWatcherFingerprint};
-use operational_task::OperationalTask;
-use summary_image::ImagePipelineSlotPool;
-use summary_command::parse as parse_summary_command;
-use summary_pipeline::*;
-use summary_scheduler::{ScheduleResult, SummaryTaskScheduler};
-use scheduled_backlog::{ScheduledSummaryBacklog, ScheduledSummaryRequest};
-use scheduled_runner::{drain_manual_retry_tasks, drain_scheduled_backlog};
-#[cfg(test)]
-use scheduled_runner::requeue_scheduled_request_after_state_read_failure;
-use trigger_state::{RecentObservedMessages, RecentTriggerAttempts};
-#[cfg(test)]
-use summary_command::{parse_args as parse_summary_command_args, SummaryCommand};
-#[cfg(test)]
-use std::sync::mpsc;
-use wxdb_watcher::{WxdbCommandWatcher, WxdbCommandWatcherRecv};
+use event_handler::handle_platform_event;
 #[cfg(test)]
 use llm_chunking::*;
 #[cfg(test)]
-use llm_service::*;
-#[cfg(test)]
 use llm_output::{looks_like_text_summary_refusal, sanitize_llm_visible_output};
 #[cfg(test)]
+use llm_service::*;
+use operational_task::OperationalTask;
+use platform_runtime::{PlatformConnectionFingerprint, PlatformRuntime, WxdbWatcherFingerprint};
+use runtime_log::*;
+use scheduled_backlog::{ScheduledSummaryBacklog, ScheduledSummaryRequest};
+#[cfg(test)]
+use scheduled_runner::requeue_scheduled_request_after_state_read_failure;
+use scheduled_runner::{drain_manual_retry_tasks, drain_scheduled_backlog};
+#[cfg(test)]
+use std::sync::mpsc;
+use summary_command::parse as parse_summary_command;
+#[cfg(test)]
+use summary_command::{parse_args as parse_summary_command_args, SummaryCommand};
+use summary_image::ImagePipelineSlotPool;
+#[cfg(test)]
 use summary_image::ImagePipelineStage;
+use summary_pipeline::*;
+use summary_scheduler::{ScheduleResult, SummaryTaskScheduler};
+use trigger_state::{RecentObservedMessages, RecentTriggerAttempts};
+use wxdb_watcher::{WxdbCommandWatcher, WxdbCommandWatcherRecv};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 #[cfg(test)]
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::{error, info, warn};
-use wechat_summary_ai::OpenAiCompatibleLlm;
 #[cfg(test)]
 use wechat_summary_ai::AiError;
+use wechat_summary_ai::OpenAiCompatibleLlm;
 use wechat_summary_core::{
-    config::{ListenConfig, MatchMode, PlatformKindConfig, TimeRangeMode},
+    config::{ListenConfig, LlmConfig, MatchMode, PlatformKindConfig, TimeRangeMode},
     models::{ChatMessage, ImageArtifact, IncomingMessage},
-    AgentConfig, PrivacyFilter, ResolvedTimeRange, TimeRangeCalculator,
-    TriggerMatch, TriggerMatcher,
+    AgentConfig, PrivacyFilter, ResolvedTimeRange, TimeRangeCalculator, TriggerMatch,
+    TriggerMatcher,
 };
-use wechat_summary_storage::{
-    NewTask, SqliteStateStore, TaskState,
-};
+use wechat_summary_storage::{NewTask, SqliteStateStore, TaskState};
 
 use crate::platform::{
     PlatformClient, PlatformEvent, PlatformHistoryCursor, PlatformHistoryMessage, PlatformWorker,
@@ -152,6 +150,21 @@ async fn run_agent(config_path: &str) -> Result<()> {
     store
         .cleanup_operational_data(config.operations.retention_days)
         .context("cleaning expired operational records")?;
+    let (resumed_tasks, review_tasks) = store
+        .recover_interrupted_tasks()
+        .context("recovering interrupted tasks")?;
+    let uncertain_deliveries = store
+        .recover_interrupted_deliveries()
+        .context("recovering interrupted deliveries")?;
+    if resumed_tasks > 0 || review_tasks > 0 || uncertain_deliveries > 0 {
+        append_runtime_log(
+            config,
+            &format!(
+                "startup recovery resumed_tasks={} review_tasks={} uncertain_deliveries={}",
+                resumed_tasks, review_tasks, uncertain_deliveries
+            ),
+        );
+    }
     let mut platform = PlatformRuntime::start(config).await?;
     let recent_trigger_attempts = Arc::new(Mutex::new(RecentTriggerAttempts::default()));
     let recent_observed_messages = Arc::new(Mutex::new(RecentObservedMessages::default()));
@@ -279,12 +292,22 @@ async fn run_agent(config_path: &str) -> Result<()> {
                     &store_for_report,
                     &worker_for_report,
                     &task_group_name,
-                ).await {
-                    append_runtime_log(&config_for_report, &format!("weekly report failed group={} error={error:#}", task_group_name));
+                )
+                .await
+                {
+                    append_runtime_log(
+                        &config_for_report,
+                        &format!(
+                            "weekly report failed group={} error={error:#}",
+                            task_group_name
+                        ),
+                    );
                 }
             });
             if let Some(group) = config.report_groups.get(&name) {
-                if let Some(next) = report_schedule::next_run_after(now + Duration::seconds(1), group) {
+                if let Some(next) =
+                    report_schedule::next_run_after(now + Duration::seconds(1), group)
+                {
                     next_weekly_runs.insert(name, next);
                 }
             }
@@ -477,7 +500,9 @@ async fn deliver_outboxed_text(
     client: &PlatformWorker,
     room_id: &str,
     text: &str,
-) -> Result<()> { outbox::deliver_text(config, task, client, room_id, text).await }
+) -> Result<()> {
+    outbox::deliver_text(config, task, client, room_id, text).await
+}
 
 async fn deliver_outboxed_image(
     config: &AgentConfig,
@@ -485,13 +510,68 @@ async fn deliver_outboxed_image(
     client: &PlatformWorker,
     room_id: &str,
     artifact: &ImageArtifact,
-) -> Result<()> { outbox::deliver_image(config, task, client, room_id, artifact).await }
+) -> Result<()> {
+    outbox::deliver_image(config, task, client, room_id, artifact).await
+}
 
 async fn drain_outbox(
     config: &AgentConfig,
     store: &SqliteStateStore,
     client: &PlatformWorker,
-) -> Result<()> { outbox::drain(config, store, client).await }
+) -> Result<()> {
+    outbox::drain(config, store, client).await
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DailyBudgetState {
+    pub(crate) media_decode_limit: Option<usize>,
+}
+
+pub(crate) fn daily_budget_state(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    room_id: &str,
+    now: DateTime<Utc>,
+    image_requested: bool,
+) -> Result<DailyBudgetState> {
+    if !config.budget.enabled {
+        return Ok(DailyBudgetState {
+            media_decode_limit: None,
+        });
+    }
+    let local = now.with_timezone(&Local);
+    let day_start = Local
+        .from_local_datetime(
+            &local
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid"),
+        )
+        .earliest()
+        .unwrap_or(local)
+        .with_timezone(&Utc);
+    let usage = store.daily_usage(room_id, day_start)?;
+    let policy = config.room_policy(room_id);
+    let summary_limit = policy
+        .daily_summary_limit
+        .unwrap_or(config.budget.daily_summary_limit);
+    let image_limit = policy
+        .daily_image_limit
+        .unwrap_or(config.budget.daily_image_limit);
+    let media_limit = policy
+        .daily_media_limit
+        .unwrap_or(config.budget.daily_media_limit);
+    if summary_limit > 0 && usage.tasks >= summary_limit {
+        anyhow::bail!("该群今日总结额度已用完（{}/{summary_limit}）", usage.tasks);
+    }
+    if image_requested && image_limit > 0 && usage.images >= image_limit {
+        anyhow::bail!("该群今日图片额度已用完（{}/{image_limit}）", usage.images);
+    }
+    Ok(DailyBudgetState {
+        media_decode_limit: (media_limit > 0)
+            .then(|| media_limit.saturating_sub(usage.media) as usize),
+    })
+}
 
 fn record_image_cooldown_success(
     config: &AgentConfig,
@@ -540,22 +620,95 @@ fn config_revision(config: &AgentConfig) -> String {
     )
 }
 
+/// Skip a known-unhealthy primary provider before spending another request
+/// timeout. The regular client still retains the remaining fallback chain.
+pub(crate) fn routed_llm_config(
+    config: &AgentConfig,
+    store: Option<&SqliteStateStore>,
+) -> (LlmConfig, bool) {
+    let primary_key = format!(
+        "{}:{}",
+        config.llm.provider,
+        config.llm.model.as_deref().unwrap_or("default")
+    );
+    let circuit_open = store
+        .and_then(|store| store.provider_health().ok())
+        .and_then(|entries| {
+            entries
+                .into_iter()
+                .find(|entry| entry.capability == "llm" && entry.provider_key == primary_key)
+        })
+        .and_then(|entry| entry.circuit_open_until)
+        .is_some_and(|until| until > Utc::now());
+    if !circuit_open {
+        return (config.llm.clone(), false);
+    }
+
+    let Some((index, fallback)) = config
+        .llm
+        .fallbacks
+        .iter()
+        .enumerate()
+        .find(|(_, fallback)| !fallback.provider.trim().is_empty())
+    else {
+        return (config.llm.clone(), false);
+    };
+
+    let mut routed = config.llm.clone();
+    routed.provider = fallback.provider.clone();
+    if fallback.api_key.is_some() {
+        routed.api_key = fallback.api_key.clone();
+        routed.api_keys.clear();
+    }
+    if !fallback.api_keys.is_empty() {
+        routed.api_keys = fallback.api_keys.clone();
+        routed.api_key = None;
+    }
+    if fallback.base_url.is_some() {
+        routed.base_url = fallback.base_url.clone();
+    }
+    if fallback.model.is_some() {
+        routed.model = fallback.model.clone();
+    }
+    if !fallback.request_body_overrides.is_empty() {
+        routed.request_body_overrides = fallback.request_body_overrides.clone();
+    }
+    routed.fallbacks = config.llm.fallbacks[index + 1..].to_vec();
+    (routed, true)
+}
+
 fn record_primary_llm_health(store: &SqliteStateStore, config: &AgentConfig, error: Option<&str>) {
     let provider_key = format!(
         "{}:{}",
         config.llm.provider,
         config.llm.model.as_deref().unwrap_or("default")
     );
+    let existing = store.provider_health().ok().and_then(|entries| {
+        entries
+            .into_iter()
+            .find(|entry| entry.capability == "llm" && entry.provider_key == provider_key)
+    });
+    // A successful fallback must not accidentally close the primary's circuit.
+    if error.is_none()
+        && existing
+            .as_ref()
+            .and_then(|entry| entry.circuit_open_until)
+            .is_some_and(|until| until > Utc::now())
+    {
+        return;
+    }
     let failures = if error.is_some() {
-        store
-            .provider_health()
-            .ok()
-            .and_then(|entries| entries.into_iter().find(|entry| entry.capability == "llm" && entry.provider_key == provider_key))
+        existing
+            .as_ref()
             .map(|entry| entry.consecutive_failures.saturating_add(1))
             .unwrap_or(1)
-    } else { 0 };
+    } else {
+        0
+    };
     let circuit_open_until = (failures >= 3).then(|| Utc::now() + Duration::minutes(5));
-    if let Err(update_error) = store.update_provider_health("llm", &provider_key, failures, circuit_open_until, error) {
+    if let Err(update_error) =
+        store.update_provider_health("llm", &provider_key, failures, circuit_open_until, error)
+    {
         warn!(error = %update_error, "failed to persist LLM provider health");
     }
 }
@@ -616,32 +769,71 @@ async fn run_weekly_group_report(
     for room_id in &group.rooms {
         let report_id = store.create_weekly_metric(group_name, room_id)?;
         let task = OperationalTask {
-            id: store.create_task(NewTask {
-                room_id,
-                source: "weekly_report",
-                since,
-                until: Utc::now(),
-                config_revision: &config_revision(config),
-                retry_of: None,
-            })?.id,
+            id: store
+                .create_task(NewTask {
+                    room_id,
+                    source: "weekly_report",
+                    since,
+                    until: Utc::now(),
+                    config_revision: &config_revision(config),
+                    retry_of: None,
+                })?
+                .id,
             store: store.clone(),
         };
-        task.set_stage(TaskState::Running, "weekly_chart", Some(&stats), None, weekly.tasks as u64, weekly.media);
+        task.set_stage(
+            TaskState::Running,
+            "weekly_chart",
+            Some(&stats),
+            None,
+            weekly.tasks as u64,
+            weekly.media,
+        );
         let outcome = async {
             let artifact = summary_image::generate(config, room_id, &stats, None).await?;
             deliver_outboxed_image(config, &task, client, room_id, &artifact).await?;
-            let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。", weekly.tasks, weekly.succeeded, weekly.failed);
+            let caption = format!(
+                "群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。",
+                weekly.tasks, weekly.succeeded, weekly.failed
+            );
             deliver_outboxed_text(config, &task, client, room_id, &caption).await?;
-            store.update_weekly_metric(&report_id, "succeeded", Some(&caption), Some(&artifact.path), None)?;
-            task.set_stage(TaskState::Succeeded, "weekly_chart_delivered", Some(&caption), None, weekly.tasks as u64, weekly.media);
+            store.update_weekly_metric(
+                &report_id,
+                "succeeded",
+                Some(&caption),
+                Some(&artifact.path),
+                None,
+            )?;
+            task.set_stage(
+                TaskState::Succeeded,
+                "weekly_chart_delivered",
+                Some(&caption),
+                None,
+                weekly.tasks as u64,
+                weekly.media,
+            );
             Ok::<(), anyhow::Error>(())
-        }.await;
+        }
+        .await;
         if let Err(error) = outcome {
             let error_message = format_error_chain(&error);
             let caption = format!("群组周报：近 7 天共 {} 次总结，成功 {} 次，失败 {} 次。统计图生成失败，已降级为文字统计。", weekly.tasks, weekly.succeeded, weekly.failed);
             let _ = deliver_outboxed_text(config, &task, client, room_id, &caption).await;
-            store.update_weekly_metric(&report_id, "degraded", Some(&caption), None, Some(&error_message))?;
-            task.set_stage(TaskState::Succeeded, "weekly_text_fallback", Some(&caption), Some(&error_message), weekly.tasks as u64, weekly.media);
+            store.update_weekly_metric(
+                &report_id,
+                "degraded",
+                Some(&caption),
+                None,
+                Some(&error_message),
+            )?;
+            task.set_stage(
+                TaskState::Succeeded,
+                "weekly_text_fallback",
+                Some(&caption),
+                Some(&error_message),
+                weekly.tasks as u64,
+                weekly.media,
+            );
         }
     }
     Ok(())
@@ -1301,6 +1493,7 @@ mod tests {
                 target_platform: PlatformKindConfig::Wx4py,
                 range_minutes: Some(60),
                 image_token_present: false,
+                preview_only: false,
             })
         );
     }
@@ -1319,6 +1512,7 @@ mod tests {
                 target_platform: PlatformKindConfig::Wx4py,
                 range_minutes: Some(60),
                 image_token_present: false,
+                preview_only: false,
             })
         );
     }
@@ -1362,6 +1556,7 @@ mod tests {
                 target_platform: PlatformKindConfig::Discord,
                 range_minutes: Some(120),
                 image_token_present: false,
+                preview_only: false,
             }
         );
     }
@@ -1376,6 +1571,7 @@ mod tests {
                 target_platform: PlatformKindConfig::Wx4py,
                 range_minutes: Some(24 * 60),
                 image_token_present: false,
+                preview_only: false,
             }
         );
     }
@@ -1403,6 +1599,7 @@ mod tests {
                 target_platform: PlatformKindConfig::Discord,
                 range_minutes: None,
                 image_token_present: false,
+                preview_only: false,
             }
         );
     }
@@ -1417,6 +1614,7 @@ mod tests {
                     target_platform: PlatformKindConfig::Wx4py,
                     range_minutes: None,
                     image_token_present: true,
+                    preview_only: false,
                 }
             );
         }
@@ -1433,6 +1631,7 @@ mod tests {
                 target_platform: PlatformKindConfig::Wx4py,
                 range_minutes: Some(24 * 60),
                 image_token_present: true,
+                preview_only: false,
             }
         );
     }
@@ -1447,6 +1646,7 @@ mod tests {
                 target_platform: PlatformKindConfig::Discord,
                 range_minutes: Some(60),
                 image_token_present: true,
+                preview_only: false,
             }
         );
     }
@@ -2116,8 +2316,8 @@ mod tests {
         config.image_gen.enabled = true;
         config.manual_summary.image_by_default = false;
 
-        assert!(!PipelineOptions::manual(&config, "test-room", false).image_gen_enabled);
-        assert!(PipelineOptions::manual(&config, "test-room", true).image_gen_enabled);
+        assert!(!PipelineOptions::manual(&config, "test-room", false, false).image_gen_enabled);
+        assert!(PipelineOptions::manual(&config, "test-room", true, false).image_gen_enabled);
     }
 
     #[test]
@@ -2126,15 +2326,15 @@ mod tests {
         config.image_gen.enabled = true;
         config.manual_summary.image_by_default = true;
 
-        assert!(PipelineOptions::manual(&config, "test-room", false).image_gen_enabled);
-        assert!(!PipelineOptions::manual(&config, "test-room", true).image_gen_enabled);
+        assert!(PipelineOptions::manual(&config, "test-room", false, false).image_gen_enabled);
+        assert!(!PipelineOptions::manual(&config, "test-room", true, false).image_gen_enabled);
     }
 
     #[test]
     fn manual_pipeline_logs_retry_attempts() {
         let config = test_config();
 
-        assert!(PipelineOptions::manual(&config, "test-room", false).log_retry_attempts);
+        assert!(PipelineOptions::manual(&config, "test-room", false, false).log_retry_attempts);
     }
 
     #[test]
@@ -2158,8 +2358,10 @@ mod tests {
             },
         );
 
-        assert!(!PipelineOptions::manual(&config, "text-only-room", false).image_gen_enabled);
-        assert!(PipelineOptions::manual(&config, "other-room", false).image_gen_enabled);
+        assert!(
+            !PipelineOptions::manual(&config, "text-only-room", false, false).image_gen_enabled
+        );
+        assert!(PipelineOptions::manual(&config, "other-room", false, false).image_gen_enabled);
         assert!(!PipelineOptions::scheduled(&config, "text-only-room").image_gen_enabled);
         assert!(PipelineOptions::scheduled(&config, "other-room").image_gen_enabled);
     }
@@ -2222,6 +2424,49 @@ mod tests {
             "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn routed_llm_config_skips_an_open_primary_circuit() {
+        let mut config = test_config();
+        config
+            .llm
+            .fallbacks
+            .push(wechat_summary_core::config::ProviderFallbackConfig {
+                provider: "backup-provider".to_string(),
+                api_key: Some("backup-key".to_string()),
+                api_keys: Vec::new(),
+                base_url: Some("https://backup.invalid/v1".to_string()),
+                model: Some("backup-model".to_string()),
+                request_body_overrides: Default::default(),
+            });
+        let store = SqliteStateStore::in_memory().unwrap();
+        store
+            .update_provider_health(
+                "llm",
+                "openai_compatible:default",
+                3,
+                Some(Utc::now() + Duration::minutes(5)),
+                Some("timeout"),
+            )
+            .unwrap();
+
+        let (routed, bypassed) = routed_llm_config(&config, Some(&store));
+        assert!(bypassed);
+        assert_eq!(routed.provider, "backup-provider");
+        assert_eq!(routed.model.as_deref(), Some("backup-model"));
+        assert_eq!(routed.api_key.as_deref(), Some("backup-key"));
+    }
+
+    #[test]
+    fn trigger_authorization_only_blocks_when_enabled() {
+        let mut config = test_config();
+        assert!(config.trigger_user_allowed("测试群", "any-user"));
+
+        config.listen.require_allowed_users = true;
+        config.listen.allowed_users = vec!["approved-user".to_string()];
+        assert!(config.trigger_user_allowed("测试群", "approved-user"));
+        assert!(!config.trigger_user_allowed("测试群", "other-user"));
     }
 
     fn incoming_text(content: &str) -> IncomingMessage {
