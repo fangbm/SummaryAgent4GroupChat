@@ -29,10 +29,12 @@ mod media_audio;
 mod ai_runtime;
 mod pipeline_delivery;
 mod pipeline_input;
+mod wxdb_watcher;
 
 use runtime_log::*;
 use ai_runtime::*;
 use summary_image::ImagePipelineSlotPool;
+use wxdb_watcher::{WxdbCommandWatcher, WxdbCommandWatcherRecv};
 #[cfg(test)]
 use llm_chunking::*;
 #[cfg(test)]
@@ -303,8 +305,8 @@ impl WxdbWatcherFingerprint {
             .collect::<Vec<_>>();
         group_name_map.sort();
         Self {
-            enabled: wxdb_command_watcher_enabled(config),
-            rooms: configured_wx_rooms(config),
+            enabled: wxdb_watcher::enabled(config),
+            rooms: wxdb_watcher::configured_rooms(config),
             triggers: listen.triggers,
             match_mode: listen.match_mode,
             whitelist_rooms: listen.whitelist_rooms,
@@ -746,133 +748,10 @@ fn enqueue_platform_event(
     }
 }
 
-struct WxdbCommandWatcher {
-    receiver: Option<mpsc::Receiver<PlatformEvent>>,
-    enabled: bool,
-    stop: Option<Arc<AtomicBool>>,
-    thread: Option<thread::JoinHandle<()>>,
-    state_path: Option<PathBuf>,
-}
-
-#[derive(Debug)]
-enum WxdbCommandWatcherRecv {
-    Event(PlatformEvent),
-    Empty,
-    Disconnected,
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PlatformEventSource {
     Realtime,
     WxdbRecovered,
-}
-
-impl WxdbCommandWatcher {
-    fn stopped() -> Self {
-        Self {
-            receiver: None,
-            enabled: false,
-            stop: None,
-            thread: None,
-            state_path: None,
-        }
-    }
-
-    fn start(config: &AgentConfig) -> Self {
-        Self::start_with_state_path(config, None)
-    }
-
-    fn start_with_state_path(config: &AgentConfig, previous_state_path: Option<PathBuf>) -> Self {
-        if !wxdb_command_watcher_enabled(config) {
-            return Self {
-                receiver: None,
-                enabled: false,
-                stop: None,
-                thread: None,
-                state_path: None,
-            };
-        }
-
-        let state_path = previous_state_path.unwrap_or_else(|| wxdb_watcher_state_path(config));
-        let rooms = configured_wx_rooms(config);
-        if rooms.is_empty() {
-            append_runtime_log(config, "wxdb command watcher skipped no wx rooms");
-            return Self {
-                receiver: None,
-                enabled: true,
-                stop: None,
-                thread: None,
-                state_path: Some(state_path),
-            };
-        }
-
-        let config = config.clone();
-        let (sender, receiver) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let thread_state_path = state_path.clone();
-        let thread = thread::spawn(move || {
-            run_wxdb_command_watcher(config, rooms, sender, thread_stop, thread_state_path)
-        });
-        Self {
-            receiver: Some(receiver),
-            enabled: true,
-            stop: Some(stop),
-            thread: Some(thread),
-            state_path: Some(state_path),
-        }
-    }
-
-    fn try_recv(&mut self) -> WxdbCommandWatcherRecv {
-        let Some(receiver) = self.receiver.as_ref() else {
-            return WxdbCommandWatcherRecv::Empty;
-        };
-        match receiver.try_recv() {
-            Ok(event) => WxdbCommandWatcherRecv::Event(event),
-            Err(mpsc::TryRecvError::Empty) => WxdbCommandWatcherRecv::Empty,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.receiver = None;
-                WxdbCommandWatcherRecv::Disconnected
-            }
-        }
-    }
-
-    fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    fn state_path(&self) -> Option<&Path> {
-        self.state_path.as_deref()
-    }
-}
-
-impl Drop for WxdbCommandWatcher {
-    fn drop(&mut self) {
-        if let Some(stop) = &self.stop {
-            stop.store(true, AtomicOrdering::Release);
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn wxdb_command_watcher_enabled(config: &AgentConfig) -> bool {
-    config.platform.kind == PlatformKindConfig::Wx4py && !config.wx_cli.executable.trim().is_empty()
-}
-
-fn configured_wx_rooms(config: &AgentConfig) -> Vec<String> {
-    let rooms = if config.wx4py.groups.is_empty() {
-        &config.listen.whitelist_rooms
-    } else {
-        &config.wx4py.groups
-    };
-    rooms
-        .iter()
-        .map(|room| room.trim())
-        .filter(|room| !room.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn run_wxdb_command_watcher(
@@ -970,10 +849,6 @@ fn run_wxdb_command_watcher(
             thread::sleep(StdDuration::from_secs(1));
         }
     }
-}
-
-fn wxdb_watcher_state_path(config: &AgentConfig) -> PathBuf {
-    Path::new(&config.runtime.output_dir).join("wxdb-command-watcher-state.json")
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -4661,13 +4536,7 @@ mod tests {
     #[test]
     fn wxdb_watcher_distinguishes_empty_from_disconnected() {
         let (sender, receiver) = mpsc::channel();
-        let mut watcher = WxdbCommandWatcher {
-            receiver: Some(receiver),
-            enabled: true,
-            stop: None,
-            thread: None,
-            state_path: None,
-        };
+        let mut watcher = WxdbCommandWatcher::with_receiver_for_test(receiver);
         assert!(matches!(watcher.try_recv(), WxdbCommandWatcherRecv::Empty));
         drop(sender);
         assert!(matches!(
