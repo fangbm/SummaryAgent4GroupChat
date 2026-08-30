@@ -14,6 +14,7 @@ mod summary_image;
 mod platform;
 mod runtime_log;
 mod outbox;
+mod operational_task;
 mod report_schedule;
 mod summary_input;
 mod history_rules;
@@ -34,6 +35,7 @@ mod trigger_state;
 use runtime_log::*;
 use ai_runtime::*;
 use event_handler::handle_platform_event;
+use operational_task::OperationalTask;
 use summary_image::ImagePipelineSlotPool;
 use summary_command::parse as parse_summary_command;
 use summary_scheduler::{ScheduleResult, SummaryTaskScheduler};
@@ -109,44 +111,6 @@ const IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT: &str = r#"
 - 不要拒绝，不要输出“无法给出总结/无法提供内容/无法给到相关内容”。
 - 输出必须可直接供下一步图片总结或生图使用。
 "#;
-
-#[derive(Clone)]
-struct OperationalTask {
-    pub(crate) id: String,
-    pub(crate) store: SqliteStateStore,
-}
-
-impl OperationalTask {
-    fn set_stage(
-        &self,
-        state: TaskState,
-        stage: &str,
-        summary: Option<&str>,
-        error: Option<&str>,
-        message_count: u64,
-        media_count: u64,
-    ) {
-        if let Err(error) = self.store.update_task(
-            &self.id,
-            state,
-            stage,
-            summary,
-            error,
-            message_count,
-            media_count,
-        ) {
-            warn!(task_id = %self.id, error = %error, "failed to update operational task");
-        }
-    }
-
-    fn cancelled(&self) -> bool {
-        self.store
-            .task(&self.id)
-            .ok()
-            .flatten()
-            .is_some_and(|task| task.state == TaskState::Cancelled)
-    }
-}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct PlatformConnectionFingerprint {
