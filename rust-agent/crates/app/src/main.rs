@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     env, fs,
     future::Future,
     path::{Path, PathBuf},
@@ -28,11 +28,13 @@ mod pipeline_input;
 mod wxdb_watcher;
 mod runtime_artifacts;
 mod summary_command;
+mod trigger_state;
 
 use runtime_log::*;
 use ai_runtime::*;
 use summary_image::ImagePipelineSlotPool;
 use summary_command::parse as parse_summary_command;
+use trigger_state::{RecentObservedMessages, RecentTriggerAttempts};
 #[cfg(test)]
 use summary_command::{parse_args as parse_summary_command_args, SummaryCommand};
 use wxdb_watcher::{WxdbCommandWatcher, WxdbCommandWatcherRecv};
@@ -1363,169 +1365,6 @@ async fn handle_platform_event(
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct RecentTriggerAttempts {
-    attempts_by_key: HashMap<String, Vec<RecentTriggerAttempt>>,
-}
-
-#[derive(Debug, Clone)]
-struct RecentTriggerAttempt {
-    stable_id: Option<String>,
-    event_at: DateTime<Utc>,
-    observed_at: DateTime<Utc>,
-}
-
-impl RecentTriggerAttempts {
-    #[cfg(test)]
-    fn is_duplicate_at(
-        &mut self,
-        trigger: &TriggerMatch,
-        event_at: DateTime<Utc>,
-        observed_at: DateTime<Utc>,
-    ) -> bool {
-        self.is_duplicate_at_with_id(trigger, None, event_at, observed_at)
-    }
-
-    fn is_duplicate_with_id(
-        &mut self,
-        trigger: &TriggerMatch,
-        stable_id: Option<&str>,
-        event_at: DateTime<Utc>,
-    ) -> bool {
-        self.is_duplicate_at_with_id(trigger, stable_id, event_at, Utc::now())
-    }
-
-    fn is_duplicate_at_with_id(
-        &mut self,
-        trigger: &TriggerMatch,
-        stable_id: Option<&str>,
-        event_at: DateTime<Utc>,
-        observed_at: DateTime<Utc>,
-    ) -> bool {
-        let retention_cutoff = observed_at - Duration::seconds(TRIGGER_DEDUPE_RETENTION_SECONDS);
-        self.attempts_by_key.retain(|_, attempts| {
-            attempts.retain(|attempt| attempt.observed_at >= retention_cutoff);
-            !attempts.is_empty()
-        });
-
-        let process_cutoff = observed_at - Duration::seconds(TRIGGER_DEDUPE_WINDOW_SECONDS);
-        let key = trigger_attempt_key(trigger);
-        if let Some(attempts) = self.attempts_by_key.get(&key) {
-            let duplicate = attempts.iter().any(|attempt| {
-                match (stable_id, attempt.stable_id.as_deref()) {
-                    // When both transports provide stable IDs, distinct IDs
-                    // represent distinct commands even if they arrive close together.
-                    (Some(current), Some(previous)) => stable_ids_match(previous, current),
-                    // wx4py realtime events can omit their ID while wxdb has one
-                    // (and vice versa). Fall back to the room/content key and a
-                    // bounded arrival-time window so the late replay is ignored.
-                    _ => {
-                        attempt.observed_at >= process_cutoff
-                            || event_times_close(attempt.event_at, event_at)
-                    }
-                }
-            });
-            if duplicate {
-                return true;
-            }
-        }
-
-        self.attempts_by_key
-            .entry(key)
-            .or_default()
-            .push(RecentTriggerAttempt {
-                stable_id: stable_id.map(ToOwned::to_owned),
-                event_at,
-                observed_at,
-            });
-        false
-    }
-}
-
-fn event_times_close(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
-    let delta = (left - right).num_seconds();
-    (-TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS..=TRIGGER_DEDUPE_EVENT_WINDOW_SECONDS).contains(&delta)
-}
-
-fn trigger_attempt_key(trigger: &TriggerMatch) -> String {
-    format!(
-        "{}\n{}",
-        trigger.room_id.trim(),
-        trigger.trigger_content.trim()
-    )
-}
-
-#[derive(Debug, Clone, Default)]
-struct RecentObservedMessages {
-    messages: VecDeque<IncomingMessage>,
-}
-
-impl RecentObservedMessages {
-    fn record(&mut self, message: &IncomingMessage, now: DateTime<Utc>) {
-        if message.msg_type != "text" || message.content.trim().is_empty() {
-            return;
-        }
-
-        self.messages.push_back(message.clone());
-        self.prune(now);
-    }
-
-    fn count_user_text_in_range(
-        &self,
-        room_id: &str,
-        since: DateTime<Utc>,
-        until: DateTime<Utc>,
-        incoming: &IncomingMessage,
-    ) -> usize {
-        self.messages
-            .iter()
-            .filter(|message| {
-                message.room_id == room_id
-                    && message.timestamp >= since
-                    && message.timestamp <= until
-                    && message.msg_type == "text"
-                    && !message.is_self
-                    && !message.content.trim().is_empty()
-                    && !history_rules::is_current_incoming(message, incoming)
-                    && !history_rules::is_agent_status_content(&message.content)
-            })
-            .count()
-    }
-
-    fn has_matching_trigger(
-        &self,
-        trigger: &TriggerMatch,
-        incoming: &IncomingMessage,
-        now: DateTime<Utc>,
-        window_seconds: i64,
-    ) -> bool {
-        let cutoff = now - Duration::seconds(window_seconds);
-        let target_content = trigger.trigger_content.trim();
-        self.messages.iter().any(|message| {
-            let same_stable_id = message
-                .stable_id
-                .as_deref()
-                .zip(incoming.stable_id.as_deref())
-                .is_some_and(|(left, right)| stable_ids_match(left, right));
-            message.timestamp >= cutoff
-                && message.room_id == trigger.room_id
-                && message.msg_type == "text"
-                && !message.is_self
-                && (same_stable_id
-                    || (incoming.stable_id.is_none()
-                        && message.stable_id.is_none()
-                        && message.content.trim() == target_content))
-        })
-    }
-
-    fn prune(&mut self, now: DateTime<Utc>) {
-        let cutoff = now - Duration::hours(RECENT_OBSERVED_WINDOW_HOURS);
-        self.messages.retain(|message| message.timestamp >= cutoff);
-        while self.messages.len() > RECENT_OBSERVED_MAX_MESSAGES {
-            self.messages.pop_front();
-        }
-    }
-}
 
 fn drain_scheduled_backlog(
     config: &AgentConfig,
