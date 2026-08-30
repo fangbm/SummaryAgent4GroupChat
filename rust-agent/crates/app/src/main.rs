@@ -2,10 +2,8 @@ use std::{
     cmp::Ordering,
     collections::{HashSet, VecDeque},
     env, fs,
-    future::Future,
     path::{Path, PathBuf},
-    pin::Pin,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant, SystemTime},
 };
 
@@ -28,15 +26,19 @@ mod pipeline_input;
 mod wxdb_watcher;
 mod runtime_artifacts;
 mod summary_command;
+mod summary_scheduler;
 mod trigger_state;
 
 use runtime_log::*;
 use ai_runtime::*;
 use summary_image::ImagePipelineSlotPool;
 use summary_command::parse as parse_summary_command;
+use summary_scheduler::{ScheduleResult, SummaryTaskScheduler};
 use trigger_state::{RecentObservedMessages, RecentTriggerAttempts};
 #[cfg(test)]
 use summary_command::{parse_args as parse_summary_command_args, SummaryCommand};
+#[cfg(test)]
+use std::sync::mpsc;
 use wxdb_watcher::{WxdbCommandWatcher, WxdbCommandWatcherRecv};
 #[cfg(test)]
 use llm_chunking::*;
@@ -49,7 +51,6 @@ use summary_image::ImagePipelineStage;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
-use tokio::task::JoinSet;
 #[cfg(test)]
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -105,13 +106,6 @@ const IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT: &str = r#"
 - 输出必须可直接供下一步图片总结或生图使用。
 "#;
 
-type SummaryFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
-
-struct PendingSummaryTask {
-    room_id: String,
-    future: SummaryFuture,
-}
-
 #[derive(Clone)]
 struct OperationalTask {
     pub(crate) id: String,
@@ -148,21 +142,6 @@ impl OperationalTask {
             .flatten()
             .is_some_and(|task| task.state == TaskState::Cancelled)
     }
-}
-
-struct SummaryTaskScheduler {
-    max_concurrency: usize,
-    pending_capacity: usize,
-    in_flight: HashSet<String>,
-    pending: VecDeque<PendingSummaryTask>,
-    tasks: JoinSet<()>,
-    completion_sender: mpsc::Sender<(String, Result<()>)>,
-    completion_receiver: mpsc::Receiver<(String, Result<()>)>,
-}
-
-struct SummaryTaskCompletion {
-    room_id: Option<String>,
-    sender: mpsc::Sender<(String, Result<()>)>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -335,102 +314,6 @@ struct PlatformRuntime {
     watcher_fingerprint: WxdbWatcherFingerprint,
     watcher_restart_at: Option<Instant>,
     reconnect_at: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ScheduleResult {
-    Started,
-    Queued,
-    DuplicateRoom,
-    QueueFull,
-}
-
-impl SummaryTaskCompletion {
-    fn finish(mut self, result: Result<()>) {
-        if let Some(room_id) = self.room_id.take() {
-            let _ = self.sender.send((room_id, result));
-        }
-    }
-}
-
-impl Drop for SummaryTaskCompletion {
-    fn drop(&mut self) {
-        if let Some(room_id) = self.room_id.take() {
-            let _ = self.sender.send((
-                room_id,
-                Err(anyhow::anyhow!("summary task aborted or panicked")),
-            ));
-        }
-    }
-}
-
-impl SummaryTaskScheduler {
-    fn new(max_concurrency: usize, pending_capacity: usize) -> Self {
-        let (completion_sender, completion_receiver) = mpsc::channel();
-        Self {
-            max_concurrency: max_concurrency.max(1),
-            pending_capacity,
-            in_flight: HashSet::new(),
-            pending: VecDeque::new(),
-            tasks: JoinSet::new(),
-            completion_sender,
-            completion_receiver,
-        }
-    }
-
-    fn enqueue(&mut self, room_id: String, future: SummaryFuture) -> ScheduleResult {
-        if self.in_flight.contains(&room_id) {
-            return ScheduleResult::DuplicateRoom;
-        }
-        if self.tasks.len() >= self.max_concurrency && self.pending.len() >= self.pending_capacity {
-            return ScheduleResult::QueueFull;
-        }
-        self.in_flight.insert(room_id.clone());
-        if self.tasks.len() < self.max_concurrency {
-            self.spawn(room_id, future);
-            ScheduleResult::Started
-        } else {
-            self.pending
-                .push_back(PendingSummaryTask { room_id, future });
-            ScheduleResult::Queued
-        }
-    }
-
-    fn reap(&mut self, config: &AgentConfig) {
-        while let Ok((room_id, result)) = self.completion_receiver.try_recv() {
-            self.in_flight.remove(&room_id);
-            if let Err(error) = result {
-                let error_message = format_error_chain(&error);
-                error!(room_id, error = %error_message, "summary task failed");
-                append_runtime_log(
-                    config,
-                    &format!("summary task failed room={room_id} error={error_message}"),
-                );
-            }
-        }
-        while let Some(result) = self.tasks.try_join_next() {
-            if let Err(error) = result {
-                warn!(error = %error, "summary task join failed");
-            }
-        }
-        while self.tasks.len() < self.max_concurrency {
-            let Some(task) = self.pending.pop_front() else {
-                break;
-            };
-            self.spawn(task.room_id, task.future);
-        }
-    }
-
-    fn spawn(&mut self, room_id: String, future: SummaryFuture) {
-        let completion = SummaryTaskCompletion {
-            room_id: Some(room_id),
-            sender: self.completion_sender.clone(),
-        };
-        self.tasks.spawn(async move {
-            let result = future.await;
-            completion.finish(result);
-        });
-    }
 }
 
 #[tokio::main]
@@ -3919,8 +3802,8 @@ mod tests {
         release_sender.send(()).unwrap();
         tokio::task::yield_now().await;
         scheduler.reap(&test_config());
-        assert_eq!(scheduler.pending.len(), 0);
-        assert!(scheduler.in_flight.contains("room-b"));
+        assert_eq!(scheduler.pending_len(), 0);
+        assert!(scheduler.is_in_flight("room-b"));
     }
 
     #[tokio::test]
@@ -3935,7 +3818,7 @@ mod tests {
         );
         tokio::task::yield_now().await;
         scheduler.reap(&test_config());
-        assert!(!scheduler.in_flight.contains("room-error"));
+        assert!(!scheduler.is_in_flight("room-error"));
 
         assert_eq!(
             scheduler.enqueue(
@@ -3946,7 +3829,7 @@ mod tests {
         );
         tokio::task::yield_now().await;
         scheduler.reap(&test_config());
-        assert!(!scheduler.in_flight.contains("room-panic"));
+        assert!(!scheduler.is_in_flight("room-panic"));
 
         assert_eq!(
             scheduler.enqueue("room-after-failure".to_string(), Box::pin(async { Ok(()) })),
