@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -27,6 +27,7 @@ mod wxdb_watcher;
 mod runtime_artifacts;
 mod summary_command;
 mod summary_scheduler;
+mod scheduled_backlog;
 mod trigger_state;
 
 use runtime_log::*;
@@ -34,6 +35,7 @@ use ai_runtime::*;
 use summary_image::ImagePipelineSlotPool;
 use summary_command::parse as parse_summary_command;
 use summary_scheduler::{ScheduleResult, SummaryTaskScheduler};
+use scheduled_backlog::{ScheduledSummaryBacklog, ScheduledSummaryRequest};
 use trigger_state::{RecentObservedMessages, RecentTriggerAttempts};
 #[cfg(test)]
 use summary_command::{parse_args as parse_summary_command_args, SummaryCommand};
@@ -141,66 +143,6 @@ impl OperationalTask {
             .ok()
             .flatten()
             .is_some_and(|task| task.state == TaskState::Cancelled)
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct ScheduledSummaryRequest {
-    room_id: String,
-    range: ResolvedTimeRange,
-    due_at: DateTime<Utc>,
-}
-
-#[derive(Default)]
-struct ScheduledSummaryBacklog {
-    requests: VecDeque<ScheduledSummaryRequest>,
-    next_retry_at: Option<Instant>,
-    retry_delay: StdDuration,
-}
-
-impl ScheduledSummaryBacklog {
-    fn add_rooms(
-        &mut self,
-        rooms: impl IntoIterator<Item = String>,
-        range: ResolvedTimeRange,
-        due_at: DateTime<Utc>,
-    ) {
-        for room_id in rooms {
-            if !self
-                .requests
-                .iter()
-                .any(|request| request.room_id == room_id)
-            {
-                self.requests.push_back(ScheduledSummaryRequest {
-                    room_id,
-                    range: range.clone(),
-                    due_at,
-                });
-            }
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.requests.is_empty()
-    }
-
-    fn retry_ready(&self, now: Instant) -> bool {
-        self.next_retry_at.is_none_or(|retry_at| now >= retry_at)
-    }
-
-    fn record_retry(&mut self, now: Instant) {
-        let delay = if self.retry_delay.is_zero() {
-            StdDuration::from_secs(1)
-        } else {
-            self.retry_delay.min(StdDuration::from_secs(30))
-        };
-        self.next_retry_at = Some(now + delay);
-        self.retry_delay = (delay * 2).min(StdDuration::from_secs(30));
-    }
-
-    fn clear_retry(&mut self) {
-        self.next_retry_at = None;
-        self.retry_delay = StdDuration::ZERO;
     }
 }
 
@@ -407,8 +349,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 platform.restart_watcher(config, "configuration changed");
             }
             if !config.scheduled_summary.enabled {
-                scheduled_backlog.requests.clear();
-                scheduled_backlog.clear_retry();
+                scheduled_backlog.clear();
             }
             next_scheduled_run = next_scheduled_run_after(Utc::now(), config);
             next_weekly_runs = report_schedule::schedule(Utc::now(), config);
@@ -1262,7 +1203,7 @@ fn drain_scheduled_backlog(
     }
 
     let mut queue_full = false;
-    while let Some(request) = backlog.requests.pop_front() {
+    while let Some(request) = backlog.pop_next() {
         let room = request.room_id.clone();
         let now = request.due_at;
         if !config.scheduled_summary.ignore_rate_limit {
@@ -1332,7 +1273,7 @@ fn drain_scheduled_backlog(
         match scheduler.enqueue(room.clone(), future) {
             ScheduleResult::Started | ScheduleResult::Queued => {}
             ScheduleResult::DuplicateRoom => {
-                backlog.requests.push_back(request);
+                backlog.requeue_back(request);
                 append_runtime_log(
                     config,
                     &format!("scheduled summary pending room={room} reason=in_flight"),
@@ -1340,7 +1281,7 @@ fn drain_scheduled_backlog(
             }
             ScheduleResult::QueueFull => {
                 queue_full = true;
-                backlog.requests.push_back(request);
+                backlog.requeue_back(request);
                 append_runtime_log(
                     config,
                     &format!("scheduled summary pending room={room} reason=queue_full"),
@@ -1348,7 +1289,7 @@ fn drain_scheduled_backlog(
             }
         }
     }
-    if queue_full || !backlog.requests.is_empty() {
+    if queue_full || backlog.has_pending() {
         backlog.record_retry(Instant::now());
     } else {
         backlog.clear_retry();
@@ -1359,7 +1300,7 @@ fn requeue_scheduled_request_after_state_read_failure(
     backlog: &mut ScheduledSummaryBacklog,
     request: ScheduledSummaryRequest,
 ) {
-    backlog.requests.push_front(request);
+    backlog.requeue_front(request);
     backlog.record_retry(Instant::now());
 }
 
@@ -3711,14 +3652,7 @@ mod tests {
             now,
         );
         backlog.add_rooms(vec!["room-a".to_string()], range, now);
-        assert_eq!(
-            backlog
-                .requests
-                .iter()
-                .map(|request| request.room_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["room-a", "room-b"]
-        );
+        assert_eq!(backlog.room_ids(), vec!["room-a", "room-b"]);
         backlog.record_retry(Instant::now());
         assert!(!backlog.retry_ready(Instant::now()));
         backlog.clear_retry();
@@ -3738,16 +3672,14 @@ mod tests {
             due_at: now,
         };
         let expected = request.clone();
-        let mut backlog = ScheduledSummaryBacklog {
-            requests: VecDeque::from([request]),
-            ..Default::default()
-        };
-        let request = backlog.requests.pop_front().unwrap();
+        let mut backlog = ScheduledSummaryBacklog::default();
+        backlog.requeue_back(request);
+        let request = backlog.pop_next().unwrap();
 
         requeue_scheduled_request_after_state_read_failure(&mut backlog, request);
 
-        assert_eq!(backlog.requests.front(), Some(&expected));
-        assert!(backlog.next_retry_at.is_some());
+        assert_eq!(backlog.front(), Some(&expected));
+        assert!(backlog.has_retry_scheduled());
         assert!(!backlog.retry_ready(Instant::now()));
     }
 
