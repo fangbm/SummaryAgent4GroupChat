@@ -102,6 +102,7 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _imageRetryAttempts = "5";
     [ObservableProperty] private string _imageMaxConcurrentPerKey = "0";
     [ObservableProperty] private string _imagePromptTemplate = string.Empty;
+    [ObservableProperty] private string _imageRequestBodyOverridesJson = "{}";
     [ObservableProperty] private string _imagePipelineMaxConcurrentRequests = "0";
     [ObservableProperty] private string _imageSummaryTotalTimeoutSeconds = "240";
     [ObservableProperty] private string _imagePromptTotalTimeoutSeconds = "120";
@@ -415,6 +416,7 @@ public sealed partial class MainViewModel : ObservableObject
         ImageRetryAttempts = ReadString("image_gen", "retry_5xx_attempts", "5");
         ImageMaxConcurrentPerKey = ReadString("image_gen", "max_concurrent_per_key", "0");
         ImagePromptTemplate = ReadString("image_gen", "prompt_template", string.Empty);
+        ImageRequestBodyOverridesJson = SerializeConfigField("image_gen", "request_body_overrides");
         ImagePipelineMaxConcurrentRequests = ReadString("image_pipeline", "max_concurrent_requests", "0");
         ImageSummaryTotalTimeoutSeconds = ReadString("image_pipeline", "summary_total_timeout_seconds", "240");
         ImagePromptTotalTimeoutSeconds = ReadString("image_pipeline", "prompt_total_timeout_seconds", "120");
@@ -703,6 +705,14 @@ public sealed partial class MainViewModel : ObservableObject
             : "{}";
     }
 
+    private string SerializeConfigField(string section, string key)
+    {
+        var value = Section(section);
+        return value.ValueKind == JsonValueKind.Object && value.TryGetProperty(key, out var field)
+            ? JsonSerializer.Serialize(field, new JsonSerializerOptions { WriteIndented = true })
+            : "{}";
+    }
+
     private string SerializeProviderFallbacks()
     {
         var values = new Dictionary<string, JsonElement>();
@@ -768,6 +778,20 @@ public sealed partial class MainViewModel : ObservableObject
                 ["value"] = JsonSerializer.Deserialize<object>(property.Value.GetRawText()),
             });
         }
+    }
+
+    private void AddJsonObjectOperation(
+        List<Dictionary<string, object?>> operations,
+        string section,
+        string key,
+        string text)
+    {
+        using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(text) ? "{}" : text);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException($"{key} 必须是 JSON 对象。");
+        }
+        AddOperation(operations, [section], key, JsonSerializer.Deserialize<object>(document.RootElement.GetRawText()));
     }
 
     private async Task PollTaskCenterAsync(CancellationToken cancellationToken)
@@ -875,6 +899,7 @@ public sealed partial class MainViewModel : ObservableObject
         AddNumberIfChanged(operations, "image_gen", "retry_5xx_attempts", ImageRetryAttempts, 5);
         AddNumberIfChanged(operations, "image_gen", "max_concurrent_per_key", ImageMaxConcurrentPerKey, 0);
         AddOptionalIfChanged(operations, "image_gen", "prompt_template", ImagePromptTemplate);
+        AddJsonObjectOperation(operations, "image_gen", "request_body_overrides", ImageRequestBodyOverridesJson);
         AddNumberIfChanged(operations, "image_pipeline", "max_concurrent_requests", ImagePipelineMaxConcurrentRequests, 0);
         AddNumberIfChanged(operations, "image_pipeline", "summary_total_timeout_seconds", ImageSummaryTotalTimeoutSeconds, 240);
         AddNumberIfChanged(operations, "image_pipeline", "prompt_total_timeout_seconds", ImagePromptTotalTimeoutSeconds, 120);

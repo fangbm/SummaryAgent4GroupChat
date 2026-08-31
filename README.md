@@ -175,6 +175,24 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 
 四类模型均可单独设置 Provider、Key、Base URL、模型名、重试次数、并发数与请求体覆盖 JSON。媒体请求失败不会阻止纯文本聊天记录继续总结。
 
+### NovelAI 图片生成
+
+`[image_gen]` 的 `provider` 可设为 `novelai`（也兼容 `nai`）。它会调用 NovelAI 的 `POST /ai/generate-image`，使用持久化 API Token 的 Bearer 鉴权，并自动从 ZIP 响应中取出生成图片。留空 Base URL 与模型名时，分别默认 `https://image.novelai.net` 和 `nai-diffusion-5-full`。
+
+```toml
+[image_gen]
+provider = "novelai"
+api_keys = ["pst-your-novelai-persistent-token"]
+size = "2:3" # 也可填 16:9、1:1 或 1024x1024
+
+[image_gen.request_body_overrides.parameters]
+steps = 28
+sampler = "k_dpmpp_2m_sde"
+negative_prompt = "lowres, blurry, watermark"
+```
+
+WinUI 的“模型与媒体”页也提供同一组参数输入。NovelAI API Token 是账号凭据，请只填自己的持久化 Token，不要写入日志、截图或提交到仓库。
+
 ## 运行与排障
 
 GUI 的“运行信息”页包含主程序终端与日志尾部。默认日志路径为：

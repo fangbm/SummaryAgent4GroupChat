@@ -410,6 +410,9 @@ prompt_total_timeout_seconds = 120
 
 [image_gen]
 enabled = true
+# provider supports OpenAI-compatible interfaces and NovelAI: "openai" / "novelai".
+# NovelAI uses POST https://image.novelai.net/ai/generate-image and returns a ZIP image response.
+# Suggested NovelAI values: base_url = "https://image.novelai.net", model = "nai-diffusion-5-full".
 provider = "openai"
 # Optional persistent values. If left empty/commented, the *_env variables below are used.
 # api_key = ""
@@ -426,6 +429,12 @@ size = "2:3"
 resolution = "1k"
 timeout_seconds = 300
 retry_5xx_attempts = 5
+
+# NovelAI advanced generation parameters can be supplied here and are merged into
+# the request body, for example: [image_gen.request_body_overrides.parameters]
+# steps = 28
+# sampler = "k_dpmpp_2m_sde"
+# negative_prompt = "lowres, blurry, watermark"
 
 [image_caption]
 enabled = false

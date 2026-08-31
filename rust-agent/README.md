@@ -93,6 +93,29 @@ splits it into whole-message chunks and sends up to
 Provider-specific chat completion request fields can be added or overridden through
 `llm.request_body_overrides`, for example `enable_thinking = false`.
 
+### NovelAI image generation
+
+Set `[image_gen].provider = "novelai"` (or `nai`) to use NovelAI's image API.
+The client sends `POST https://image.novelai.net/ai/generate-image`, authenticates
+with a Persistent API token using the Bearer header, and extracts the generated
+image from its ZIP response. When `base_url` and `model` are omitted, the NovelAI
+defaults are `https://image.novelai.net` and `nai-diffusion-5-full`.
+
+```toml
+[image_gen]
+provider = "novelai"
+api_keys = ["pst-your-persistent-token"]
+size = "2:3"
+
+[image_gen.request_body_overrides.parameters]
+steps = 28
+sampler = "k_dpmpp_2m_sde"
+negative_prompt = "lowres, blurry, watermark"
+```
+
+The override table is merged into the provider request body, so it can also set
+`scale`, `seed`, `noise_schedule`, or other supported NovelAI parameters.
+
 ### Multi-key concurrency
 
 Every AI client section (`llm`, `image_gen`, `image_caption`, `video_caption`,

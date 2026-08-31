@@ -745,6 +745,10 @@ pub struct ImageGenConfig {
     pub max_concurrent_per_key: usize,
     #[serde(default)]
     pub prompt_template: Option<String>,
+    /// Extra JSON fields merged into the image generation request body. This is
+    /// useful for provider-specific options such as NovelAI sampler settings.
+    #[serde(default)]
+    pub request_body_overrides: BTreeMap<String, toml::Value>,
     #[serde(default)]
     pub fallbacks: Vec<ProviderFallbackConfig>,
 }

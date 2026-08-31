@@ -4851,7 +4851,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-summary-ai"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64",
  "chrono",
@@ -4866,11 +4866,12 @@ dependencies = [
  "tracing",
  "uuid",
  "wechat-summary-core",
+ "zip",
 ]
 
 [[package]]
 name = "wechat-summary-app"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4889,7 +4890,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-summary-control"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4909,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-summary-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "chrono",
  "regex",
@@ -4920,7 +4921,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-summary-gui"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -4934,7 +4935,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-summary-storage"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -5543,7 +5544,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wx4py-client"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "chrono",
  "serde",

@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     future::Future,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -19,8 +20,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use wechat_summary_core::{
     config::{
-        ImageCaptionConfig, ImageGenConfig, LlmConfig, ProviderFallbackConfig, ProxyConfig, VideoCaptionConfig,
-        VoiceTranscriptionConfig,
+        ImageCaptionConfig, ImageGenConfig, LlmConfig, ProviderFallbackConfig, ProxyConfig,
+        VideoCaptionConfig, VoiceTranscriptionConfig,
     },
     ImageArtifact,
 };
@@ -299,11 +300,16 @@ impl OpenAiCompatibleLlm {
             .await
         {
             Ok(output) => Ok(output),
-            Err(primary_error) if is_provider_failover_error(&primary_error) && !self.fallbacks.is_empty() => {
+            Err(primary_error)
+                if is_provider_failover_error(&primary_error) && !self.fallbacks.is_empty() =>
+            {
                 warn!(fallbacks = self.fallbacks.len(), error = %primary_error, "LLM primary failed; trying configured fallback providers");
                 let mut last_error = primary_error;
                 for fallback in &self.fallbacks {
-                    match fallback.complete_with_max_tokens_primary(system_prompt, user_content, max_tokens).await {
+                    match fallback
+                        .complete_with_max_tokens_primary(system_prompt, user_content, max_tokens)
+                        .await
+                    {
                         Ok(output) => return Ok(output),
                         Err(error) => {
                             warn!(error = %error, "LLM fallback provider failed");
@@ -756,6 +762,9 @@ fn image_gen_config_for_fallback(
     config.api_keys = fallback.api_keys;
     config.base_url = fallback.base_url;
     config.model = fallback.model;
+    if !fallback.request_body_overrides.is_empty() {
+        config.request_body_overrides = fallback.request_body_overrides;
+    }
     config.fallbacks.clear();
     config
 }
@@ -765,7 +774,11 @@ fn is_provider_failover_error(error: &AiError) -> bool {
         AiError::MissingApiKey { .. } | AiError::MissingEnv { .. } => false,
         AiError::InvalidResponse(message) => {
             let lower = message.to_ascii_lowercase();
-            !(lower.contains(" 400") || lower.contains(" 401") || lower.contains(" 403") || lower.contains(" 404") || lower.contains("invalid api key"))
+            !(lower.contains(" 400")
+                || lower.contains(" 401")
+                || lower.contains(" 403")
+                || lower.contains(" 404")
+                || lower.contains("invalid api key"))
         }
         _ => true,
     }
@@ -2827,16 +2840,37 @@ impl OpenAiImageClient {
             &config.api_key_env,
             "image API key",
         )?;
-        let base_url = config_value_or_env(
-            config.base_url.as_deref(),
-            &config.base_url_env,
-            "image API base URL",
-        )?;
-        let model = config_value_or_env(
-            config.model.as_deref(),
-            &config.model_env,
-            "image model name",
-        )?;
+        let novelai = is_novelai_image_provider(&config.provider);
+        let base_url = if novelai {
+            config
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("https://image.novelai.net")
+                .to_string()
+        } else {
+            config_value_or_env(
+                config.base_url.as_deref(),
+                &config.base_url_env,
+                "image API base URL",
+            )?
+        };
+        let model = if novelai {
+            config
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("nai-diffusion-5-full")
+                .to_string()
+        } else {
+            config_value_or_env(
+                config.model.as_deref(),
+                &config.model_env,
+                "image model name",
+            )?
+        };
         let client = http_client(config.timeout_seconds, proxy)?;
         let max_concurrent_per_key = config.max_concurrent_per_key;
         let mut client = Self {
@@ -2851,9 +2885,14 @@ impl OpenAiImageClient {
             fallbacks: Vec::new(),
         };
         for fallback in fallback_specs {
-            match Self::new(image_gen_config_for_fallback(&fallback_base, fallback), proxy) {
+            match Self::new(
+                image_gen_config_for_fallback(&fallback_base, fallback),
+                proxy,
+            ) {
                 Ok(fallback_client) => client.fallbacks.push(fallback_client),
-                Err(error) => warn!(error = %error, "image generation fallback initialization failed; ignoring fallback"),
+                Err(error) => {
+                    warn!(error = %error, "image generation fallback initialization failed; ignoring fallback")
+                }
             }
         }
         Ok(client)
@@ -2915,7 +2954,10 @@ impl OpenAiImageClient {
                         error = %last_error,
                         "image generation primary failed; trying fallback provider"
                     );
-                    match fallback.generate_from_prompt_primary(prompt, output_dir).await {
+                    match fallback
+                        .generate_from_prompt_primary(prompt, output_dir)
+                        .await
+                    {
                         Ok(artifact) => return Ok(artifact),
                         Err(error) if is_provider_failover_error(&error) => last_error = error,
                         Err(error) => return Err(error),
@@ -2932,8 +2974,17 @@ impl OpenAiImageClient {
         prompt: &str,
         output_dir: &Path,
     ) -> Result<ImageArtifact, AiError> {
-        let endpoint = image_generations_endpoint(&self.base_url);
-        let payload = self.image_generation_payload(prompt);
+        let novelai = is_novelai_image_provider(&self.config.provider);
+        let endpoint = if novelai {
+            novelai_image_generation_endpoint(&self.base_url)
+        } else {
+            image_generations_endpoint(&self.base_url)
+        };
+        let payload = if novelai {
+            self.novelai_image_generation_payload(prompt)
+        } else {
+            self.image_generation_payload(prompt)
+        };
 
         let max_attempts = http_max_attempts(self.config.retry_5xx_attempts);
         let permit = self.key_pool.acquire().await;
@@ -3117,6 +3168,34 @@ impl OpenAiImageClient {
                 "image generation HTTP request completed"
             );
 
+            if novelai {
+                let bytes = response.bytes().await?.to_vec();
+                let response_for_trace = format!("<NovelAI ZIP response: {} bytes>", bytes.len());
+                write_optional_ai_http_trace(
+                    &self.trace_dir,
+                    AiHttpTrace {
+                        trace_id,
+                        operation: "image_generation",
+                        context: self.trace_context.as_ref(),
+                        method: "POST",
+                        endpoint: &endpoint,
+                        model: Some(&self.model),
+                        attempt,
+                        max_attempts,
+                        elapsed_ms,
+                        status: Some(status.as_u16()),
+                        retry: false,
+                        retry_after_ms: 0,
+                        max_tokens: None,
+                        request_body: Some(&payload),
+                        response_body: Some(&response_for_trace),
+                        error: None,
+                    },
+                );
+                let image = novelai_image_from_zip(&bytes)?;
+                return self.write_image(output_dir, &image);
+            }
+
             let body = response.text().await?;
             write_optional_ai_http_trace(
                 &self.trace_dir,
@@ -3192,7 +3271,52 @@ impl OpenAiImageClient {
             payload.insert("official_fallback".into(), json!(true));
         }
 
-        Value::Object(payload)
+        let mut payload = Value::Object(payload);
+        apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
+        payload
+    }
+
+    fn novelai_image_generation_payload(&self, prompt: &str) -> Value {
+        let (width, height) = novelai_image_dimensions(&self.config.size);
+        let params_version = if self.model.trim().starts_with("nai-diffusion-5") {
+            4
+        } else {
+            3
+        };
+        let negative_prompt = "";
+        let mut payload = json!({
+            "input": prompt,
+            "model": self.model,
+            "action": "generate",
+            "parameters": {
+                "params_version": params_version,
+                "width": width,
+                "height": height,
+                "n_samples": 1,
+                "seed": 0,
+                "extra_noise_seed": 0,
+                "sampler": "k_euler_ancestral",
+                "steps": 23,
+                "scale": if params_version >= 4 { 7.0 } else { 5.0 },
+                "negative_prompt": negative_prompt,
+                "cfg_rescale": 0.0,
+                "noise_schedule": if params_version >= 4 { "karras" } else { "native" },
+                "legacy": false,
+                "legacy_v3_extend": false,
+                "add_original_image": false,
+                "v4_prompt": {
+                    "caption": { "base_caption": prompt, "char_captions": [] },
+                    "use_coords": false,
+                    "use_order": true
+                },
+                "v4_negative_prompt": {
+                    "caption": { "base_caption": negative_prompt, "char_captions": [] },
+                    "legacy_uc": false
+                }
+            }
+        });
+        apply_request_body_overrides(&mut payload, &self.config.request_body_overrides);
+        payload
     }
 
     async fn image_bytes_from_generation_response(
@@ -4014,6 +4138,80 @@ fn image_generations_endpoint(base_url: &str) -> String {
     }
 }
 
+fn is_novelai_image_provider(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "novelai" | "novel_ai" | "nai"
+    )
+}
+
+fn novelai_image_generation_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/ai/generate-image") {
+        base.to_string()
+    } else {
+        format!("{base}/ai/generate-image")
+    }
+}
+
+fn novelai_image_dimensions(size: &str) -> (u32, u32) {
+    let normalized = size.trim().to_ascii_lowercase().replace(' ', "");
+    if let Some((width, height)) = normalized.split_once('x') {
+        if let (Ok(width), Ok(height)) = (width.parse::<u32>(), height.parse::<u32>()) {
+            if width >= 64 && height >= 64 {
+                return (width, height);
+            }
+        }
+    }
+    match normalized.as_str() {
+        "2:3" => (832, 1216),
+        "3:2" => (1216, 832),
+        "3:4" => (896, 1152),
+        "4:3" => (1152, 896),
+        "9:16" => (704, 1216),
+        "16:9" => (1216, 704),
+        "1:1" => (1024, 1024),
+        _ => (1024, 1024),
+    }
+}
+
+fn novelai_image_from_zip(bytes: &[u8]) -> Result<Vec<u8>, AiError> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok(bytes.to_vec());
+    }
+
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
+        AiError::InvalidResponse(format!(
+            "NovelAI returned an invalid ZIP image response: {error}"
+        ))
+    })?;
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| {
+            AiError::InvalidResponse(format!(
+                "reading NovelAI image response ZIP failed: {error}"
+            ))
+        })?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().to_ascii_lowercase();
+        if !matches!(
+            name.rsplit('.').next(),
+            Some("png" | "jpg" | "jpeg" | "webp")
+        ) {
+            continue;
+        }
+        let mut image = Vec::with_capacity(file.size().min(16 * 1024 * 1024) as usize);
+        file.read_to_end(&mut image).map_err(AiError::Io)?;
+        if !image.is_empty() {
+            return Ok(image);
+        }
+    }
+    Err(AiError::InvalidResponse(
+        "NovelAI image response ZIP did not contain a supported image".to_string(),
+    ))
+}
+
 fn api_root_url(base_url: &str) -> String {
     base_url
         .trim_end_matches('/')
@@ -4115,12 +4313,27 @@ mod tests {
     use tokio::sync::Mutex;
 
     fn image_client(config: ImageGenConfig) -> OpenAiImageClient {
+        let novelai = is_novelai_image_provider(&config.provider);
+        let base_url = config.base_url.clone().unwrap_or_else(|| {
+            if novelai {
+                "https://image.novelai.net".into()
+            } else {
+                "https://api.apimart.ai/v1".into()
+            }
+        });
+        let model = config.model.clone().unwrap_or_else(|| {
+            if novelai {
+                "nai-diffusion-5-full".into()
+            } else {
+                "gpt-image-2".into()
+            }
+        });
         OpenAiImageClient {
             config,
             client: reqwest::Client::new(),
             key_pool: Arc::new(ApiKeyPool::from_keys(vec!["test-key".to_string()], 0)),
-            base_url: "https://api.apimart.ai/v1".into(),
-            model: "gpt-image-2".into(),
+            base_url,
+            model,
             retry_notifier: None,
             trace_dir: None,
             trace_context: None,
@@ -4340,6 +4553,7 @@ mod tests {
             retry_5xx_attempts: 5,
             max_concurrent_per_key: 0,
             prompt_template: None,
+            request_body_overrides: Default::default(),
             fallbacks: Vec::new(),
         }
     }
@@ -4357,6 +4571,72 @@ mod tests {
         assert_eq!(payload["size"], "16:9");
         assert_eq!(payload["resolution"], "2k");
         assert!(payload.get("quality").is_none());
+    }
+
+    #[test]
+    fn novelai_payload_uses_v5_contract_and_request_overrides() {
+        let mut config = image_config();
+        config.provider = "novelai".into();
+        config.model = Some("nai-diffusion-5-full".into());
+        config.size = "2:3".into();
+        config.request_body_overrides = toml::from_str(
+            r#"
+                [parameters]
+                steps = 28
+                sampler = "k_dpmpp_2m_sde"
+                negative_prompt = "lowres"
+            "#,
+        )
+        .unwrap();
+        let client = image_client(config);
+
+        let payload = client.novelai_image_generation_payload("anime group summary poster");
+
+        assert_eq!(payload["input"], "anime group summary poster");
+        assert_eq!(payload["model"], "nai-diffusion-5-full");
+        assert_eq!(payload["action"], "generate");
+        assert_eq!(payload["parameters"]["params_version"], 4);
+        assert_eq!(payload["parameters"]["width"], 832);
+        assert_eq!(payload["parameters"]["height"], 1216);
+        assert_eq!(payload["parameters"]["steps"], 28);
+        assert_eq!(payload["parameters"]["sampler"], "k_dpmpp_2m_sde");
+        assert_eq!(payload["parameters"]["negative_prompt"], "lowres");
+        assert_eq!(
+            payload["parameters"]["v4_prompt"]["caption"]["base_caption"],
+            "anime group summary poster"
+        );
+    }
+
+    #[test]
+    fn novelai_client_uses_safe_default_endpoint_and_model() {
+        let mut config = image_config();
+        config.provider = "novelai".into();
+        config.api_key = Some("pst-test-token".into());
+        let client = OpenAiImageClient::new(config, &ProxyConfig::default()).unwrap();
+
+        assert_eq!(client.base_url, "https://image.novelai.net");
+        assert_eq!(client.model, "nai-diffusion-5-full");
+    }
+
+    #[test]
+    fn novelai_image_response_extracts_first_supported_image() {
+        use std::io::Write;
+        use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut cursor);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            writer.start_file("image_0.png", options).unwrap();
+            writer.write_all(b"png-bytes").unwrap();
+            writer.finish().unwrap();
+        }
+
+        assert_eq!(
+            novelai_image_from_zip(cursor.get_ref()).unwrap(),
+            b"png-bytes"
+        );
     }
 
     #[test]
@@ -5087,6 +5367,12 @@ reasoning_effort = "none"
             api_root_url("https://api.apimart.ai/v1/images/generations"),
             "https://api.apimart.ai/v1"
         );
+        assert_eq!(
+            novelai_image_generation_endpoint("https://image.novelai.net"),
+            "https://image.novelai.net/ai/generate-image"
+        );
+        assert!(is_novelai_image_provider("NAI"));
+        assert_eq!(novelai_image_dimensions("16:9"), (1216, 704));
     }
 
     #[test]

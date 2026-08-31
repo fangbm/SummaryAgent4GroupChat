@@ -111,7 +111,7 @@
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                        <StackPanel Spacing="5"><TextBlock Text="图片接口类型" /><TextBox Text="{Binding ImageProvider, Mode=TwoWay}" /></StackPanel>
+                        <StackPanel Spacing="5"><TextBlock Text="图片接口类型" /><TextBox Text="{Binding ImageProvider, Mode=TwoWay}" PlaceholderText="openai 或 novelai" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片模型名称" /><TextBox Text="{Binding ImageModel, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="图片 Base URL" /><TextBox Text="{Binding ImageBaseUrl, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片 API Key（逗号分隔多 Key）" /><PasswordBox x:Name="ImageApiKeysBox" PasswordChanged="ImageApiKeys_PasswordChanged" PlaceholderText="留空保留当前密钥；输入新值覆盖" /></StackPanel>
@@ -137,6 +137,12 @@
                         <CheckBox Grid.Column="1" Content="允许接口官方回退" IsChecked="{Binding ImageOfficialFallback, Mode=TwoWay}" VerticalAlignment="Bottom" />
                     </Grid>
                     <StackPanel Spacing="5"><TextBlock Text="图片提示词模板（可用 {summary}，留空使用默认）" /><TextBox Text="{Binding ImagePromptTemplate, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="72" /></StackPanel>
+                    <Expander Header="NovelAI 参数（可选）" IsExpanded="False">
+                        <StackPanel Spacing="8" Padding="0,10,0,0">
+                            <TextBlock Text="将接口类型设为 novelai 后，空 Base URL 和模型名称会分别使用 https://image.novelai.net 与 nai-diffusion-5-full。图片尺寸可填 2:3、16:9 或 1024x1024。以下 JSON 会合并进 NovelAI 的请求体 parameters，可设置 steps、sampler、negative_prompt、scale、seed 等。" TextWrapping="Wrap" Opacity="0.74" />
+                            <TextBox Text="{Binding ImageRequestBodyOverridesJson, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" FontFamily="Cascadia Mono" FontSize="13" AcceptsReturn="True" TextWrapping="NoWrap" MinHeight="132" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" />
+                        </StackPanel>
+                    </Expander>
                     <StackPanel Spacing="5">
                         <TextBlock Text="备用供应商路由（主供应商失败后按顺序尝试；密钥仅在保存时写入，不会回显）" TextWrapping="Wrap" />
                         <TextBox Text="{Binding ProviderFallbacksJson, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" FontFamily="Cascadia Mono" FontSize="13" AcceptsReturn="True" TextWrapping="NoWrap" MinHeight="180" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" />
