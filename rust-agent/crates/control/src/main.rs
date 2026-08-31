@@ -1,6 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-//! Local control plane for the native Windows UI.
+//! Local control plane for the native desktop UIs.
 //! The GUI never owns configuration parsing or agent processes directly.
 
 use std::{
@@ -21,7 +21,7 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader as AsyncBufReader},
     process::Command as AsyncCommand,
     sync::broadcast,
     time::timeout,
@@ -31,6 +31,7 @@ use wechat_summary_core::AgentConfig;
 use wechat_summary_storage::{DeliveryState, NewTask, SqliteStateStore, TaskState};
 
 const PROTOCOL_VERSION: u32 = 1;
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 /// How long to wait for the user to accept the UAC prompt before reporting a
@@ -47,11 +48,23 @@ const EMBEDDED_RUNTIME_INSTALL_SCRIPT: &str =
 const EMBEDDED_WXDB_UPDATE_SCRIPT: &str = include_str!("../../../../scripts/update-wxdb.ps1");
 const EMBEDDED_PIP_UPDATE_SCRIPT: &str = include_str!("../../../../scripts/update-wx4py.ps1");
 
+fn default_control_endpoint() -> String {
+    #[cfg(windows)]
+    {
+        r"\\.\pipe\SummaryAgent4GroupChat.Control.v1".into()
+    }
+    #[cfg(not(windows))]
+    {
+        env::var("SUMMARY_AGENT_CONTROL_SOCKET")
+            .unwrap_or_else(|_| "/tmp/SummaryAgent4GroupChat.Control.v1.sock".into())
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "wechat-summary-control")]
 #[command(about = "Local control service for SummaryAgent4GroupChat")]
 struct Args {
-    #[arg(long, default_value = r"\\.\pipe\SummaryAgent4GroupChat.Control.v1")]
+    #[arg(long, default_value_t = default_control_endpoint())]
     pipe: String,
     /// Shared secret for authorizing control requests. Prefer passing it via
     /// the SUMMARY_AGENT_CONTROL_TOKEN environment variable: command lines are
@@ -334,16 +347,42 @@ async fn run_server(pipe: String, token: String, state: ControlState) -> Result<
 }
 
 #[cfg(not(windows))]
-async fn run_server(_pipe: String, _token: String, _state: ControlState) -> Result<()> {
-    bail!("the local control service is supported on Windows only")
+async fn run_server(socket: String, token: String, state: ControlState) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::{UnixListener, UnixStream};
+
+    let path = PathBuf::from(socket);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("control socket path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+    if path.exists() {
+        if UnixStream::connect(&path).await.is_ok() {
+            bail!(
+                "another local control service is already listening on {}",
+                path.display()
+            );
+        }
+        fs::remove_file(&path)
+            .with_context(|| format!("removing stale control socket {}", path.display()))?;
+    }
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("binding local control socket {}", path.display()))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    loop {
+        let (connected, _) = listener.accept().await?;
+        let state = state.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let _ = serve_connection(connected, state, token).await;
+        });
+    }
 }
 
-#[cfg(windows)]
-async fn serve_connection(
-    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
-    state: ControlState,
-    token: String,
-) -> Result<()> {
+async fn serve_connection<T>(pipe: T, state: ControlState, token: String) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let mut reader = AsyncBufReader::new(pipe);
     let mut line = String::new();
     let count = reader.read_line(&mut line).await?;
@@ -436,11 +475,10 @@ async fn serve_connection(
     }
 }
 
-#[cfg(windows)]
-async fn write_response(
-    pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
-    response: Response,
-) -> Result<()> {
+async fn write_response<T>(pipe: &mut T, response: Response) -> Result<()>
+where
+    T: AsyncWrite + Unpin,
+{
     let text = serde_json::to_string(&response)?;
     pipe.write_all(text.as_bytes()).await?;
     pipe.write_all(b"\n").await?;
@@ -448,11 +486,10 @@ async fn write_response(
     Ok(())
 }
 
-#[cfg(windows)]
-async fn write_event(
-    pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
-    event: Event,
-) -> Result<()> {
+async fn write_event<T>(pipe: &mut T, event: Event) -> Result<()>
+where
+    T: AsyncWrite + Unpin,
+{
     let text = serde_json::to_string(&event)?;
     pipe.write_all(text.as_bytes()).await?;
     pipe.write_all(b"\n").await?;
@@ -1118,6 +1155,13 @@ fn agent_stop(state: &ControlState) -> Result<Value> {
 }
 
 fn start_elevated_operation(state: &ControlState, operation: ElevatedOperation) -> Result<Value> {
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        let _ = operation;
+        bail!("管理员维护操作仅支持 Windows；macOS 请使用应用安装器或终端完成依赖维护")
+    }
+    #[cfg(windows)]
     start_elevated_operation_with_package(state, operation, None)
 }
 
@@ -1607,6 +1651,10 @@ fn path_open(state: &ControlState, params: &Value) -> Result<Value> {
     {
         Command::new("explorer.exe").arg(&path).spawn()?;
     }
+    #[cfg(not(windows))]
+    {
+        Command::new("open").arg(&path).spawn()?;
+    }
     Ok(json!({ "opened": path }))
 }
 
@@ -2060,7 +2108,11 @@ fn runtime_output_dir(paths: &AppPaths) -> Result<PathBuf> {
 }
 
 fn find_program(paths: &AppPaths, stem: &str) -> Result<PathBuf> {
-    let name = format!("{stem}.exe");
+    let name = if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem.to_string()
+    };
     let current = env::current_exe()?;
     let candidates = [
         paths.working_dir.join("bin").join(&name),

@@ -1,8 +1,8 @@
 # SummaryAgent4GroupChat
 
-Windows 原生群聊总结助手。它监听微信或 Discord 的群聊指令，按指定时间范围读取消息，调用兼容 OpenAI Chat Completions 的模型生成中文总结，并可选生成配图后发回原群。
+原生群聊总结助手。它监听微信或 Discord 的群聊指令，按指定时间范围读取消息，调用兼容 OpenAI Chat Completions 的模型生成中文总结，并可选生成配图后发回原群。
 
-项目使用 WinUI 3 原生 Windows 管理界面；Rust 控制服务负责配置校验、主程序生命周期、终端与日志脱敏。微信的窗口自动化由 `wx4py` 完成，聊天历史由独立的外部 `wxdb` 命令提供。主仓库不包含、链接或分发微信数据库读取实现。
+Windows 使用 WinUI 3 原生管理界面，macOS 使用 SwiftUI 原生管理界面；两者都通过 Rust 控制服务管理配置、主程序生命周期、终端与日志脱敏。微信的窗口自动化由 `wx4py` 完成，聊天历史由独立的外部 `wxdb` 命令提供，二者仅支持 Windows。主仓库不包含、链接或分发微信数据库读取实现。
 
 ## 能力
 
@@ -50,6 +50,10 @@ GUI 与主程序默认以普通权限运行，不会额外弹出命令行窗口�
 5. 尝试执行 `wxdb init`。微信未登录、未运行或权限不足时会显示警告，可在登录微信后点击“运行外部 wxdb init”重试。
 
 主项目不附带 wxdb。如果独立 wxdb 项目尚未发布 Windows Release，请自行配置本地 `wxdb.exe` 的绝对路径或将其加入 `PATH`，再运行安装流程。
+
+### macOS 原生界面
+
+macOS 版使用 SwiftUI，不嵌入浏览器或 WebView。当前首个原生版本支持 Discord 与所有平台无关的 Rust 总结、任务和投递能力；微信 wx4py/wxdb 明确保持 Windows 专用。开发构建、配置方式和后续签名发布方向见 [macOS 说明](docs/macos.md)。
 
 ### 从源码构建
 
@@ -235,8 +239,9 @@ WinUI GUI 使用普通权限 manifest；本地可用 `dotnet build .\windows-ui\
 
 ### 代码库结构说明
 
-- `rust-agent/crates/`：产品本体。`app` 是主程序，`control` 是 WinUI 前端依赖的本地控制服务，`core`/`ai`/`storage` 为共享库，`gui` 是旧版 egui 界面（保留但不再是默认前端）。
-- `windows-ui/`：WinUI 3 前端（当前默认界面）。
+- `rust-agent/crates/`：产品本体。`app` 是主程序，`control` 是 WinUI/SwiftUI 前端依赖的本地控制服务，`core`/`ai`/`storage` 为共享库，`gui` 是旧版 egui 界面（保留但不再是默认前端）。
+- `windows-ui/`：WinUI 3 前端（Windows 默认界面）。
+- `macos-ui/`：SwiftUI 原生 macOS 前端。
 - `scripts/wx4py_sidecar.py`：微信 UI 自动化 sidecar，随产品分发。
 - `src/linux_bot`、`src/windows_worker`、`src/pipeline_core`：旧 Python 双机/API 部署管线，仅作可选方案维护，不属于安装包默认路径；相关部署见 `docs/deploy-guide.md`。
 

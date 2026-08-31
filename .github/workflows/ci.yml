@@ -11,6 +11,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build SwiftUI macOS client
+        working-directory: macos-ui
+        run: swift build -c release
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-agent
+      - name: Check portable Rust control plane
+        working-directory: rust-agent
+        run: cargo check -p wechat-summary-control -p wechat-summary-app
+
   windows:
     runs-on: windows-latest
     steps:
