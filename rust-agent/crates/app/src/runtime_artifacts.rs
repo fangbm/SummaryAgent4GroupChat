@@ -14,8 +14,9 @@ use wechat_summary_core::{models::ImageArtifact, AgentConfig};
 static RANDOM_IMAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Pick one still-usable NovelAI image from the dedicated runtime output pool.
-/// Both summary generation and the manual NovelAI command write `summary-*.png`
-/// files below `<output_dir>/nai`.
+/// Only the manual NovelAI command writes `summary-*.png` files below
+/// `<output_dir>/nai`; summary-image generation keeps using the root output
+/// directory selected by `[image_gen]`.
 pub(crate) fn random_generated_image(config: &AgentConfig) -> Result<Option<ImageArtifact>> {
     let output_dir = Path::new(&config.runtime.output_dir).join("nai");
     random_generated_image_from_dir(&output_dir)

@@ -105,8 +105,8 @@
                         </StackPanel>
                     </Grid>
 
-                    <TextBlock Text="图片生成与媒体理解" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
-                    <StackPanel Orientation="Horizontal" Spacing="20"><CheckBox Content="启用图片生成" IsChecked="{Binding ImageGenerationEnabled, Mode=TwoWay}" /><CheckBox Content="启用图片转述" IsChecked="{Binding ImageCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用视频转述" IsChecked="{Binding VideoCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用语音转写" IsChecked="{Binding VoiceTranscriptionEnabled, Mode=TwoWay}" /></StackPanel>
+                    <TextBlock Text="总结配图与媒体理解" Style="{ThemeResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
+                    <StackPanel Orientation="Horizontal" Spacing="20"><CheckBox Content="启用总结配图" IsChecked="{Binding ImageGenerationEnabled, Mode=TwoWay}" /><CheckBox Content="启用图片转述" IsChecked="{Binding ImageCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用视频转述" IsChecked="{Binding VideoCaptionEnabled, Mode=TwoWay}" /><CheckBox Content="启用语音转写" IsChecked="{Binding VoiceTranscriptionEnabled, Mode=TwoWay}" /></StackPanel>
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                         <StackPanel Spacing="5"><TextBlock Text="图片流水线槽位（0 为按启用群数自动）" TextWrapping="Wrap" /><NumberBox Value="{Binding ImagePipelineMaxConcurrentRequests, Mode=TwoWay}" Minimum="0" SpinButtonPlacementMode="Compact" /></StackPanel>
@@ -116,7 +116,7 @@
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                        <StackPanel Spacing="5"><TextBlock Text="图片接口类型" /><TextBox Text="{Binding ImageProvider, Mode=TwoWay}" PlaceholderText="openai 或 novelai" /></StackPanel>
+                        <StackPanel Spacing="5"><TextBlock Text="总结配图接口类型" /><TextBox Text="{Binding ImageProvider, Mode=TwoWay}" PlaceholderText="例如 openai" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="图片模型名称" /><TextBox Text="{Binding ImageModel, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="图片 Base URL" /><TextBox Text="{Binding ImageBaseUrl, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片 API Key（逗号分隔多 Key）" /><PasswordBox x:Name="ImageApiKeysBox" PasswordChanged="ImageApiKeys_PasswordChanged" PlaceholderText="留空保留当前密钥；输入新值覆盖" /></StackPanel>
@@ -142,10 +142,30 @@
                         <CheckBox Grid.Column="1" Content="允许接口官方回退" IsChecked="{Binding ImageOfficialFallback, Mode=TwoWay}" VerticalAlignment="Bottom" />
                     </Grid>
                     <StackPanel Spacing="5"><TextBlock Text="图片提示词模板（可用 {summary}，留空使用默认）" /><TextBox Text="{Binding ImagePromptTemplate, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="72" /></StackPanel>
-                    <Expander Header="NovelAI 参数（可选）" IsExpanded="False">
+                    <Expander Header="总结配图请求参数（可选）" IsExpanded="False">
                         <StackPanel Spacing="8" Padding="0,10,0,0">
-                            <TextBlock Text="将接口类型设为 novelai 后，空 Base URL 和模型名称会分别使用 https://image.novelai.net 与 nai-diffusion-5-full。图片尺寸可填 2:3、16:9 或 1024x1024。以下 JSON 会合并进 NovelAI 的请求体 parameters，可设置 steps、sampler、negative_prompt、scale、seed 等。" TextWrapping="Wrap" Opacity="0.74" />
+                            <TextBlock Text="以下 JSON 会合并进群聊总结配图的请求体。它与 /图片、/img、/image 命令的 NovelAI 参数完全独立。" TextWrapping="Wrap" Opacity="0.74" />
                             <TextBox Text="{Binding ImageRequestBodyOverridesJson, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" FontFamily="Cascadia Mono" FontSize="13" AcceptsReturn="True" TextWrapping="NoWrap" MinHeight="132" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" />
+                        </StackPanel>
+                    </Expander>
+                    <Expander Header="NovelAI 手动图片命令（/图片、/img、/image）" IsExpanded="False">
+                        <StackPanel Spacing="10" Padding="0,10,0,0">
+                            <CheckBox Content="启用 NovelAI 手动图片命令" IsChecked="{Binding NovelAiEnabled, Mode=TwoWay}" />
+                            <TextBlock Text="带 prompt 时生成新图；不带 prompt 时仅从 runtime.output_dir/nai 随机回发已有 NovelAI 产物。此处不读取也不修改上方的总结配图配置。" TextWrapping="Wrap" Opacity="0.74" />
+                            <Grid ColumnSpacing="16" RowSpacing="12">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                                <StackPanel Spacing="5"><TextBlock Text="NovelAI Base URL" /><TextBox Text="{Binding NovelAiBaseUrl, Mode=TwoWay}" /></StackPanel>
+                                <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="NovelAI 模型名称" /><TextBox Text="{Binding NovelAiModel, Mode=TwoWay}" /></StackPanel>
+                                <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="NovelAI API Key（逗号分隔多 Key）" /><PasswordBox x:Name="NovelAiApiKeysBox" PasswordChanged="NovelAiApiKeys_PasswordChanged" PlaceholderText="留空保留当前密钥；输入新值覆盖" /></StackPanel>
+                                <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="图片尺寸" /><TextBox Text="{Binding NovelAiSize, Mode=TwoWay}" PlaceholderText="例如 2:3、16:9 或 1024x1024" /></StackPanel>
+                            </Grid>
+                            <StackPanel Orientation="Horizontal" Spacing="16">
+                                <StackPanel Width="180" Spacing="5"><TextBlock Text="超时（秒）" /><NumberBox Value="{Binding NovelAiTimeoutSeconds, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel>
+                                <StackPanel Width="180" Spacing="5"><TextBlock Text="5xx 重试次数" /><NumberBox Value="{Binding NovelAiRetryAttempts, Mode=TwoWay}" Minimum="0" SpinButtonPlacementMode="Compact" /></StackPanel>
+                                <StackPanel Width="180" Spacing="5"><TextBlock Text="每 Key 最大并发（0 为不限）" /><NumberBox Value="{Binding NovelAiMaxConcurrentPerKey, Mode=TwoWay}" Minimum="0" SpinButtonPlacementMode="Compact" /></StackPanel>
+                            </StackPanel>
+                            <StackPanel Spacing="5"><TextBlock Text="NovelAI 请求参数 JSON（合并至 parameters）" /><TextBox Text="{Binding NovelAiRequestBodyOverridesJson, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" FontFamily="Cascadia Mono" FontSize="13" AcceptsReturn="True" TextWrapping="NoWrap" MinHeight="132" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" /></StackPanel>
                         </StackPanel>
                     </Expander>
                     <StackPanel Spacing="5">

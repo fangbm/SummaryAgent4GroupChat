@@ -417,9 +417,9 @@ async fn handle_manual_image_command(
         );
         return Ok(());
     }
-    if !config.image_summary_enabled_for_room(&trigger.room_id) {
+    if !config.novelai.enabled {
         let _ = client
-            .send_text(&trigger.room_id, "本群已禁用图片生成。")
+            .send_text(&trigger.room_id, "NovelAI 图片命令未启用。")
             .await;
         return Ok(());
     }

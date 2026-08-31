@@ -62,6 +62,10 @@ public sealed partial class ConfigEditorPage : Page
     {
         if (!_clearingSecretInputs && ViewModel is not null && sender is PasswordBox box) ViewModel.ImageApiKeysInput = box.Password;
     }
+    private void NovelAiApiKeys_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (!_clearingSecretInputs && ViewModel is not null && sender is PasswordBox box) ViewModel.NovelAiApiKeysInput = box.Password;
+    }
     private void DiscordToken_PasswordChanged(object sender, RoutedEventArgs e)
     {
         if (!_clearingSecretInputs && ViewModel is not null && sender is PasswordBox box) ViewModel.DiscordTokenInput = box.Password;
@@ -69,7 +73,7 @@ public sealed partial class ConfigEditorPage : Page
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(MainViewModel.LlmApiKeysInput) or nameof(MainViewModel.ImageApiKeysInput) or nameof(MainViewModel.DiscordTokenInput)
+        if (e.PropertyName is nameof(MainViewModel.LlmApiKeysInput) or nameof(MainViewModel.ImageApiKeysInput) or nameof(MainViewModel.NovelAiApiKeysInput) or nameof(MainViewModel.DiscordTokenInput)
             && ViewModel is not null
             && string.IsNullOrEmpty(SecretValue(e.PropertyName)))
         {
@@ -77,6 +81,7 @@ public sealed partial class ConfigEditorPage : Page
             {
                 nameof(MainViewModel.LlmApiKeysInput) => LlmApiKeysBox,
                 nameof(MainViewModel.ImageApiKeysInput) => ImageApiKeysBox,
+                nameof(MainViewModel.NovelAiApiKeysInput) => NovelAiApiKeysBox,
                 _ => DiscordTokenBox,
             });
         }
@@ -86,6 +91,7 @@ public sealed partial class ConfigEditorPage : Page
     {
         nameof(MainViewModel.LlmApiKeysInput) => ViewModel?.LlmApiKeysInput ?? string.Empty,
         nameof(MainViewModel.ImageApiKeysInput) => ViewModel?.ImageApiKeysInput ?? string.Empty,
+        nameof(MainViewModel.NovelAiApiKeysInput) => ViewModel?.NovelAiApiKeysInput ?? string.Empty,
         _ => ViewModel?.DiscordTokenInput ?? string.Empty,
     };
 
@@ -93,6 +99,7 @@ public sealed partial class ConfigEditorPage : Page
     {
         ClearSecretInput(LlmApiKeysBox);
         ClearSecretInput(ImageApiKeysBox);
+        ClearSecretInput(NovelAiApiKeysBox);
         ClearSecretInput(DiscordTokenBox);
     }
 

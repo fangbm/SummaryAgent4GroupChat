@@ -3771,14 +3771,7 @@ impl OpenAiImageClient {
         bytes: &[u8],
     ) -> Result<ImageArtifact, AiError> {
         let output_dir = output_dir.as_ref();
-        // Keep NovelAI artifacts in their own pool. Besides making cleanup and
-        // inspection clearer, this is the pool used by an empty /图片 command.
-        let output_dir = if is_novelai_image_provider(&self.config.provider) {
-            output_dir.join("nai")
-        } else {
-            output_dir.to_path_buf()
-        };
-        fs::create_dir_all(&output_dir)?;
+        fs::create_dir_all(output_dir)?;
         let filename = format!("summary-{}.png", Uuid::new_v4());
         let path = output_dir.join(filename);
         fs::write(&path, bytes)?;

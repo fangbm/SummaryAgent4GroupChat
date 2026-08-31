@@ -3,6 +3,7 @@
 use std::{
     collections::VecDeque,
     future::Future,
+    path::Path,
     time::{Duration as StdDuration, Instant},
 };
 
@@ -638,20 +639,17 @@ pub(crate) async fn generate(
 }
 
 /// Turn a short user request into a NovelAI V5-oriented prompt, then generate the image.
-/// This intentionally uses the normal image-pipeline slot pool so manual commands cannot stampede
-/// the same provider used by scheduled summary images.
+/// This intentionally uses the normal prompt-preparation slot pool, while its
+/// NovelAI generation settings and output directory remain independent from
+/// summary-image generation.
 pub(crate) async fn generate_manual_novelai_image(
     config: &AgentConfig,
     image_pipeline_slots: &ImagePipelineSlotPool,
     room_id: &str,
     user_prompt: &str,
 ) -> Result<ImageArtifact> {
-    let provider = config.image_gen.provider.trim().to_ascii_lowercase();
-    if !matches!(provider.as_str(), "novelai" | "nai") {
-        bail!("图片命令需要将 [image_gen].provider 设置为 novelai 或 nai");
-    }
-    if !config.image_gen.enabled {
-        bail!("图片生成功能未启用");
+    if !config.novelai.enabled {
+        bail!("NovelAI 图片命令未启用；请设置 [novelai].enabled = true");
     }
     let retry_notifier = retry_log_notifier(config, room_id.to_string());
     let llm = configure_llm_tracing(
@@ -682,7 +680,20 @@ pub(crate) async fn generate_manual_novelai_image(
     )
     .await
     .context("calling LLM for manual NovelAI image prompt")?;
-    generate(config, room_id, &prompt, Some(retry_notifier)).await
+    let mut image_client =
+        OpenAiImageClient::new(config.novelai.image_client_config(), &config.proxy)
+            .context("initializing NovelAI client for manual image command")?;
+    if let Some(trace_dir) = ai_trace_dir(config)? {
+        image_client = image_client.with_trace_dir(trace_dir);
+    }
+    image_client = image_client
+        .with_trace_context(ai_trace_context(room_id, "manual NovelAI image generation"))
+        .with_retry_notifier(retry_notifier);
+    let output_dir = Path::new(&config.runtime.output_dir).join("nai");
+    image_client
+        .generate_from_prompt(&prompt, output_dir)
+        .await
+        .context("generating manual NovelAI image")
 }
 
 const MANUAL_NOVELAI_PROMPT_SYSTEM: &str = r#"

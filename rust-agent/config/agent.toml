@@ -418,9 +418,8 @@ prompt_total_timeout_seconds = 120
 
 [image_gen]
 enabled = true
-# provider supports OpenAI-compatible interfaces and NovelAI: "openai" / "novelai".
-# NovelAI uses POST https://image.novelai.net/ai/generate-image and returns a ZIP image response.
-# Suggested NovelAI values: base_url = "https://image.novelai.net", model = "nai-diffusion-5-full".
+# Summary-image provider. This is used only after a chat summary; manual
+# /图片, /img and /image commands use the independent [novelai] section below.
 provider = "openai"
 # Optional persistent values. If left empty/commented, the *_env variables below are used.
 # api_key = ""
@@ -438,8 +437,26 @@ resolution = "1k"
 timeout_seconds = 300
 retry_5xx_attempts = 5
 
-# NovelAI advanced generation parameters can be supplied here and are merged into
-# the request body, for example: [image_gen.request_body_overrides.parameters]
+# Provider-specific fields can be supplied here and are merged into the
+# summary-image request body.
+
+[novelai]
+# Dedicated provider for /图片, /img and /image. It never affects [image_gen]
+# summary images. Artifacts are kept below runtime.output_dir/nai.
+enabled = false
+# api_key = "pst-your-novelai-persistent-token"
+# api_keys = ["pst-key-1", "pst-key-2"]
+api_key_env = "NOVELAI_API_KEY"
+api_keys_env = "NOVELAI_API_KEYS"
+base_url = "https://image.novelai.net"
+model = "nai-diffusion-5-full"
+size = "2:3"
+timeout_seconds = 300
+retry_5xx_attempts = 5
+# max_concurrent_per_key = 0 # 0 = unlimited
+
+# Parameters are merged into NovelAI's request body, for example:
+# [novelai.request_body_overrides.parameters]
 # steps = 28
 # sampler = "k_dpmpp_2m_sde"
 # negative_prompt = "lowres, blurry, watermark"

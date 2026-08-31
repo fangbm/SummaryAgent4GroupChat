@@ -53,6 +53,8 @@ pub struct AgentConfig {
     pub image_pipeline: ImagePipelineConfig,
     pub image_gen: ImageGenConfig,
     #[serde(default)]
+    pub novelai: NovelAiConfig,
+    #[serde(default)]
     pub image_prompt: ImagePromptConfig,
     #[serde(default)]
     pub image_caption: ImageCaptionConfig,
@@ -770,6 +772,107 @@ pub struct ImageGenConfig {
     pub fallbacks: Vec<ProviderFallbackConfig>,
 }
 
+/// Dedicated settings for the manual `/图片` / `/img` / `/image` NovelAI command.
+/// This intentionally does not share credentials or routing with `[image_gen]`,
+/// which remains the provider used by summary-image generation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NovelAiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_novelai_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    #[serde(default = "default_novelai_api_keys_env")]
+    pub api_keys_env: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_novelai_base_url_env")]
+    pub base_url_env: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_novelai_model_env")]
+    pub model_env: String,
+    #[serde(default = "default_novelai_size")]
+    pub size: String,
+    #[serde(default)]
+    pub quality: Option<String>,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub official_fallback: bool,
+    #[serde(default = "default_image_poll_initial_delay")]
+    pub poll_initial_delay_seconds: u64,
+    #[serde(default = "default_image_poll_interval")]
+    pub poll_interval_seconds: u64,
+    #[serde(default = "default_image_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_retry_5xx_attempts")]
+    pub retry_5xx_attempts: usize,
+    #[serde(default = "default_max_concurrent_per_key")]
+    pub max_concurrent_per_key: usize,
+    #[serde(default)]
+    pub request_body_overrides: BTreeMap<String, toml::Value>,
+}
+
+impl NovelAiConfig {
+    /// Convert the command-only configuration to the common image client input.
+    pub fn image_client_config(&self) -> ImageGenConfig {
+        ImageGenConfig {
+            enabled: self.enabled,
+            provider: "novelai".into(),
+            api_key: self.api_key.clone(),
+            api_key_env: self.api_key_env.clone(),
+            api_keys: self.api_keys.clone(),
+            api_keys_env: self.api_keys_env.clone(),
+            base_url: self.base_url.clone(),
+            base_url_env: self.base_url_env.clone(),
+            model: self.model.clone(),
+            model_env: self.model_env.clone(),
+            size: self.size.clone(),
+            quality: self.quality.clone(),
+            resolution: self.resolution.clone(),
+            official_fallback: self.official_fallback,
+            poll_initial_delay_seconds: self.poll_initial_delay_seconds,
+            poll_interval_seconds: self.poll_interval_seconds,
+            timeout_seconds: self.timeout_seconds,
+            retry_5xx_attempts: self.retry_5xx_attempts,
+            max_concurrent_per_key: self.max_concurrent_per_key,
+            prompt_template: None,
+            request_body_overrides: self.request_body_overrides.clone(),
+            fallbacks: Vec::new(),
+        }
+    }
+}
+
+impl Default for NovelAiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            api_key_env: default_novelai_api_key_env(),
+            api_keys: Vec::new(),
+            api_keys_env: default_novelai_api_keys_env(),
+            base_url: None,
+            base_url_env: default_novelai_base_url_env(),
+            model: None,
+            model_env: default_novelai_model_env(),
+            size: default_novelai_size(),
+            quality: None,
+            resolution: None,
+            official_fallback: false,
+            poll_initial_delay_seconds: default_image_poll_initial_delay(),
+            poll_interval_seconds: default_image_poll_interval(),
+            timeout_seconds: default_image_timeout(),
+            retry_5xx_attempts: default_retry_5xx_attempts(),
+            max_concurrent_per_key: default_max_concurrent_per_key(),
+            request_body_overrides: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImagePromptConfig {
     #[serde(default = "default_image_prompt_system_prompt")]
@@ -1236,6 +1339,14 @@ fn default_image_api_keys_env() -> String {
     "IMAGE_API_KEYS".to_string()
 }
 
+fn default_novelai_api_key_env() -> String {
+    "NOVELAI_API_KEY".to_string()
+}
+
+fn default_novelai_api_keys_env() -> String {
+    "NOVELAI_API_KEYS".to_string()
+}
+
 fn default_image_caption_api_keys_env() -> String {
     "IMAGE_CAPTION_API_KEYS".to_string()
 }
@@ -1257,8 +1368,20 @@ fn default_image_base_url_env() -> String {
     "IMAGE_BASE_URL".to_string()
 }
 
+fn default_novelai_base_url_env() -> String {
+    "NOVELAI_BASE_URL".to_string()
+}
+
 fn default_image_model_env() -> String {
     "IMAGE_MODEL".to_string()
+}
+
+fn default_novelai_model_env() -> String {
+    "NOVELAI_MODEL".to_string()
+}
+
+fn default_novelai_size() -> String {
+    "2:3".to_string()
 }
 
 fn default_image_caption_provider() -> String {
@@ -1734,6 +1857,16 @@ size = "2:3"
 "#,
         )
         .unwrap();
+        let novelai: NovelAiConfig = toml::from_str(
+            r#"
+enabled = true
+api_keys = ["pst-1"]
+base_url = "https://image.novelai.net"
+model = "nai-diffusion-5-full"
+size = "2:3"
+"#,
+        )
+        .unwrap();
         let caption: ImageCaptionConfig = toml::from_str(
             r#"
 api_keys_env = "IMAGE_CAPTION_API_KEYS"
@@ -1749,6 +1882,9 @@ max_concurrent_per_key = 3
         assert_eq!(llm.max_concurrent_per_key, 2);
         assert_eq!(image.api_keys, vec!["img-1"]);
         assert_eq!(image.max_concurrent_per_key, 1);
+        assert!(novelai.enabled);
+        assert_eq!(novelai.image_client_config().provider, "novelai");
+        assert_eq!(novelai.api_keys, vec!["pst-1"]);
         assert_eq!(caption.api_keys_env, "IMAGE_CAPTION_API_KEYS");
         assert_eq!(caption.max_concurrent_per_key, 3);
         assert_eq!(video.max_concurrent_per_key, 1);

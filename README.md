@@ -150,7 +150,7 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 "123456789012345678" = { image_summary_enabled = false }
 ```
 
-未列出的房间继承全局图片总结配置。该覆盖同时作用于手动指令和定时任务，且不会开启图片冷却。
+未列出的房间继承全局图片总结配置。该覆盖只作用于总结配图（手动总结和定时任务）；独立的 NovelAI 图片命令由 `[novelai]` 单独控制。
 
 ## 指令与定时任务
 
@@ -175,7 +175,8 @@ Discord 还会注册原生 Slash Commands：`/summary`（可选 `time`、`image`
 
 | 功能 | 配置段 | 说明 |
 | --- | --- | --- |
-| 图片生成 | `[image_gen]` | 在文本总结后生成群聊配图。 |
+| 总结配图 | `[image_gen]` | 在文本总结后生成群聊配图。 |
+| NovelAI 手动生图 | `[novelai]` | 仅供 `/图片`、`/img`、`/image` 命令使用，与总结配图独立。 |
 | 图片转述 | `[image_caption]` | 将图片内容插回对应消息位置，再交给文本总结模型。 |
 | 视频转述 | `[video_caption]` | 将视频以 base64 发送到多模态模型进行转述。 |
 | 语音转写 | `[voice_transcription]` | 可先用 FFmpeg 统一转为 MP3，再请求转写模型。 |
@@ -184,17 +185,17 @@ Discord 还会注册原生 Slash Commands：`/summary`（可选 `time`、`image`
 
 ### NovelAI 图片生成
 
-`[image_gen]` 的 `provider` 可设为 `novelai`（也兼容 `nai`）。它会调用 NovelAI 的 `POST /ai/generate-image`，使用持久化 API Token 的 Bearer 鉴权，并自动从 ZIP 响应中取出生成图片。留空 Base URL 与模型名时，分别默认 `https://image.novelai.net` 和 `nai-diffusion-5-full`。
+`[novelai]` 专供 `/图片`、`/img`、`/image` 命令使用；`[image_gen]` 继续只服务群聊总结配图。它会调用 NovelAI 的 `POST /ai/generate-image`，使用持久化 API Token 的 Bearer 鉴权，并自动从 ZIP 响应中取出生成图片。留空 Base URL 与模型名时，分别默认 `https://image.novelai.net` 和 `nai-diffusion-5-full`。
 
 NovelAI 的产物会单独写入 `runtime.output_dir/nai/`，与其他图片生成器的输出隔离。空 `/图片`、`/img` 或 `/image` 会从这个目录随机回发一张已有 NovelAI 图片；带 prompt 时仍会先生成新图。
 
 ```toml
-[image_gen]
-provider = "novelai"
+[novelai]
+enabled = true
 api_keys = ["pst-your-novelai-persistent-token"]
 size = "2:3" # 也可填 16:9、1:1 或 1024x1024
 
-[image_gen.request_body_overrides.parameters]
+[novelai.request_body_overrides.parameters]
 steps = 28
 sampler = "k_dpmpp_2m_sde"
 negative_prompt = "lowres, blurry, watermark"
@@ -202,7 +203,7 @@ negative_prompt = "lowres, blurry, watermark"
 
 WinUI 的“模型与媒体”页也提供同一组参数输入。NovelAI API Token 是账号凭据，请只填自己的持久化 Token，不要写入日志、截图或提交到仓库。
 
-`/图片` 系列仅在 `provider = "novelai"` 或 `provider = "nai"` 时启用。它使用 NAI V5 的字段分工：标签式外观/场景、短句式动作/镜头、多人时以 `Character N` 和 `source#` / `target#` / `mutual#` 明确关系；不会把负面提示词或参数混入正向 Prompt。这个约束参考了 [nai-flow](https://github.com/fangbm/nai-flow) 的 V5 工作流字段与 [nai5-prompting](https://github.com/Miint-Sunny/nai5-prompting) 的提示词方法。
+`/图片` 系列仅在 `[novelai].enabled = true` 时启用。它使用 NAI V5 的字段分工：标签式外观/场景、短句式动作/镜头、多人时以 `Character N` 和 `source#` / `target#` / `mutual#` 明确关系；不会把负面提示词或参数混入正向 Prompt。这个约束参考了 [nai-flow](https://github.com/fangbm/nai-flow) 的 V5 工作流字段与 [nai5-prompting](https://github.com/Miint-Sunny/nai5-prompting) 的提示词方法。
 
 ## 运行与排障
 
