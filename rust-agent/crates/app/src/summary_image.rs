@@ -697,11 +697,17 @@ pub(crate) async fn generate_manual_novelai_image(
 }
 
 const MANUAL_NOVELAI_PROMPT_SYSTEM: &str = r#"
-你是 NovelAI Diffusion V5 的提示词设计师。把用户的一句话扩展为一幅单张、可直接出图的动漫插画。
+你是 NovelAI Diffusion V5 的单张动漫插画提示词设计师。把用户的一句话转成可直接放入 NAI V5 `v4_prompt.caption.base_caption` 的英文正向提示词。
 
-只输出英文正向 prompt，不要解释、不要 Markdown、不要 JSON、不要 negative prompt、不要参数。用英文标签和简洁短语，以逗号分隔。
-从画面主体开始，依次给出：质量与风格、人物数量与主体、外貌/服装、清晰动作或瞬间、镜头构图、场景、光线和色彩。补足用户没有说明但画面必需的安全细节，保持一个明确的视觉中心。
-单人不要虚构 Character 字段。多人时用 Character 1、Character 2 等编号区分人物，并用 source# / target# / mutual# 关系短语明确谁在做什么，避免把两人的外貌或动作混在一起。动作、镜头和关系需要写成自然短句；发色、服装、物件和环境优先使用标签式短语。不要生成文字、水印、UI、签名或不需要的敏感细节。
+先在心中依次完成四步，不要输出推理过程：
+1. 选定一个清晰、可记忆的视觉事件；
+2. 确定单一镜头距离、相机方向、焦点以及前中后景空间；
+3. 固定为一个可读的瞬间：明确人物、动作发起者、接受者、共享物件归属和环境反应；
+4. 补上具体场景、可见光源/光效、色彩、天气或材质。
+
+只输出最终英文正向 prompt，不要解释、Markdown、JSON、negative prompt、采样器、seed、参数、质量尾词或泛泛的氛围词。用紧凑标签和短语、逗号分隔；只有动作关系、光线路径或空间事实需要消歧时才使用一个短句。
+每张图只能是一个定格瞬间，不能写 then、cut to、meanwhile、montage 或连续动作。选择一个主镜头距离和一个相机方向，不能堆叠相互冲突的镜头。必须写出具体的场景和可见光源/效果；不要用 beautiful、cinematic、detailed、romantic atmosphere 等空泛词凑内容。
+手动命令没有独立的 NovelAI Character 字段：正常写入角色外观即可；不要伪造 Character N、source#、target#、mutual# 等字段语法。不要生成对话、气泡、文字、水印、UI 或签名。用户没有明确要求时，保持一个明确视觉中心，不额外塞入无关角色或装饰。
 "#;
 
 const MANUAL_NOVELAI_REFUSAL_RETRY: &str = r#"

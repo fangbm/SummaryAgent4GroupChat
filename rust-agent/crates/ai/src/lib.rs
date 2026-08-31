@@ -3284,6 +3284,13 @@ impl OpenAiImageClient {
             3
         };
         let negative_prompt = "";
+        // Keep the V5 baseline aligned with the dedicated NAI flow. Overrides
+        // remain available for users who want a different sampler or preset.
+        let seed = u32::from_le_bytes(
+            Uuid::new_v4().as_bytes()[..4]
+                .try_into()
+                .expect("UUID prefix has exactly four bytes"),
+        );
         let mut payload = json!({
             "input": prompt,
             "model": self.model,
@@ -3293,17 +3300,20 @@ impl OpenAiImageClient {
                 "width": width,
                 "height": height,
                 "n_samples": 1,
-                "seed": 0,
+                "seed": seed,
                 "extra_noise_seed": 0,
                 "sampler": "k_euler_ancestral",
-                "steps": 23,
-                "scale": if params_version >= 4 { 7.0 } else { 5.0 },
+                "steps": 28,
+                "scale": 5.0,
                 "negative_prompt": negative_prompt,
+                "uc": negative_prompt,
+                "ucPreset": 0,
+                "qualityToggle": true,
                 "cfg_rescale": 0.0,
                 "noise_schedule": if params_version >= 4 { "karras" } else { "native" },
                 "legacy": false,
                 "legacy_v3_extend": false,
-                "add_original_image": false,
+                "add_original_image": true,
                 "v4_prompt": {
                     "caption": { "base_caption": prompt, "char_captions": [] },
                     "use_coords": false,
@@ -3311,6 +3321,8 @@ impl OpenAiImageClient {
                 },
                 "v4_negative_prompt": {
                     "caption": { "base_caption": negative_prompt, "char_captions": [] },
+                    "use_coords": false,
+                    "use_order": false,
                     "legacy_uc": false
                 }
             }
@@ -4602,6 +4614,10 @@ mod tests {
         assert_eq!(payload["parameters"]["steps"], 28);
         assert_eq!(payload["parameters"]["sampler"], "k_dpmpp_2m_sde");
         assert_eq!(payload["parameters"]["negative_prompt"], "lowres");
+        assert_eq!(payload["parameters"]["uc"], "");
+        assert_eq!(payload["parameters"]["qualityToggle"], true);
+        assert_eq!(payload["parameters"]["add_original_image"], true);
+        assert!(payload["parameters"]["seed"].as_u64().is_some());
         assert_eq!(
             payload["parameters"]["v4_prompt"]["caption"]["base_caption"],
             "anime group summary poster"
