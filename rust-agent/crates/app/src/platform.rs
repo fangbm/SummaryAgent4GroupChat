@@ -582,50 +582,57 @@ fn should_send_discord_text_as_file(options: &DiscordSendOptions, chunk_count: u
 }
 
 async fn register_discord_commands(http: &Http) -> Result<()> {
-    let existing = Command::get_global_commands(http)
-        .await
-        .context("listing Discord application commands")?;
-    let has_summary = existing.iter().any(|command| command.name == "summary");
-    let has_image = existing.iter().any(|command| command.name == "image");
-    if !has_summary {
-        Command::create_global_command(
-            http,
-            CreateCommand::new("summary")
-                .description("生成当前频道的聊天总结")
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "time",
-                        "可选，例如 24h、30d 或 90m",
-                    )
-                    .required(false),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "image",
-                        "可选：image 生成图片总结",
-                    )
-                    .required(false),
-                ),
-        )
-        .await
-        .context("registering Discord /summary command")?;
+    // Discord treats a create using an existing name as an update. Register on
+    // every startup so new aliases and option changes propagate automatically.
+    for name in ["summary", "总结"] {
+        Command::create_global_command(http, create_discord_summary_command(name))
+            .await
+            .with_context(|| format!("registering Discord /{name} command"))?;
     }
-    if !has_image {
-        Command::create_global_command(
-            http,
-            CreateCommand::new("image")
-                .description("根据一句话生成图片")
-                .add_option(
-                    CreateCommandOption::new(CommandOptionType::String, "prompt", "你想画什么")
-                        .required(true),
-                ),
-        )
-        .await
-        .context("registering Discord /image command")?;
+    for name in ["image", "img", "图片"] {
+        Command::create_global_command(http, create_discord_image_command(name))
+            .await
+            .with_context(|| format!("registering Discord /{name} command"))?;
     }
     Ok(())
+}
+
+fn create_discord_summary_command(name: &str) -> CreateCommand {
+    CreateCommand::new(name)
+        .description("生成当前频道的聊天总结")
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::String,
+                "platform",
+                "可选：wx、wechat、dc 或 discord",
+            )
+            .required(false),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::String,
+                "time",
+                "可选，例如 24h、30d 或 90m",
+            )
+            .required(false),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::String,
+                "image",
+                "可选：image、img 或 图片生成图片总结",
+            )
+            .required(false),
+        )
+}
+
+fn create_discord_image_command(name: &str) -> CreateCommand {
+    CreateCommand::new(name)
+        .description("根据一句话生成图片；留空随机发送已有图片")
+        .add_option(
+            CreateCommandOption::new(CommandOptionType::String, "prompt", "你想画什么")
+                .required(false),
+        )
 }
 
 struct DiscordHandler {
@@ -645,6 +652,9 @@ impl EventHandler for DiscordHandler {
 
         let content = discord_message_content(&message);
         if content.trim().is_empty() {
+            return;
+        }
+        if is_discord_native_command_text(&content) {
             return;
         }
         let msg_type = discord_message_msg_type(&message).to_string();
@@ -669,7 +679,7 @@ impl EventHandler for DiscordHandler {
         let Interaction::Command(command) = interaction else {
             return;
         };
-        if !matches!(command.data.name.as_str(), "summary" | "image")
+        if !is_discord_slash_command_name(command.data.name.as_str())
             || !self.channel_allowed(&ctx.http, command.channel_id).await
         {
             return;
@@ -736,26 +746,69 @@ fn discord_slash_command_content(command: &CommandInteraction) -> Option<String>
             .map(str::trim)
             .filter(|value| !value.is_empty())
     };
-    match command.data.name.as_str() {
-        "summary" => {
-            let mut content = String::from("/总结");
-            if let Some(time) = value("time") {
-                content.push(' ');
-                content.push_str(time);
-            }
-            if value("image").is_some_and(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "image" | "img" | "图片"
-                )
-            }) {
-                content.push_str(" image");
-            }
-            Some(content)
+    discord_slash_command_content_from_values(
+        command.data.name.as_str(),
+        value("platform"),
+        value("time"),
+        value("image"),
+        value("prompt"),
+    )
+}
+
+fn discord_slash_command_content_from_values(
+    name: &str,
+    platform: Option<&str>,
+    time: Option<&str>,
+    image: Option<&str>,
+    prompt: Option<&str>,
+) -> Option<String> {
+    if is_discord_summary_command_name(name) {
+        let mut content = String::from("/总结");
+        if let Some(platform) = platform {
+            content.push(' ');
+            content.push_str(platform);
         }
-        "image" => value("prompt").map(|prompt| format!("/图片 {prompt}")),
-        _ => None,
+        if let Some(time) = time {
+            content.push(' ');
+            content.push_str(time);
+        }
+        if image.is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "image" | "img" | "图片"
+            )
+        }) {
+            content.push_str(" image");
+        }
+        return Some(content);
     }
+    if is_discord_image_command_name(name) {
+        return Some(match prompt {
+            Some(prompt) => format!("/图片 {prompt}"),
+            None => "/图片".to_string(),
+        });
+    }
+    None
+}
+
+fn is_discord_slash_command_name(name: &str) -> bool {
+    is_discord_summary_command_name(name) || is_discord_image_command_name(name)
+}
+
+fn is_discord_summary_command_name(name: &str) -> bool {
+    name == "总结" || name.eq_ignore_ascii_case("summary")
+}
+
+fn is_discord_image_command_name(name: &str) -> bool {
+    name == "图片" || name.eq_ignore_ascii_case("image") || name.eq_ignore_ascii_case("img")
+}
+
+fn is_discord_native_command_text(content: &str) -> bool {
+    content
+        .trim_start()
+        .strip_prefix('/')
+        .and_then(|content| content.split_whitespace().next())
+        .is_some_and(is_discord_slash_command_name)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1350,5 +1403,47 @@ mod tests {
             discord_rooms(&config),
             vec!["234567890123456789".to_string()]
         );
+    }
+
+    #[test]
+    fn discord_slash_aliases_map_to_existing_command_syntax() {
+        assert_eq!(
+            discord_slash_command_content_from_values(
+                "总结",
+                Some("wx"),
+                Some("24h"),
+                Some("img"),
+                None,
+            ),
+            Some("/总结 wx 24h image".to_string())
+        );
+        assert_eq!(
+            discord_slash_command_content_from_values("summary", None, Some("1d"), None, None,),
+            Some("/总结 1d".to_string())
+        );
+        for name in ["image", "img", "图片"] {
+            assert_eq!(
+                discord_slash_command_content_from_values(name, None, None, None, Some("夜景")),
+                Some("/图片 夜景".to_string())
+            );
+            assert_eq!(
+                discord_slash_command_content_from_values(name, None, None, None, None),
+                Some("/图片".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn discord_plain_text_command_aliases_do_not_bypass_slash_commands() {
+        for content in [
+            "/summary 24h",
+            "/总结 1d",
+            "/image sunset",
+            "/img",
+            "/图片 猫",
+        ] {
+            assert!(is_discord_native_command_text(content), "{content}");
+        }
+        assert!(!is_discord_native_command_text("普通聊天 /总结"));
     }
 }

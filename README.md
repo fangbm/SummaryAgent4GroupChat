@@ -174,7 +174,7 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 
 `图片`、`image`、`img` 均可用。`[manual_summary].image_by_default = false` 时，只有包含图片参数才生成图片；设为 `true` 时含图片参数表示跳过生图。
 
-Discord 还会注册原生 Slash Commands：`/summary`（可选 `time`、`image`）和 `/image prompt`。全局命令由 Discord 同步，首次出现可能需要短暂传播时间。Discord 长文本默认分段发送；在“接入平台”页选 `file` 后，达到阈值会改用 `.txt` 附件。图片、音频、视频和普通文件都通过同一个附件发送链路投递。
+Discord 使用原生 Slash Commands：`/summary`、`/总结`（可选 `platform`、`time`、`image`），以及 `/image`、`/img`、`/图片`（可选 `prompt`；留空随机发送已有 NovelAI 图片）。这些命令会映射到同一条总结或手动生图链路；Discord 普通消息中的同名命令不会再触发。全局命令由 Discord 同步，首次出现可能需要短暂传播时间。Discord 长文本默认分段发送；在“接入平台”页选 `file` 后，达到阈值会改用 `.txt` 附件。图片、音频、视频和普通文件都通过同一个附件发送链路投递。
 
 定时总结由 `[scheduled_summary]` 控制，默认每天本地时间 22:00 汇总 24 小时。定时任务不受手动图片冷却影响。
 
