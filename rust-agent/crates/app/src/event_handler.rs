@@ -428,9 +428,13 @@ async fn handle_manual_image_command(
         id: store
             .create_task(NewTask {
                 room_id: &trigger.room_id,
-                source: match event_source {
-                    PlatformEventSource::Realtime => "manual_image",
-                    PlatformEventSource::WxdbRecovered => "manual_image_wxdb_recovered",
+                source: match (event_source, command.prompt.is_some()) {
+                    (PlatformEventSource::Realtime, true) => "manual_image",
+                    (PlatformEventSource::WxdbRecovered, true) => "manual_image_wxdb_recovered",
+                    (PlatformEventSource::Realtime, false) => "manual_image_random",
+                    (PlatformEventSource::WxdbRecovered, false) => {
+                        "manual_image_random_wxdb_recovered"
+                    }
                 },
                 since: incoming.timestamp,
                 until: incoming.timestamp,
@@ -440,19 +444,104 @@ async fn handle_manual_image_command(
             .id,
         store: store.clone(),
     };
-    task.set_stage(TaskState::Running, "manual_image_prompt", None, None, 0, 0);
+    let replay_generated_image = command.prompt.is_none();
+    task.set_stage(
+        TaskState::Running,
+        if replay_generated_image {
+            "manual_image_random"
+        } else {
+            "manual_image_prompt"
+        },
+        None,
+        None,
+        0,
+        0,
+    );
     info!(
         room_id = %trigger.room_id,
         source_platform = source_platform.as_str(),
-        prompt_chars = command.prompt.chars().count(),
+        prompt_chars = command.prompt.as_deref().unwrap_or_default().chars().count(),
+        replay_generated_image,
         "manual image command accepted"
     );
+    if replay_generated_image {
+        let artifact = match runtime_artifacts::random_generated_image(config) {
+            Ok(Some(artifact)) => artifact,
+            Ok(None) => {
+                task.set_stage(
+                    TaskState::Failed,
+                    "no_generated_image",
+                    None,
+                    Some("no generated image artifacts are available"),
+                    0,
+                    0,
+                );
+                let _ = client
+                    .send_text(&trigger.room_id, "暂无可随机发送的已生成图片。")
+                    .await;
+                return Ok(());
+            }
+            Err(error) => {
+                let detail = format_error_chain(&error);
+                task.set_stage(
+                    TaskState::Failed,
+                    "random_image_lookup_failed",
+                    None,
+                    Some(&detail),
+                    0,
+                    0,
+                );
+                let _ = client
+                    .send_text(
+                        &trigger.room_id,
+                        &format_failure_message_for_chat("读取已生成图片失败", &detail),
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        match outbox::deliver_image(config, &task, client, &trigger.room_id, &artifact).await {
+            Ok(()) => {
+                task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "manual random image command completed room={}",
+                        trigger.room_id
+                    ),
+                );
+            }
+            Err(error) => {
+                let detail = format_error_chain(&error);
+                task.set_stage(
+                    TaskState::Failed,
+                    "delivery_failed",
+                    None,
+                    Some(&detail),
+                    0,
+                    0,
+                );
+                let _ = client
+                    .send_text(
+                        &trigger.room_id,
+                        &format_failure_message_for_chat("图片发送失败", &detail),
+                    )
+                    .await;
+            }
+        }
+        return Ok(());
+    }
+
+    let prompt = command
+        .prompt
+        .as_deref()
+        .expect("prompt is present after replay branch");
     let _ = client.send_text(&trigger.room_id, "正在生成图片...").await;
     match summary_image::generate_manual_novelai_image(
         config,
         image_pipeline_slots,
         &trigger.room_id,
-        &command.prompt,
+        prompt,
     )
     .await
     {

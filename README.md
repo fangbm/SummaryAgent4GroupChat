@@ -161,7 +161,7 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 | `/总结 dc 1d` | 在当前群中请求 Discord 平台最近一天的总结。 |
 | `/总结 微信 2h 图片` | 总结微信最近两小时，并按图片开关生成或跳过配图。 |
 | `/总结 24h 预览` | 生成文字预览，仅保存在任务中心，便于检查模型与提示词。 |
-| `/图片 [prompt]`、`/img [prompt]`、`/image [prompt]` | 让 LLM 将一句话写成 NovelAI V5 提示词，再调用 NovelAI 并把图片发回当前微信群、Discord 频道或论坛帖子线程。 |
+| `/图片 [prompt]`、`/img [prompt]`、`/image [prompt]` | 带 prompt 时让 LLM 写 NovelAI V5 提示词并生成新图；不带 prompt 时从已有 NovelAI 产物中随机发一张到当前微信群、Discord 频道或论坛帖子线程。 |
 
 `图片`、`image`、`img` 均可用。`[manual_summary].image_by_default = false` 时，只有包含图片参数才生成图片；设为 `true` 时含图片参数表示跳过生图。
 
@@ -185,6 +185,8 @@ Discord 还会注册原生 Slash Commands：`/summary`（可选 `time`、`image`
 ### NovelAI 图片生成
 
 `[image_gen]` 的 `provider` 可设为 `novelai`（也兼容 `nai`）。它会调用 NovelAI 的 `POST /ai/generate-image`，使用持久化 API Token 的 Bearer 鉴权，并自动从 ZIP 响应中取出生成图片。留空 Base URL 与模型名时，分别默认 `https://image.novelai.net` 和 `nai-diffusion-5-full`。
+
+NovelAI 的产物会单独写入 `runtime.output_dir/nai/`，与其他图片生成器的输出隔离。空 `/图片`、`/img` 或 `/image` 会从这个目录随机回发一张已有 NovelAI 图片；带 prompt 时仍会先生成新图。
 
 ```toml
 [image_gen]
