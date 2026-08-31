@@ -12,6 +12,7 @@ mod config_reloader;
 mod event_dispatcher;
 mod event_handler;
 mod history_rules;
+mod image_command;
 mod llm_chunking;
 mod llm_output;
 mod llm_service;
@@ -41,6 +42,7 @@ use ai_runtime::*;
 use config_reloader::ConfigReloader;
 use event_dispatcher::{enqueue_platform_event, PlatformEventSource};
 use event_handler::handle_platform_event;
+use image_command::parse as parse_image_command;
 #[cfg(test)]
 use llm_chunking::*;
 #[cfg(test)]

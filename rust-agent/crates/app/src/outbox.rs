@@ -78,6 +78,43 @@ pub(crate) async fn deliver_image(
     Ok(())
 }
 
+/// Queue a generic platform attachment. Discord preserves the attachment MIME type, so this
+/// covers audio, video and ordinary files without a platform-specific delivery branch.
+#[allow(dead_code)] // Used by the platform-neutral media delivery callers as they are migrated.
+pub(crate) async fn deliver_file(
+    config: &AgentConfig,
+    task: &OperationalTask,
+    client: &PlatformWorker,
+    room_id: &str,
+    file_path: &str,
+) -> Result<()> {
+    let delivery = task
+        .store
+        .enqueue_delivery(Some(&task.id), room_id, "file", file_path)
+        .context("enqueueing file delivery")?;
+    if !task.store.claim_delivery(
+        &delivery.id,
+        delivery.attempts.saturating_add(1),
+        DELIVERY_LEASE_SECONDS,
+    )? {
+        return Ok(());
+    }
+    match client.send_file(room_id, file_path).await {
+        Ok(()) => task.store.update_delivery(
+            &delivery.id,
+            DeliveryState::Delivered,
+            1,
+            Utc::now(),
+            None,
+        )?,
+        Err(error) => {
+            schedule_failure(config, &task.store, &delivery, &error)?;
+            return Err(error).context("sending outboxed file");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn drain(
     config: &AgentConfig,
     store: &SqliteStateStore,
@@ -95,6 +132,7 @@ pub(crate) async fn drain(
                     .send_image(&delivery.room_id, &delivery.payload)
                     .await
             }
+            "file" => client.send_file(&delivery.room_id, &delivery.payload).await,
             _ => Err(anyhow::anyhow!(
                 "unsupported outbox delivery kind {}",
                 delivery.kind

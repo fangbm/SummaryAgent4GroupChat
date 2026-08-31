@@ -16,6 +16,22 @@ pub(crate) async fn handle_platform_event(
 ) -> Result<()> {
     let source_platform = event.platform;
     let incoming = IncomingMessage::from(event);
+    if matcher.allows_message(&incoming) {
+        if let Some(command) = parse_image_command(&incoming.content) {
+            return handle_manual_image_command(
+                config,
+                store,
+                client,
+                recent_trigger_attempts,
+                image_pipeline_slots,
+                source_platform,
+                event_source,
+                &incoming,
+                command,
+            )
+            .await;
+        }
+    }
     let Some(trigger) = matcher.match_message(&incoming) else {
         return Ok(());
     };
@@ -351,5 +367,134 @@ pub(crate) async fn handle_platform_event(
         }
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_manual_image_command(
+    config: &AgentConfig,
+    store: &SqliteStateStore,
+    client: &PlatformWorker,
+    recent_trigger_attempts: &Arc<Mutex<RecentTriggerAttempts>>,
+    image_pipeline_slots: &ImagePipelineSlotPool,
+    source_platform: PlatformKindConfig,
+    event_source: PlatformEventSource,
+    incoming: &IncomingMessage,
+    command: crate::image_command::ImageCommand,
+) -> Result<()> {
+    let trigger = TriggerMatch {
+        room_id: incoming.room_id.clone(),
+        trigger_symbol: command.trigger_symbol,
+        trigger_content: incoming.content.clone(),
+    };
+    if !config.trigger_user_allowed(&trigger.room_id, &incoming.sender_id) {
+        append_runtime_log(
+            config,
+            &format!(
+                "manual image command ignored room={} reason=sender_not_allowed",
+                trigger.room_id
+            ),
+        );
+        return Ok(());
+    }
+    if recent_trigger_attempts
+        .lock()
+        .map(|mut attempts| {
+            attempts.is_duplicate_with_id(
+                &trigger,
+                incoming.stable_id.as_deref(),
+                incoming.timestamp,
+            )
+        })
+        .unwrap_or(false)
+    {
+        append_runtime_log(
+            config,
+            &format!(
+                "manual image command ignored room={} reason=duplicate",
+                trigger.room_id
+            ),
+        );
+        return Ok(());
+    }
+    if !config.image_summary_enabled_for_room(&trigger.room_id) {
+        let _ = client
+            .send_text(&trigger.room_id, "本群已禁用图片生成。")
+            .await;
+        return Ok(());
+    }
+
+    let task = OperationalTask {
+        id: store
+            .create_task(NewTask {
+                room_id: &trigger.room_id,
+                source: match event_source {
+                    PlatformEventSource::Realtime => "manual_image",
+                    PlatformEventSource::WxdbRecovered => "manual_image_wxdb_recovered",
+                },
+                since: incoming.timestamp,
+                until: incoming.timestamp,
+                config_revision: &config_revision(config),
+                retry_of: None,
+            })?
+            .id,
+        store: store.clone(),
+    };
+    task.set_stage(TaskState::Running, "manual_image_prompt", None, None, 0, 0);
+    info!(
+        room_id = %trigger.room_id,
+        source_platform = source_platform.as_str(),
+        prompt_chars = command.prompt.chars().count(),
+        "manual image command accepted"
+    );
+    let _ = client.send_text(&trigger.room_id, "正在生成图片...").await;
+    match summary_image::generate_manual_novelai_image(
+        config,
+        image_pipeline_slots,
+        &trigger.room_id,
+        &command.prompt,
+    )
+    .await
+    {
+        Ok(artifact) => {
+            match outbox::deliver_image(config, &task, client, &trigger.room_id, &artifact).await {
+                Ok(()) => {
+                    task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
+                    append_runtime_log(
+                        config,
+                        &format!("manual image command completed room={}", trigger.room_id),
+                    );
+                }
+                Err(error) => {
+                    let detail = format_error_chain(&error);
+                    task.set_stage(
+                        TaskState::Failed,
+                        "delivery_failed",
+                        None,
+                        Some(&detail),
+                        0,
+                        0,
+                    );
+                    let _ = client
+                        .send_text(
+                            &trigger.room_id,
+                            &format_failure_message_for_chat("图片发送失败", &detail),
+                        )
+                        .await;
+                }
+            }
+        }
+        Err(error) => {
+            let detail = format_error_chain(&error);
+            task.set_stage(TaskState::Failed, "failed", None, Some(&detail), 0, 0);
+            error!(room_id = %trigger.room_id, error = %detail, "manual image command failed");
+            let _ = client
+                .send_text(
+                    &trigger.room_id,
+                    &format_failure_message_for_chat("图片生成失败", &detail),
+                )
+                .await;
+        }
+    }
     Ok(())
 }

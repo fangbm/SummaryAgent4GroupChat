@@ -38,6 +38,11 @@
                         <StackPanel Grid.Row="2" Spacing="5"><TextBlock Text="wxdb 可执行文件" /><TextBox Text="{Binding WxdbExecutable, Mode=TwoWay}" /></StackPanel>
                         <StackPanel Grid.Row="2" Grid.Column="1" Spacing="5"><TextBlock Text="wxdb 缓存目录（留空使用默认位置）" /><TextBox Text="{Binding WxdbCacheDirectory, Mode=TwoWay}" /></StackPanel>
                     </Grid>
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="5"><TextBlock Text="Discord Bot Token（仅保存时写入，不会回显）" /><PasswordBox x:Name="DiscordTokenBox" PasswordChanged="DiscordToken_PasswordChanged" PlaceholderText="留空保留当前 Token；保存后会重连 Discord" /></StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="Discord 超长文字投递" /><StackPanel Orientation="Horizontal" Spacing="12"><ComboBox Width="150" SelectedValuePath="Content" SelectedValue="{Binding DiscordLongTextDelivery, Mode=TwoWay}"><ComboBoxItem Content="chunks" /><ComboBoxItem Content="file" /></ComboBox><NumberBox Width="150" Value="{Binding DiscordLongTextFileMinChunks, Mode=TwoWay}" Minimum="1" SpinButtonPlacementMode="Compact" /></StackPanel><TextBlock Text="file 模式会在达到该分段数时作为 .txt 附件发送。" Opacity="0.65" FontSize="12" /></StackPanel>
+                    </Grid>
                     <StackPanel Spacing="5"><TextBlock Text="禁用图片总结的群聊（逗号或换行分隔）" /><TextBox Text="{Binding DisabledImageRooms, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="72" /></StackPanel>
                     <Expander Header="房间策略模板与群组周报" IsExpanded="False">
                         <StackPanel Spacing="10" Padding="0,12,0,0">

@@ -34,37 +34,7 @@ impl TriggerMatcher {
     }
 
     pub fn match_message(&self, msg: &IncomingMessage) -> Option<TriggerMatch> {
-        if self.config.ignore_self && msg.is_self {
-            return None;
-        }
-
-        let room_allowed = self.config.whitelist_rooms.is_empty()
-            || self.config.whitelist_rooms.iter().any(|room| {
-                room == &msg.room_id
-                    || msg
-                        .room_name
-                        .as_ref()
-                        .is_some_and(|name| name.contains(room))
-            });
-        if !room_allowed {
-            return None;
-        }
-
-        if self
-            .config
-            .blacklist_users
-            .iter()
-            .any(|user| user == &msg.sender_id)
-        {
-            return None;
-        }
-
-        if !self
-            .config
-            .content_types
-            .iter()
-            .any(|kind| kind == &msg.msg_type)
-        {
+        if !self.allows_message(msg) {
             return None;
         }
 
@@ -91,6 +61,45 @@ impl TriggerMatcher {
             trigger_symbol: trigger_symbol.clone(),
             trigger_content: msg.content.clone(),
         })
+    }
+
+    /// Shared admission checks for built-in commands which do not use the configurable summary
+    /// trigger text, such as `/image`.
+    pub fn allows_message(&self, msg: &IncomingMessage) -> bool {
+        if self.config.ignore_self && msg.is_self {
+            return false;
+        }
+
+        let room_allowed = self.config.whitelist_rooms.is_empty()
+            || self.config.whitelist_rooms.iter().any(|room| {
+                room == &msg.room_id
+                    || msg
+                        .room_name
+                        .as_ref()
+                        .is_some_and(|name| name.contains(room))
+            });
+        if !room_allowed {
+            return false;
+        }
+
+        if self
+            .config
+            .blacklist_users
+            .iter()
+            .any(|user| user == &msg.sender_id)
+        {
+            return false;
+        }
+
+        if !self
+            .config
+            .content_types
+            .iter()
+            .any(|kind| kind == &msg.msg_type)
+        {
+            return false;
+        }
+        true
     }
 }
 

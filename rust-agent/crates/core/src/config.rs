@@ -374,6 +374,12 @@ pub struct DiscordConfig {
     pub token_env: String,
     #[serde(default)]
     pub channels: Vec<String>,
+    #[serde(default)]
+    pub long_text_delivery: DiscordLongTextDelivery,
+    #[serde(default = "default_discord_long_text_file_min_chunks")]
+    pub long_text_file_min_chunks: usize,
+    #[serde(default)]
+    pub long_text_file_dir: String,
 }
 
 impl Default for DiscordConfig {
@@ -382,8 +388,19 @@ impl Default for DiscordConfig {
             token: None,
             token_env: default_discord_token_env(),
             channels: Vec::new(),
+            long_text_delivery: DiscordLongTextDelivery::default(),
+            long_text_file_min_chunks: default_discord_long_text_file_min_chunks(),
+            long_text_file_dir: String::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordLongTextDelivery {
+    #[default]
+    Chunks,
+    File,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1116,6 +1133,10 @@ fn default_wx4py_command_timeout() -> u64 {
 }
 
 fn default_wx4py_long_text_file_min_chunks() -> usize {
+    3
+}
+
+fn default_discord_long_text_file_min_chunks() -> usize {
     3
 }
 

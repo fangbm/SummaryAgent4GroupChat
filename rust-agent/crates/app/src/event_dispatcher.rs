@@ -21,7 +21,10 @@ pub(crate) fn enqueue_platform_event(
             recent.record(&incoming, Utc::now());
         }
     }
-    if matcher.match_message(&incoming).is_none() {
+    if matcher.match_message(&incoming).is_none()
+        && (!matcher.allows_message(&incoming)
+            || crate::parse_image_command(&incoming.content).is_none())
+    {
         return;
     }
 

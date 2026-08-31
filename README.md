@@ -88,7 +88,7 @@ winget install --id JRSoftware.InnoSetup -e --scope user --accept-package-agreem
 打开 GUI 后，依次完成以下内容：
 
 1. 在“接入平台”页选择 `wx` 或 `discord`。
-2. 微信模式填写可搜索到的群显示名；Discord 模式填写频道 ID 与机器人 Token 环境变量名。
+2. 微信模式填写可搜索到的群显示名；Discord 模式填写频道或论坛 ID，并在同页的写入专用输入框填写 Bot Token。论坛 ID 会自动接收其帖子线程中的命令，回复也会留在原线程。
 3. 在“模型与图片”页填写 LLM 的 API Key、Base URL 和模型名称。支持直接填值，也支持环境变量名。
 4. 微信模式点击“安装微信运行环境”，并在微信登录后运行 `wxdb init`。
 5. 在“监听与命令”页确认触发词、白名单和冷却时间；保存配置后启动主程序。
@@ -157,8 +157,11 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 | `/总结 dc 1d` | 在当前群中请求 Discord 平台最近一天的总结。 |
 | `/总结 微信 2h 图片` | 总结微信最近两小时，并按图片开关生成或跳过配图。 |
 | `/总结 24h 预览` | 生成文字预览，仅保存在任务中心，便于检查模型与提示词。 |
+| `/图片 [prompt]`、`/img [prompt]`、`/image [prompt]` | 让 LLM 将一句话写成 NovelAI V5 提示词，再调用 NovelAI 并把图片发回当前微信群、Discord 频道或论坛帖子线程。 |
 
 `图片`、`image`、`img` 均可用。`[manual_summary].image_by_default = false` 时，只有包含图片参数才生成图片；设为 `true` 时含图片参数表示跳过生图。
+
+Discord 还会注册原生 Slash Commands：`/summary`（可选 `time`、`image`）和 `/image prompt`。全局命令由 Discord 同步，首次出现可能需要短暂传播时间。Discord 长文本默认分段发送；在“接入平台”页选 `file` 后，达到阈值会改用 `.txt` 附件。图片、音频、视频和普通文件都通过同一个附件发送链路投递。
 
 定时总结由 `[scheduled_summary]` 控制，默认每天本地时间 22:00 汇总 24 小时。定时任务不受手动图片冷却影响。
 
@@ -193,6 +196,8 @@ negative_prompt = "lowres, blurry, watermark"
 
 WinUI 的“模型与媒体”页也提供同一组参数输入。NovelAI API Token 是账号凭据，请只填自己的持久化 Token，不要写入日志、截图或提交到仓库。
 
+`/图片` 系列仅在 `provider = "novelai"` 或 `provider = "nai"` 时启用。它使用 NAI V5 的字段分工：标签式外观/场景、短句式动作/镜头、多人时以 `Character N` 和 `source#` / `target#` / `mutual#` 明确关系；不会把负面提示词或参数混入正向 Prompt。这个约束参考了 [nai-flow](https://github.com/fangbm/nai-flow) 的 V5 工作流字段与 [nai5-prompting](https://github.com/Miint-Sunny/nai5-prompting) 的提示词方法。
+
 ## 运行与排障
 
 GUI 的“运行信息”页包含主程序终端与日志尾部。默认日志路径为：
@@ -206,7 +211,7 @@ runtime\rust-output\wechat-summary-app.log
 - **没有收到指令**：确认平台、群/频道白名单、触发词和主程序状态；微信还需确认 UI 自动化能找到该群。
 - **wxdb 找不到密钥或没有消息**：保持目标微信登录，使用与微信相同权限启动 GUI，然后执行“运行外部 wxdb init”；多账号时配置 `wxdb.db_dir`。
 - **图片、语音或视频失败**：先检查各自模型的 Key、Base URL、模型名和网络可达性；完整脱敏错误会写入运行日志。
-- **长总结发不完**：在 `[wx4py]` 中保留 `long_text_delivery = "chunks"`，或改为 `file`，让超长结果以 UTF-8 文本文件发送。
+- **长总结发不完**：在 `[wx4py]` 或 `[discord]` 中保留 `long_text_delivery = "chunks"`，或改为 `file`，让超长结果以 UTF-8 文本文件发送。
 
 更多细节见 [部署说明](docs/deploy-guide.md)、[故障排查](docs/troubleshooting.md)、[隐私与合规](docs/privacy-and-compliance.md) 和 [Rust 设计文档](docs/rust-windows-wx4py-wxdb-dev-doc.md)。
 

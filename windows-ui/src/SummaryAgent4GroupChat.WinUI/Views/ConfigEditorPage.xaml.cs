@@ -62,25 +62,38 @@ public sealed partial class ConfigEditorPage : Page
     {
         if (!_clearingSecretInputs && ViewModel is not null && sender is PasswordBox box) ViewModel.ImageApiKeysInput = box.Password;
     }
+    private void DiscordToken_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (!_clearingSecretInputs && ViewModel is not null && sender is PasswordBox box) ViewModel.DiscordTokenInput = box.Password;
+    }
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(MainViewModel.LlmApiKeysInput) or nameof(MainViewModel.ImageApiKeysInput)
+        if (e.PropertyName is nameof(MainViewModel.LlmApiKeysInput) or nameof(MainViewModel.ImageApiKeysInput) or nameof(MainViewModel.DiscordTokenInput)
             && ViewModel is not null
-            && string.IsNullOrEmpty(e.PropertyName == nameof(MainViewModel.LlmApiKeysInput)
-                ? ViewModel.LlmApiKeysInput
-                : ViewModel.ImageApiKeysInput))
+            && string.IsNullOrEmpty(SecretValue(e.PropertyName)))
         {
-            ClearSecretInput(e.PropertyName == nameof(MainViewModel.LlmApiKeysInput)
-                ? LlmApiKeysBox
-                : ImageApiKeysBox);
+            ClearSecretInput(e.PropertyName switch
+            {
+                nameof(MainViewModel.LlmApiKeysInput) => LlmApiKeysBox,
+                nameof(MainViewModel.ImageApiKeysInput) => ImageApiKeysBox,
+                _ => DiscordTokenBox,
+            });
         }
     }
+
+    private string SecretValue(string? propertyName) => propertyName switch
+    {
+        nameof(MainViewModel.LlmApiKeysInput) => ViewModel?.LlmApiKeysInput ?? string.Empty,
+        nameof(MainViewModel.ImageApiKeysInput) => ViewModel?.ImageApiKeysInput ?? string.Empty,
+        _ => ViewModel?.DiscordTokenInput ?? string.Empty,
+    };
 
     private void ClearSecretInputs()
     {
         ClearSecretInput(LlmApiKeysBox);
         ClearSecretInput(ImageApiKeysBox);
+        ClearSecretInput(DiscordTokenBox);
     }
 
     private void ClearSecretInput(PasswordBox input)

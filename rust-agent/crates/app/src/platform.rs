@@ -13,7 +13,9 @@ use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
 use chrono::{DateTime, Local, Utc};
 use serenity::{
     all::{
-        Attachment, ChannelId, CreateAttachment, CreateMessage, GatewayIntents, GetMessages,
+        Attachment, Channel, ChannelId, Command, CommandInteraction, CommandOptionType,
+        CreateAttachment, CreateCommand, CreateCommandOption, CreateInteractionResponse,
+        CreateInteractionResponseMessage, CreateMessage, GatewayIntents, GetMessages, Interaction,
         Message, MessageId, UserId,
     },
     async_trait,
@@ -21,7 +23,7 @@ use serenity::{
     http::Http,
 };
 use wechat_summary_core::{
-    config::{ListenConfig, PlatformKindConfig, Wx4pyLongTextDelivery},
+    config::{DiscordLongTextDelivery, ListenConfig, PlatformKindConfig, Wx4pyLongTextDelivery},
     models::IncomingMessage,
     AgentConfig,
 };
@@ -44,7 +46,10 @@ pub enum PlatformSender {
         sender: Wx4pySender,
         options: Arc<RwLock<Wx4pySendOptions>>,
     },
-    Discord(DiscordSender),
+    Discord {
+        sender: DiscordSender,
+        options: Arc<RwLock<DiscordSendOptions>>,
+    },
 }
 
 #[derive(Clone)]
@@ -68,6 +73,13 @@ pub struct DiscordSender {
     http: Arc<Http>,
 }
 
+#[derive(Clone)]
+pub struct DiscordSendOptions {
+    long_text_delivery: DiscordLongTextDelivery,
+    long_text_file_min_chunks: usize,
+    long_text_file_dir: PathBuf,
+}
+
 pub struct Wx4pyPlatform {
     client: Wx4pyClient,
     send_options: Arc<RwLock<Wx4pySendOptions>>,
@@ -84,6 +96,7 @@ pub struct DiscordPlatform {
     http: Arc<Http>,
     receiver: Receiver<DiscordInbound>,
     bot_user_id: UserId,
+    send_options: Arc<RwLock<DiscordSendOptions>>,
     _gateway_task: tokio::task::JoinHandle<()>,
 }
 
@@ -129,9 +142,12 @@ impl PlatformClient {
                 sender: platform.client.sender(),
                 options: Arc::clone(&platform.send_options),
             },
-            Self::Discord(platform) => PlatformSender::Discord(DiscordSender {
-                http: Arc::clone(&platform.http),
-            }),
+            Self::Discord(platform) => PlatformSender::Discord {
+                sender: DiscordSender {
+                    http: Arc::clone(&platform.http),
+                },
+                options: Arc::clone(&platform.send_options),
+            },
         }
     }
 
@@ -154,12 +170,21 @@ impl PlatformClient {
     }
 
     pub fn refresh_runtime_options(&self, config: &AgentConfig) -> Result<()> {
-        if let Self::Wx4py(platform) = self {
-            let mut send_options = platform
-                .send_options
-                .write()
-                .map_err(|_| anyhow!("wx4py send options lock poisoned"))?;
-            *send_options = wx4py_send_options(config);
+        match self {
+            Self::Wx4py(platform) => {
+                let mut send_options = platform
+                    .send_options
+                    .write()
+                    .map_err(|_| anyhow!("wx4py send options lock poisoned"))?;
+                *send_options = wx4py_send_options(config);
+            }
+            Self::Discord(platform) => {
+                let mut send_options = platform
+                    .send_options
+                    .write()
+                    .map_err(|_| anyhow!("Discord send options lock poisoned"))?;
+                *send_options = discord_send_options(config);
+            }
         }
         Ok(())
     }
@@ -193,6 +218,10 @@ impl PlatformWorker {
 
     pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
         self.sender.send_image(room_id, image_path).await
+    }
+
+    pub async fn send_file(&self, room_id: &str, file_path: &str) -> Result<()> {
+        self.sender.send_file(room_id, file_path).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -254,6 +283,7 @@ impl DiscordPlatform {
             .await
             .context("fetching Discord bot user")?;
         let bot_user_id = current_user.id;
+        register_discord_commands(&http).await?;
         let gateway_task = tokio::spawn(async move {
             if let Err(error) = client.start().await {
                 let _ = sender.send(DiscordInbound::Error(format!(
@@ -266,6 +296,7 @@ impl DiscordPlatform {
             http,
             receiver,
             bot_user_id,
+            send_options: Arc::new(RwLock::new(discord_send_options(config))),
             _gateway_task: gateway_task,
         })
     }
@@ -378,7 +409,21 @@ impl PlatformSender {
                     Ok(())
                 }
             }
-            Self::Discord(sender) => sender.send_text(room_id, text).await,
+            Self::Discord { sender, options } => {
+                let options = options
+                    .read()
+                    .map_err(|_| anyhow!("Discord send options lock poisoned"))?
+                    .clone();
+                let chunks = discord_text_chunks(text);
+                if should_send_discord_text_as_file(&options, chunks.len()) {
+                    let path = write_long_text_file(&options.long_text_file_dir, room_id, text)?;
+                    sender
+                        .send_file(room_id, path.to_string_lossy().as_ref())
+                        .await
+                } else {
+                    sender.send_chunks(room_id, chunks).await
+                }
+            }
         }
     }
 
@@ -388,7 +433,17 @@ impl PlatformSender {
                 .send_image(room_id, image_path)
                 .await
                 .map_err(Into::into),
-            Self::Discord(sender) => sender.send_image(room_id, image_path).await,
+            Self::Discord { sender, .. } => sender.send_image(room_id, image_path).await,
+        }
+    }
+
+    pub async fn send_file(&self, room_id: &str, file_path: &str) -> Result<()> {
+        match self {
+            Self::Wx4py { sender, .. } => sender
+                .send_file(room_id, file_path)
+                .await
+                .map_err(Into::into),
+            Self::Discord { sender, .. } => sender.send_file(room_id, file_path).await,
         }
     }
 }
@@ -398,28 +453,28 @@ fn should_send_wx4py_text_as_file(options: &Wx4pySendOptions, chunk_count: usize
         && chunk_count >= options.long_text_file_min_chunks.max(1)
 }
 
-fn write_wx4py_long_text_file(
-    options: &Wx4pySendOptions,
-    room_id: &str,
-    text: &str,
-) -> Result<PathBuf> {
-    fs::create_dir_all(&options.long_text_file_dir).with_context(|| {
-        format!(
-            "creating wx4py long text file dir {}",
-            options.long_text_file_dir.display()
-        )
-    })?;
+fn write_long_text_file(output_dir: &PathBuf, room_id: &str, text: &str) -> Result<PathBuf> {
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating long text file dir {}", output_dir.display()))?;
     let file_name = format!(
         "summary-{}-{}.txt",
         safe_filename_component(room_id),
         Local::now().format("%Y%m%d-%H%M%S-%3f")
     );
-    let path = options.long_text_file_dir.join(file_name);
+    let path = output_dir.join(file_name);
     let mut content = String::from("\u{feff}");
     content.push_str(text);
     fs::write(&path, content.as_bytes())
-        .with_context(|| format!("writing wx4py long text file {}", path.display()))?;
+        .with_context(|| format!("writing long text file {}", path.display()))?;
     Ok(path)
+}
+
+fn write_wx4py_long_text_file(
+    options: &Wx4pySendOptions,
+    room_id: &str,
+    text: &str,
+) -> Result<PathBuf> {
+    write_long_text_file(&options.long_text_file_dir, room_id, text)
 }
 
 fn safe_filename_component(value: &str) -> String {
@@ -444,9 +499,9 @@ fn safe_filename_component(value: &str) -> String {
 }
 
 impl DiscordSender {
-    async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
+    async fn send_chunks(&self, room_id: &str, chunks: Vec<String>) -> Result<()> {
         let channel_id = parse_discord_channel_id(room_id)?;
-        for chunk in discord_text_chunks(text) {
+        for chunk in chunks {
             channel_id
                 .send_message(&self.http, CreateMessage::new().content(chunk))
                 .await
@@ -456,16 +511,72 @@ impl DiscordSender {
     }
 
     async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
+        self.send_file(room_id, image_path).await
+    }
+
+    async fn send_file(&self, room_id: &str, file_path: &str) -> Result<()> {
         let channel_id = parse_discord_channel_id(room_id)?;
-        let attachment = CreateAttachment::path(image_path)
+        let attachment = CreateAttachment::path(file_path)
             .await
-            .with_context(|| format!("loading image attachment {image_path}"))?;
+            .with_context(|| format!("loading Discord attachment {file_path}"))?;
         channel_id
             .send_files(&self.http, [attachment], CreateMessage::new())
             .await
-            .with_context(|| format!("sending Discord image to channel {room_id}"))?;
+            .with_context(|| format!("sending Discord attachment to channel {room_id}"))?;
         Ok(())
     }
+}
+
+fn should_send_discord_text_as_file(options: &DiscordSendOptions, chunk_count: usize) -> bool {
+    options.long_text_delivery == DiscordLongTextDelivery::File
+        && chunk_count >= options.long_text_file_min_chunks.max(1)
+}
+
+async fn register_discord_commands(http: &Http) -> Result<()> {
+    let existing = Command::get_global_commands(http)
+        .await
+        .context("listing Discord application commands")?;
+    let has_summary = existing.iter().any(|command| command.name == "summary");
+    let has_image = existing.iter().any(|command| command.name == "image");
+    if !has_summary {
+        Command::create_global_command(
+            http,
+            CreateCommand::new("summary")
+                .description("生成当前频道的聊天总结")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "time",
+                        "可选，例如 24h、30d 或 90m",
+                    )
+                    .required(false),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "image",
+                        "可选：image 生成图片总结",
+                    )
+                    .required(false),
+                ),
+        )
+        .await
+        .context("registering Discord /summary command")?;
+    }
+    if !has_image {
+        Command::create_global_command(
+            http,
+            CreateCommand::new("image")
+                .description("根据一句话生成图片")
+                .add_option(
+                    CreateCommandOption::new(CommandOptionType::String, "prompt", "你想画什么")
+                        .required(true),
+                ),
+        )
+        .await
+        .context("registering Discord /image command")?;
+    }
+    Ok(())
 }
 
 struct DiscordHandler {
@@ -479,8 +590,7 @@ impl EventHandler for DiscordHandler {
         if message.author.bot {
             return;
         }
-        let channel_id = message.channel_id.to_string();
-        if !self.allowed_channels.is_empty() && !self.allowed_channels.contains(&channel_id) {
+        if !self.channel_allowed(&ctx.http, message.channel_id).await {
             return;
         }
 
@@ -504,6 +614,98 @@ impl EventHandler for DiscordHandler {
             is_self: false,
         };
         let _ = self.sender.send(DiscordInbound::Event(event));
+    }
+
+    async fn interaction_create(&self, ctx: SerenityContext, interaction: Interaction) {
+        let Interaction::Command(command) = interaction else {
+            return;
+        };
+        if !matches!(command.data.name.as_str(), "summary" | "image")
+            || !self.channel_allowed(&ctx.http, command.channel_id).await
+        {
+            return;
+        }
+
+        let content = match discord_slash_command_content(&command) {
+            Some(content) => content,
+            None => return,
+        };
+        if let Err(error) = command
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Defer(
+                    CreateInteractionResponseMessage::new().ephemeral(true),
+                ),
+            )
+            .await
+        {
+            tracing::warn!(error = %error, "failed to acknowledge Discord slash command");
+            return;
+        }
+
+        let room_name = command.channel_id.name(&ctx.http).await.ok();
+        let event = PlatformEvent {
+            platform: PlatformKindConfig::Discord,
+            room_id: command.channel_id.to_string(),
+            room_name,
+            stable_id: Some(format!("discord:interaction:{}", command.id)),
+            sender_id: command.user.id.to_string(),
+            sender_name: Some(command.user.name.clone()),
+            content,
+            msg_type: "text".to_string(),
+            timestamp: Utc::now(),
+            is_self: false,
+        };
+        let _ = self.sender.send(DiscordInbound::Event(event));
+    }
+}
+
+impl DiscordHandler {
+    async fn channel_allowed(&self, http: &Http, channel_id: ChannelId) -> bool {
+        if self.allowed_channels.is_empty()
+            || self.allowed_channels.contains(&channel_id.to_string())
+        {
+            return true;
+        }
+        let Ok(Channel::Guild(channel)) = channel_id.to_channel(http).await else {
+            return false;
+        };
+        channel
+            .parent_id
+            .is_some_and(|parent| self.allowed_channels.contains(&parent.to_string()))
+    }
+}
+
+fn discord_slash_command_content(command: &CommandInteraction) -> Option<String> {
+    let value = |name: &str| {
+        command
+            .data
+            .options
+            .iter()
+            .find(|option| option.name == name)
+            .and_then(|option| option.value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    match command.data.name.as_str() {
+        "summary" => {
+            let mut content = String::from("/总结");
+            if let Some(time) = value("time") {
+                content.push(' ');
+                content.push_str(time);
+            }
+            if value("image").is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "image" | "img" | "图片"
+                )
+            }) {
+                content.push_str(" image");
+            }
+            Some(content)
+        }
+        "image" => value("prompt").map(|prompt| format!("/图片 {prompt}")),
+        _ => None,
     }
 }
 
@@ -841,6 +1043,19 @@ fn wx4py_send_options(config: &AgentConfig) -> Wx4pySendOptions {
     Wx4pySendOptions {
         long_text_delivery: config.wx4py.long_text_delivery,
         long_text_file_min_chunks: config.wx4py.long_text_file_min_chunks,
+        long_text_file_dir,
+    }
+}
+
+fn discord_send_options(config: &AgentConfig) -> DiscordSendOptions {
+    let long_text_file_dir = if config.discord.long_text_file_dir.trim().is_empty() {
+        PathBuf::from(&config.runtime.output_dir).join("discord-long-text")
+    } else {
+        PathBuf::from(config.discord.long_text_file_dir.trim())
+    };
+    DiscordSendOptions {
+        long_text_delivery: config.discord.long_text_delivery,
+        long_text_file_min_chunks: config.discord.long_text_file_min_chunks,
         long_text_file_dir,
     }
 }

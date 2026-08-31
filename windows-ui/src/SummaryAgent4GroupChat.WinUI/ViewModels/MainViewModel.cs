@@ -47,6 +47,10 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _platformKind = "wx";
     [ObservableProperty] private string _weChatGroups = string.Empty;
     [ObservableProperty] private string _discordChannels = string.Empty;
+    // Discord bot token is write-only for the same reason as model API keys.
+    [ObservableProperty] private string _discordTokenInput = string.Empty;
+    [ObservableProperty] private string _discordLongTextDelivery = "chunks";
+    [ObservableProperty] private string _discordLongTextFileMinChunks = "3";
     [ObservableProperty] private string _wxdbExecutable = "wxdb";
     [ObservableProperty] private string _wxdbCacheDirectory = string.Empty;
     [ObservableProperty] private string _historyPageSize = "10000";
@@ -364,6 +368,9 @@ public sealed partial class MainViewModel : ObservableObject
         PlatformKind = ReadString("platform", "kind", "wx");
         WeChatGroups = ReadList("wx4py", "groups");
         DiscordChannels = ReadList("discord", "channels");
+        DiscordTokenInput = string.Empty;
+        DiscordLongTextDelivery = ReadString("discord", "long_text_delivery", "chunks");
+        DiscordLongTextFileMinChunks = ReadString("discord", "long_text_file_min_chunks", "3");
         WxdbExecutable = ReadString("wxdb", "executable", "wxdb");
         WxdbCacheDirectory = ReadString("wxdb", "cache_dir", string.Empty);
         HistoryPageSize = ReadString("history", "max_messages", "10000");
@@ -848,6 +855,9 @@ public sealed partial class MainViewModel : ObservableObject
         AddIfChanged(operations, "platform", "kind", PlatformKind);
         AddListIfChanged(operations, "wx4py", "groups", WeChatGroups);
         AddListIfChanged(operations, "discord", "channels", DiscordChannels);
+        AddSecretIfEntered(operations, "discord", "token", DiscordTokenInput);
+        AddIfChanged(operations, "discord", "long_text_delivery", DiscordLongTextDelivery);
+        AddNumberIfChanged(operations, "discord", "long_text_file_min_chunks", DiscordLongTextFileMinChunks, 3);
         AddIfChanged(operations, "wxdb", "executable", WxdbExecutable);
         AddOptionalIfChanged(operations, "wxdb", "cache_dir", WxdbCacheDirectory);
         AddNumberIfChanged(operations, "history", "max_messages", HistoryPageSize, 10000);
@@ -1140,6 +1150,12 @@ public sealed partial class MainViewModel : ObservableObject
             // legacy api_key/api_key_env values. Never read or compare secrets.
             AddOperation(operations, [section], "api_keys", keys);
         }
+    }
+
+    private void AddSecretIfEntered(List<Dictionary<string, object?>> operations, string section, string key, string current)
+    {
+        var value = current.Trim();
+        if (!string.IsNullOrEmpty(value)) AddOperation(operations, [section], key, value);
     }
 
     private static int ParseInt(string? value, int fallback) =>

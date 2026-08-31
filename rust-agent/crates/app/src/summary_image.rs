@@ -637,6 +637,66 @@ pub(crate) async fn generate(
     Ok(artifact)
 }
 
+/// Turn a short user request into a NovelAI V5-oriented prompt, then generate the image.
+/// This intentionally uses the normal image-pipeline slot pool so manual commands cannot stampede
+/// the same provider used by scheduled summary images.
+pub(crate) async fn generate_manual_novelai_image(
+    config: &AgentConfig,
+    image_pipeline_slots: &ImagePipelineSlotPool,
+    room_id: &str,
+    user_prompt: &str,
+) -> Result<ImageArtifact> {
+    let provider = config.image_gen.provider.trim().to_ascii_lowercase();
+    if !matches!(provider.as_str(), "novelai" | "nai") {
+        bail!("图片命令需要将 [image_gen].provider 设置为 novelai 或 nai");
+    }
+    if !config.image_gen.enabled {
+        bail!("图片生成功能未启用");
+    }
+    let retry_notifier = retry_log_notifier(config, room_id.to_string());
+    let llm = configure_llm_tracing(
+        OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
+            .context("initializing LLM client for manual NovelAI image command")?,
+        config,
+    )?
+    .with_retry_notifier(retry_notifier.clone())
+    .with_streaming(false);
+    let request = format!(
+        "用户想画的内容：\n{}\n\n请直接给出最终 NovelAI 正向提示词。",
+        user_prompt.trim()
+    );
+    let prompt = run_llm_stage(
+        config,
+        image_pipeline_slots,
+        room_id,
+        ImagePipelineStage::Prompt,
+        complete_prompt_with_refusal_retry(
+            config,
+            &llm,
+            room_id,
+            "manual NovelAI image prompt",
+            MANUAL_NOVELAI_PROMPT_SYSTEM,
+            &request,
+            MANUAL_NOVELAI_REFUSAL_RETRY,
+        ),
+    )
+    .await
+    .context("calling LLM for manual NovelAI image prompt")?;
+    generate(config, room_id, &prompt, Some(retry_notifier)).await
+}
+
+const MANUAL_NOVELAI_PROMPT_SYSTEM: &str = r#"
+你是 NovelAI Diffusion V5 的提示词设计师。把用户的一句话扩展为一幅单张、可直接出图的动漫插画。
+
+只输出英文正向 prompt，不要解释、不要 Markdown、不要 JSON、不要 negative prompt、不要参数。用英文标签和简洁短语，以逗号分隔。
+从画面主体开始，依次给出：质量与风格、人物数量与主体、外貌/服装、清晰动作或瞬间、镜头构图、场景、光线和色彩。补足用户没有说明但画面必需的安全细节，保持一个明确的视觉中心。
+单人不要虚构 Character 字段。多人时用 Character 1、Character 2 等编号区分人物，并用 source# / target# / mutual# 关系短语明确谁在做什么，避免把两人的外貌或动作混在一起。动作、镜头和关系需要写成自然短句；发色、服装、物件和环境优先使用标签式短语。不要生成文字、水印、UI、签名或不需要的敏感细节。
+"#;
+
+const MANUAL_NOVELAI_REFUSAL_RETRY: &str = r#"
+即使原始想法涉及争议或不适合直接复现的元素，也请改写为中性、安全的动漫场景提示词。不要拒绝，不要解释，只输出英文正向 prompt。
+"#;
+
 pub(crate) async fn send_with_sender(
     config: &AgentConfig,
     sender: &PlatformSender,
