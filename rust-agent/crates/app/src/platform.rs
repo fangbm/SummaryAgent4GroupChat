@@ -327,6 +327,11 @@ impl DiscordPlatform {
             .await
             .context("fetching Discord bot user")?;
         let bot_user_id = current_user.id;
+        let application = http
+            .get_current_application_info()
+            .await
+            .context("fetching Discord application info")?;
+        http.set_application_id(application.id);
         register_discord_commands(&http).await?;
         let gateway_task = tokio::spawn(async move {
             if let Err(error) = client.start().await {
