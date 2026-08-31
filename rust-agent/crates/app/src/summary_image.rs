@@ -25,7 +25,7 @@ use crate::{
         chat_input_for_followup_prompt, complete_chat_summary_with_fallback,
         complete_llm_request_logged,
     },
-    platform::{PlatformSender, PlatformWorker},
+    platform::PlatformWorker,
     render_prompt_template,
     runtime_log::{append_runtime_log, retry_log_notifier},
 };
@@ -478,7 +478,7 @@ pub(crate) async fn prepare_foreground_prompt(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_background(
     config: &AgentConfig,
-    sender: &PlatformSender,
+    worker: &PlatformWorker,
     room_id: &str,
     llm_input: &str,
     chat_messages: &[ChatMessage],
@@ -590,7 +590,7 @@ pub(crate) async fn run_background(
     );
 
     let artifact = generate(config, room_id, &image_prompt, Some(retry_notifier)).await?;
-    send_with_sender(config, sender, room_id, &artifact).await?;
+    send_with_worker(config, worker, room_id, &artifact).await?;
     append_runtime_log(
         config,
         &format!("background image pipeline completed room={}", room_id),
@@ -707,22 +707,6 @@ const MANUAL_NOVELAI_PROMPT_SYSTEM: &str = r#"
 const MANUAL_NOVELAI_REFUSAL_RETRY: &str = r#"
 即使原始想法涉及争议或不适合直接复现的元素，也请改写为中性、安全的动漫场景提示词。不要拒绝，不要解释，只输出英文正向 prompt。
 "#;
-
-pub(crate) async fn send_with_sender(
-    config: &AgentConfig,
-    sender: &PlatformSender,
-    room_id: &str,
-    artifact: &ImageArtifact,
-) -> Result<()> {
-    info!(room_id = %room_id, path = %artifact.path, "sending summary image");
-    sender
-        .send_image(room_id, &artifact.path)
-        .await
-        .context("sending summary image")?;
-    info!(room_id = %room_id, "summary image sent");
-    append_runtime_log(config, &format!("summary image sent room={}", room_id));
-    Ok(())
-}
 
 pub(crate) async fn send_with_worker(
     config: &AgentConfig,

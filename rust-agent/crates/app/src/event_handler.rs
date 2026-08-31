@@ -136,10 +136,9 @@ pub(crate) async fn handle_platform_event(
     }
     if !client.supports(command.target_platform) {
         let message = format!(
-            "暂不支持从 {} 总结 {} 平台消息。当前已接入的平台：{}。",
+            "暂不支持跨平台总结：当前指令来自 {}，目标为 {}。请在目标平台对应的群聊或频道内发送指令。",
             source_platform.as_str(),
-            command.target_platform.as_str(),
-            client.kind().as_str()
+            command.target_platform.as_str()
         );
         append_runtime_log(
             config,

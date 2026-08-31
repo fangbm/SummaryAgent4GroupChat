@@ -12,17 +12,15 @@ use std::{
     time::Duration as StdDuration,
 };
 
+use crate::{
+    platform::PlatformEvent,
+    runtime_log::{append_runtime_log, compact_error_for_runtime},
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use wechat_summary_core::{
-    config::PlatformKindConfig,
-    models::IncomingMessage,
-    AgentConfig, TriggerMatcher,
-};
-use crate::{
-    platform::PlatformEvent,
-    runtime_log::{append_runtime_log, compact_error_for_runtime},
+    config::PlatformKindConfig, models::IncomingMessage, AgentConfig, TriggerMatcher,
 };
 
 pub(crate) struct WxdbCommandWatcher {
@@ -81,9 +79,8 @@ impl WxdbCommandWatcher {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread_state_path = state_path.clone();
-        let thread = thread::spawn(move || {
-            run(config, rooms, sender, thread_stop, thread_state_path)
-        });
+        let thread =
+            thread::spawn(move || run(config, rooms, sender, thread_stop, thread_state_path));
         Self {
             receiver: Some(receiver),
             enabled: true,
@@ -139,7 +136,11 @@ impl Drop for WxdbCommandWatcher {
 }
 
 pub(crate) fn enabled(config: &AgentConfig) -> bool {
-    config.platform.kind == PlatformKindConfig::Wx4py && !config.wx_cli.executable.trim().is_empty()
+    config
+        .platform
+        .enabled_kinds()
+        .contains(&PlatformKindConfig::Wx4py)
+        && !config.wx_cli.executable.trim().is_empty()
 }
 
 pub(crate) fn configured_rooms(config: &AgentConfig) -> Vec<String> {
@@ -333,7 +334,8 @@ impl WatcherErrors {
             .entry(room.to_string())
             .or_insert(WatcherErrorState {
                 first_seen: now,
-                last_logged: now - Duration::seconds(crate::WXDB_COMMAND_WATCH_ERROR_LOG_INTERVAL_SECONDS),
+                last_logged: now
+                    - Duration::seconds(crate::WXDB_COMMAND_WATCH_ERROR_LOG_INTERVAL_SECONDS),
                 suppressed: 0,
             });
 
@@ -416,12 +418,17 @@ fn poll_room(
     let mut events = Vec::new();
     for message in messages {
         let Some(key) = seen_message_key(chat_name, &message) else {
-            tracing::warn!(chat_name, "wxdb watcher ignored message without stable local_id");
+            tracing::warn!(
+                chat_name,
+                "wxdb watcher ignored message without stable local_id"
+            );
             continue;
         };
         if state.contains(&key)
             || state.last_seen_local_id.is_some_and(|last_seen| {
-                message.local_id.is_some_and(|local_id| local_id <= last_seen)
+                message
+                    .local_id
+                    .is_some_and(|local_id| local_id <= last_seen)
             })
         {
             continue;
@@ -470,8 +477,9 @@ fn poll_room(
 
     events.sort_by(|left, right| {
         left.timestamp.cmp(&right.timestamp).then_with(|| {
-            crate::stable_id_number(left.stable_id.as_deref().unwrap_or(""))
-                .cmp(&crate::stable_id_number(right.stable_id.as_deref().unwrap_or("")))
+            crate::stable_id_number(left.stable_id.as_deref().unwrap_or("")).cmp(
+                &crate::stable_id_number(right.stable_id.as_deref().unwrap_or("")),
+            )
         })
     });
     for event in &events {
@@ -497,6 +505,11 @@ fn effective_cache_dir(config: &AgentConfig) -> String {
     }
 }
 
-fn seen_message_key(chat_name: &str, message: &wx4py_client::Wx4pyHistoryMessage) -> Option<String> {
-    message.local_id.map(|local_id| format!("{chat_name}:local:{local_id}"))
+fn seen_message_key(
+    chat_name: &str,
+    message: &wx4py_client::Wx4pyHistoryMessage,
+) -> Option<String> {
+    message
+        .local_id
+        .map(|local_id| format!("{chat_name}:local:{local_id}"))
 }

@@ -1,10 +1,12 @@
 //! Platform client lifecycle, reconnects, and wxdb watcher restarts.
 
+use std::collections::HashMap;
+
 use crate::*;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct PlatformConnectionFingerprint {
-    pub(crate) kind: PlatformKindConfig,
+    pub(crate) kinds: Vec<PlatformKindConfig>,
     wx_python: String,
     wx_script: String,
     wx_ready_timeout: u64,
@@ -33,7 +35,7 @@ impl PlatformConnectionFingerprint {
             .collect::<Vec<_>>();
         group_name_map.sort();
         Self {
-            kind: config.platform.kind,
+            kinds: config.platform.enabled_kinds(),
             wx_python: config.wx4py.python_executable.clone(),
             wx_script: config.wx4py.sidecar_script.clone(),
             wx_ready_timeout: config.wx4py.ready_timeout_seconds,
@@ -104,59 +106,108 @@ impl WxdbWatcherFingerprint {
 }
 
 pub(crate) struct PlatformRuntime {
-    pub(crate) client: Arc<Mutex<PlatformClient>>,
+    clients: HashMap<PlatformKindConfig, Arc<Mutex<PlatformClient>>>,
+    workers: HashMap<PlatformKindConfig, PlatformWorker>,
     pub(crate) worker: PlatformWorker,
     pub(crate) rooms: Vec<String>,
     pub(crate) fingerprint: PlatformConnectionFingerprint,
     pub(crate) watcher: WxdbCommandWatcher,
     pub(crate) watcher_fingerprint: WxdbWatcherFingerprint,
     pub(crate) watcher_restart_at: Option<Instant>,
-    pub(crate) reconnect_at: Option<Instant>,
+    reconnect_at: HashMap<PlatformKindConfig, Instant>,
 }
 
 impl PlatformRuntime {
     pub(crate) async fn start(config: &AgentConfig) -> Result<Self> {
-        let client = PlatformClient::start(config).await.with_context(|| {
-            format!("starting {} platform client", config.platform.kind.as_str())
-        })?;
-        let worker = client.worker();
-        let rooms = client.configured_rooms(config);
+        let (clients, workers, rooms, worker) = Self::connect_all(config).await?;
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            clients,
+            workers,
             worker,
             rooms,
             fingerprint: PlatformConnectionFingerprint::from_config(config),
             watcher: WxdbCommandWatcher::start(config),
             watcher_fingerprint: WxdbWatcherFingerprint::from_config(config),
             watcher_restart_at: None,
-            reconnect_at: None,
+            reconnect_at: HashMap::new(),
         })
     }
 
+    async fn connect_all(
+        config: &AgentConfig,
+    ) -> Result<(
+        HashMap<PlatformKindConfig, Arc<Mutex<PlatformClient>>>,
+        HashMap<PlatformKindConfig, PlatformWorker>,
+        Vec<String>,
+        PlatformWorker,
+    )> {
+        let mut clients = HashMap::new();
+        let mut workers = HashMap::new();
+        let mut rooms = Vec::new();
+        let mut room_platforms = HashMap::new();
+        for kind in config.platform.enabled_kinds() {
+            let client = PlatformClient::start_kind(config, kind)
+                .await
+                .with_context(|| format!("starting {} platform client", kind.as_str()))?;
+            let worker = client.worker();
+            for room in client.configured_rooms(config) {
+                if let Some(existing) = room_platforms.insert(room.clone(), kind) {
+                    if existing != kind {
+                        anyhow::bail!(
+                            "room {room:?} is configured for both {} and {}; use unique room/channel identifiers",
+                            existing.as_str(),
+                            kind.as_str()
+                        );
+                    }
+                }
+                if !rooms.contains(&room) {
+                    rooms.push(room);
+                }
+            }
+            clients.insert(kind, Arc::new(Mutex::new(client)));
+            workers.insert(kind, worker);
+        }
+        let worker = PlatformWorker::Multi {
+            workers: Arc::new(workers.clone()),
+            room_platforms: Arc::new(room_platforms),
+        };
+        Ok((clients, workers, rooms, worker))
+    }
+
     pub(crate) fn request_reconnect(&mut self, config: &AgentConfig, reason: &str) {
-        if self.reconnect_at.is_none() {
+        let now = Instant::now() + PLATFORM_RECONNECT_DELAY;
+        let mut scheduled = Vec::new();
+        for kind in config.platform.enabled_kinds() {
+            if self.reconnect_at.insert(kind, now).is_none() {
+                scheduled.push(kind.as_str());
+            }
+        }
+        if !scheduled.is_empty() {
             append_runtime_log(
                 config,
-                &format!("platform reconnect scheduled reason={reason} delay_seconds=2"),
+                &format!(
+                    "platform reconnect scheduled kinds={} reason={reason} delay_seconds=2",
+                    scheduled.join(",")
+                ),
             );
-            self.reconnect_at = Some(Instant::now() + PLATFORM_RECONNECT_DELAY);
         }
     }
 
     pub(crate) async fn reconnect_if_due(&mut self, config: &AgentConfig) {
-        let Some(reconnect_at) = self.reconnect_at else {
-            return;
-        };
-        if Instant::now() < reconnect_at {
+        let due = self
+            .reconnect_at
+            .iter()
+            .filter(|(_, reconnect_at)| Instant::now() >= **reconnect_at)
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>();
+        if due.is_empty() {
             return;
         }
-
-        match PlatformClient::start(config).await {
-            Ok(client) => {
-                let worker = client.worker();
-                let rooms = client.configured_rooms(config);
+        match Self::connect_all(config).await {
+            Ok((clients, workers, rooms, worker)) => {
                 let previous_state_path = self.watcher.state_path().map(Path::to_path_buf);
-                self.client = Arc::new(Mutex::new(client));
+                self.clients = clients;
+                self.workers = workers;
                 self.worker = worker;
                 self.rooms = rooms;
                 self.fingerprint = PlatformConnectionFingerprint::from_config(config);
@@ -167,17 +218,14 @@ impl PlatformRuntime {
                     WxdbCommandWatcher::start_with_state_path(config, previous_state_path);
                 self.watcher_fingerprint = WxdbWatcherFingerprint::from_config(config);
                 self.watcher_restart_at = None;
-                self.reconnect_at = None;
+                self.reconnect_at.clear();
                 info!(
-                    platform = self.fingerprint.kind.as_str(),
+                    platforms = ?self.fingerprint.kinds,
                     "platform reconnected"
                 );
                 append_runtime_log(
                     config,
-                    &format!(
-                        "platform reconnected kind={}",
-                        self.fingerprint.kind.as_str()
-                    ),
+                    &format!("platform reconnected kinds={:?}", self.fingerprint.kinds),
                 );
             }
             Err(error) => {
@@ -187,9 +235,30 @@ impl PlatformRuntime {
                     config,
                     &format!("platform reconnect failed error={message}; retrying"),
                 );
-                self.reconnect_at = Some(Instant::now() + PLATFORM_RECONNECT_DELAY);
+                let next = Instant::now() + PLATFORM_RECONNECT_DELAY;
+                for kind in due {
+                    self.reconnect_at.insert(kind, next);
+                }
             }
         }
+    }
+
+    pub(crate) fn refresh_runtime_options(&self, config: &AgentConfig) -> Result<()> {
+        for client in self.clients.values() {
+            client
+                .lock()
+                .map_err(|_| anyhow::anyhow!("platform client mutex poisoned"))?
+                .refresh_runtime_options(config)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn event_clients(&self) -> Vec<Arc<Mutex<PlatformClient>>> {
+        self.clients.values().cloned().collect()
+    }
+
+    pub(crate) fn worker_for(&self, kind: PlatformKindConfig) -> Option<PlatformWorker> {
+        self.workers.get(&kind).cloned()
     }
 
     pub(crate) fn note_watcher_disconnected(&mut self, config: &AgentConfig) {

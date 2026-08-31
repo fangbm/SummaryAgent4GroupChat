@@ -177,16 +177,15 @@ async fn run_agent(config_path: &str) -> Result<()> {
     let mut next_artifact_cleanup = Instant::now() + StdDuration::from_secs(6 * 60 * 60);
 
     info!(
-        platform = platform.fingerprint.kind.as_str(),
+        platforms = ?platform.fingerprint.kinds,
         rooms = ?platform.rooms,
         "platform message receiving enabled"
     );
     append_runtime_log(
         config,
         &format!(
-            "platform enabled kind={} rooms={:?}",
-            platform.fingerprint.kind.as_str(),
-            platform.rooms
+            "platform enabled kinds={:?} rooms={:?}",
+            platform.fingerprint.kinds, platform.rooms
         ),
     );
 
@@ -220,11 +219,7 @@ async fn run_agent(config_path: &str) -> Result<()> {
             if new_fingerprint != old_fingerprint {
                 platform.request_reconnect(config, "platform connection configuration changed");
             } else {
-                platform
-                    .client
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("platform client mutex poisoned"))?
-                    .refresh_runtime_options(config)?;
+                platform.refresh_runtime_options(config)?;
             }
             if WxdbWatcherFingerprint::from_config(config) != old_watcher_fingerprint {
                 platform.restart_watcher(config, "configuration changed");
@@ -346,7 +341,9 @@ async fn run_agent(config_path: &str) -> Result<()> {
                 config,
                 &store,
                 matcher,
-                &platform.worker,
+                &platform
+                    .worker_for(PlatformKindConfig::Wx4py)
+                    .unwrap_or_else(|| platform.worker.clone()),
                 &recent_trigger_attempts,
                 &recent_observed_messages,
                 &image_pipeline_slots,
@@ -356,16 +353,19 @@ async fn run_agent(config_path: &str) -> Result<()> {
             );
         }
 
-        if platform.reconnect_at.is_some() {
-            tokio::time::sleep(StdDuration::from_millis(100)).await;
-            continue;
-        }
-        let event_client = Arc::clone(&platform.client);
+        let event_clients = platform.event_clients();
         let event = tokio::task::spawn_blocking(move || {
-            let client_guard = event_client
-                .lock()
-                .map_err(|_| anyhow::anyhow!("platform client mutex poisoned"))?;
-            client_guard.next_event_timeout(StdDuration::from_secs(1))
+            let per_client_timeout =
+                StdDuration::from_millis((1_000 / event_clients.len().max(1) as u64).max(1));
+            for event_client in event_clients {
+                let client_guard = event_client
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("platform client mutex poisoned"))?;
+                if let Some(event) = client_guard.next_event_timeout(per_client_timeout)? {
+                    return Ok(Some(event));
+                }
+            }
+            Ok(None)
         })
         .await
         .context("joining platform event wait")?;
@@ -373,11 +373,18 @@ async fn run_agent(config_path: &str) -> Result<()> {
             Ok(Some(event)) => {
                 let config = config_reloader.config();
                 let matcher = config_reloader.matcher();
+                let Some(worker) = platform.worker_for(event.platform) else {
+                    warn!(
+                        platform = event.platform.as_str(),
+                        "received event from disconnected platform"
+                    );
+                    continue;
+                };
                 enqueue_platform_event(
                     config,
                     &store,
                     matcher,
-                    &platform.worker,
+                    &worker,
                     &recent_trigger_attempts,
                     &recent_observed_messages,
                     &image_pipeline_slots,
@@ -463,12 +470,14 @@ fn config_modified_time(path: &Path) -> Option<SystemTime> {
 
 fn effective_listen_config(config: &AgentConfig) -> ListenConfig {
     let mut listen = config.listen.clone();
-    match config.platform.kind {
-        PlatformKindConfig::Wx4py => {
-            extend_unique_rooms(&mut listen.whitelist_rooms, &config.wx4py.groups)
-        }
-        PlatformKindConfig::Discord => {
-            extend_unique_rooms(&mut listen.whitelist_rooms, &config.discord.channels)
+    for kind in config.platform.enabled_kinds() {
+        match kind {
+            PlatformKindConfig::Wx4py => {
+                extend_unique_rooms(&mut listen.whitelist_rooms, &config.wx4py.groups)
+            }
+            PlatformKindConfig::Discord => {
+                extend_unique_rooms(&mut listen.whitelist_rooms, &config.discord.channels)
+            }
         }
     }
     listen

@@ -45,6 +45,8 @@ public sealed partial class MainViewModel : ObservableObject
     public event Action<string>? MaintenanceDialogRequested;
 
     [ObservableProperty] private string _platformKind = "wx";
+    [ObservableProperty] private bool _weChatPlatformEnabled = true;
+    [ObservableProperty] private bool _discordPlatformEnabled;
     [ObservableProperty] private string _weChatGroups = string.Empty;
     [ObservableProperty] private string _discordChannels = string.Empty;
     // Discord bot token is write-only for the same reason as model API keys.
@@ -374,7 +376,14 @@ public sealed partial class MainViewModel : ObservableObject
 
     public void LoadFormFromConfig()
     {
+        var enabledPlatforms = ReadList("platform", "kinds")
+            .Split([',', '\n', '\r'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(value => value.ToLowerInvariant())
+            .ToHashSet(StringComparer.Ordinal);
         PlatformKind = ReadString("platform", "kind", "wx");
+        if (enabledPlatforms.Count == 0) enabledPlatforms.Add(PlatformKind.ToLowerInvariant());
+        WeChatPlatformEnabled = enabledPlatforms.Contains("wx") || enabledPlatforms.Contains("wechat") || enabledPlatforms.Contains("微信");
+        DiscordPlatformEnabled = enabledPlatforms.Contains("discord") || enabledPlatforms.Contains("dc");
         WeChatGroups = ReadList("wx4py", "groups");
         DiscordChannels = ReadList("discord", "channels");
         DiscordTokenInput = string.Empty;
@@ -870,7 +879,13 @@ public sealed partial class MainViewModel : ObservableObject
     {
         var operations = new List<Dictionary<string, object?>>();
 
+        var enabledPlatforms = new List<string>();
+        if (WeChatPlatformEnabled) enabledPlatforms.Add("wx");
+        if (DiscordPlatformEnabled) enabledPlatforms.Add("discord");
+        if (enabledPlatforms.Count == 0) throw new InvalidOperationException("至少需要启用微信或 Discord 其中一个平台。");
+        PlatformKind = enabledPlatforms[0];
         AddIfChanged(operations, "platform", "kind", PlatformKind);
+        AddListIfChanged(operations, "platform", "kinds", string.Join(", ", enabledPlatforms));
         AddListIfChanged(operations, "wx4py", "groups", WeChatGroups);
         AddListIfChanged(operations, "discord", "channels", DiscordChannels);
         AddSecretIfEntered(operations, "discord", "token", DiscordTokenInput);

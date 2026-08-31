@@ -285,9 +285,30 @@ pub struct ReportGroupConfig {
 pub struct PlatformConfig {
     #[serde(default)]
     pub kind: PlatformKindConfig,
+    /// Enabled platform adapters. When omitted, the legacy single `kind`
+    /// field remains the complete configuration.
+    #[serde(default, alias = "enabled")]
+    pub kinds: Vec<PlatformKindConfig>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+impl PlatformConfig {
+    pub fn enabled_kinds(&self) -> Vec<PlatformKindConfig> {
+        let configured = if self.kinds.is_empty() {
+            vec![self.kind]
+        } else {
+            self.kinds.clone()
+        };
+        let mut result = Vec::new();
+        for kind in configured {
+            if !result.contains(&kind) {
+                result.push(kind);
+            }
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum PlatformKindConfig {
     #[default]
     Wx4py,
@@ -1626,6 +1647,7 @@ mod tests {
     fn platform_defaults_to_wx4py() {
         let cfg: PlatformConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.kind, PlatformKindConfig::Wx4py);
+        assert_eq!(cfg.enabled_kinds(), vec![PlatformKindConfig::Wx4py]);
     }
 
     #[test]
@@ -1639,6 +1661,20 @@ mod tests {
             let cfg: PlatformConfig = toml::from_str(&format!("kind = {value:?}")).unwrap();
             assert_eq!(cfg.kind, PlatformKindConfig::Discord);
         }
+    }
+
+    #[test]
+    fn platform_kinds_enable_both_adapters_and_dedupe_aliases() {
+        let cfg: PlatformConfig = toml::from_str(
+            r#"
+kinds = ["wechat", "dc", "wx", "discord"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.enabled_kinds(),
+            vec![PlatformKindConfig::Wx4py, PlatformKindConfig::Discord]
+        );
     }
 
     #[test]

@@ -1,5 +1,8 @@
 [platform]
+# `kind` is kept for older configs. Set `kinds` to enable one or both
+# adapters in the same process.
 kind = "wx"
+# kinds = ["wx", "discord"]
 
 [wx4py]
 # wx4py uses Windows UI automation, so groups must be WeChat display names.
@@ -16,7 +19,7 @@ long_text_file_dir = ""
 groups = ["paper2galgame种子用户群", "paper2galgame用户群2", "paper2galgame用户群3", "脑机2galgame"]
 
 [discord]
-# Set [platform].kind = "dc" or "discord" to run the Discord bot adapter.
+# Add "discord" to [platform].kinds to run the Discord bot alongside WeChat.
 # Bot token is read from this environment variable unless token is set directly.
 # WinUI writes token directly as a masked, write-only field.
 token_env = "DISCORD_BOT_TOKEN"

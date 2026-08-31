@@ -36,11 +36,12 @@ fn random_generated_image_from_dir(output_dir: &Path) -> Result<Option<ImageArti
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            if !path.is_file() || !is_generated_image(&path) {
+            let mime_type = replayable_image_mime_type(&path)?;
+            if !path.is_file() {
                 return None;
             }
             let metadata = entry.metadata().ok()?;
-            (metadata.len() > 0).then_some((path, metadata.len()))
+            (metadata.len() > 0).then_some((path, metadata.len(), mime_type))
         })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
@@ -56,10 +57,10 @@ fn random_generated_image_from_dir(output_dir: &Path) -> Result<Option<ImageArti
     let sequence = RANDOM_IMAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let index = ((now ^ u128::from(sequence) ^ u128::from(std::process::id()))
         % candidates.len() as u128) as usize;
-    let (path, size_bytes) = candidates.swap_remove(index);
+    let (path, size_bytes, mime_type) = candidates.swap_remove(index);
     Ok(Some(ImageArtifact {
         path: path.to_string_lossy().into_owned(),
-        mime_type: "image/png".into(),
+        mime_type: mime_type.into(),
         size_bytes,
         // Delivery does not consume the digest. Avoid re-reading a potentially
         // large image merely to replay an already written artifact.
@@ -153,6 +154,21 @@ fn is_generated_image(path: &Path) -> bool {
     name.starts_with("summary-") && name.ends_with(".png")
 }
 
+fn replayable_image_mime_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
 fn is_ai_trace(path: &Path) -> bool {
     let name = name(path);
     name.ends_with(".json") && name.contains("-attempt-")
@@ -174,7 +190,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn random_generated_image_uses_only_nonempty_summary_pngs() {
+    fn random_generated_image_uses_any_nonempty_supported_image_in_nai_dir() {
         let directory = std::env::temp_dir().join(format!(
             "summary-agent-random-image-{}",
             SystemTime::now()
@@ -186,17 +202,18 @@ mod tests {
         let nai = directory.join("nai");
         fs::create_dir_all(&nai).unwrap();
         fs::write(nai.join("summary-a.png"), b"png-a").unwrap();
-        fs::write(nai.join("summary-b.png"), b"png-b").unwrap();
-        fs::write(nai.join("summary-empty.png"), []).unwrap();
-        fs::write(directory.join("summary-root.png"), b"not-nai").unwrap();
-        fs::write(nai.join("other.png"), b"not-a-summary").unwrap();
+        fs::write(nai.join("custom.jpg"), b"jpg").unwrap();
+        fs::write(nai.join("empty.webp"), []).unwrap();
+        fs::write(nai.join("notes.txt"), b"not-an-image").unwrap();
+        fs::write(directory.join("root.png"), b"not-nai").unwrap();
 
         let artifact = random_generated_image_from_dir(&nai).unwrap().unwrap();
-        assert!(
-            artifact.path.ends_with("summary-a.png") || artifact.path.ends_with("summary-b.png")
-        );
+        assert!(artifact.path.ends_with("summary-a.png") || artifact.path.ends_with("custom.jpg"));
         assert!(artifact.path.contains("nai"));
-        assert_eq!(artifact.mime_type, "image/png");
+        assert!(matches!(
+            artifact.mime_type.as_str(),
+            "image/png" | "image/jpeg"
+        ));
         let _ = fs::remove_dir_all(directory);
     }
 }

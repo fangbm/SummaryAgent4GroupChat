@@ -9,15 +9,12 @@ use crate::{
     record_image_cooldown_success, summary_image, ImageCooldownRecorder, OperationalTask,
     IMAGE_PIPELINE_REFUSAL_RETRY_PROMPT,
 };
-use crate::{
-    platform::{PlatformSender, PlatformWorker},
-    summary_image::ImagePipelineSlotPool,
-};
+use crate::{platform::PlatformWorker, summary_image::ImagePipelineSlotPool};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_background_image_pipeline(
     config: AgentConfig,
-    sender: PlatformSender,
+    client: PlatformWorker,
     room_id: String,
     llm_input: String,
     chat_messages: Vec<ChatMessage>,
@@ -29,7 +26,7 @@ pub(super) async fn run_background_image_pipeline(
     let result: Result<()> = async {
         summary_image::run_background(
             &config,
-            &sender,
+            &client,
             &room_id,
             &llm_input,
             &chat_messages,
@@ -56,7 +53,7 @@ pub(super) async fn run_background_image_pipeline(
         } else {
             ""
         };
-        if let Err(send_error) = sender
+        if let Err(send_error) = client
             .send_text(
                 &room_id,
                 &format!(

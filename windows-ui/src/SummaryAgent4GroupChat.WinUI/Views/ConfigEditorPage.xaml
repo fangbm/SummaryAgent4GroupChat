@@ -31,7 +31,7 @@
                     <Grid ColumnSpacing="16" RowSpacing="12">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                        <StackPanel Spacing="5"><TextBlock Text="运行平台" /><ComboBox SelectedValuePath="Content" SelectedValue="{Binding PlatformKind, Mode=TwoWay}"><ComboBoxItem Content="wx" /><ComboBoxItem Content="discord" /></ComboBox></StackPanel>
+                        <StackPanel Spacing="5"><TextBlock Text="启用平台" /><StackPanel Orientation="Horizontal" Spacing="18"><CheckBox Content="微信" IsChecked="{Binding WeChatPlatformEnabled, Mode=TwoWay}" /><CheckBox Content="Discord" IsChecked="{Binding DiscordPlatformEnabled, Mode=TwoWay}" /></StackPanel><TextBlock Text="可同时启用；保存后主程序会分别连接两个平台。" Opacity="0.65" FontSize="12" TextWrapping="Wrap" /></StackPanel>
                         <StackPanel Grid.Column="1" Spacing="5"><TextBlock Text="每页历史读取条数" /><NumberBox Value="{Binding HistoryPageSize, Mode=TwoWay}" SpinButtonPlacementMode="Compact" Minimum="1" /></StackPanel>
                         <StackPanel Grid.Row="1" Spacing="5"><TextBlock Text="微信目标群（逗号或换行分隔）" /><TextBox Text="{Binding WeChatGroups, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="88" /></StackPanel>
                         <StackPanel Grid.Row="1" Grid.Column="1" Spacing="5"><TextBlock Text="Discord 频道 ID（逗号或换行分隔）" /><TextBox Text="{Binding DiscordChannels, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="88" /></StackPanel>

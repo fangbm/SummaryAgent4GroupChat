@@ -776,11 +776,21 @@ fn report_groups_read(state: &ControlState) -> Result<Value> {
 fn status_payload(state: &ControlState) -> Result<Value> {
     let config = AgentConfig::from_path(&state.paths.config_path)
         .context("validating current configuration")?;
-    let targets = if config.platform.kind.as_str() == "discord" {
-        config.discord.channels.len()
-    } else {
-        config.wx4py.groups.len()
-    };
+    let platform_kinds = config.platform.enabled_kinds();
+    let targets = platform_kinds
+        .iter()
+        .map(|kind| match kind {
+            wechat_summary_core::config::PlatformKindConfig::Wx4py => config.wx4py.groups.len(),
+            wechat_summary_core::config::PlatformKindConfig::Discord => {
+                config.discord.channels.len()
+            }
+        })
+        .sum::<usize>();
+    let platforms = platform_kinds
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let running = state
         .agent
         .lock()
@@ -790,7 +800,7 @@ fn status_payload(state: &ControlState) -> Result<Value> {
     Ok(json!({
         "agent_running": running.is_some(),
         "agent_pid": running,
-        "platform": config.platform.kind.as_str(),
+        "platform": platforms,
         "targets": targets,
         "config_path": state.paths.config_path,
         "working_dir": state.paths.working_dir,

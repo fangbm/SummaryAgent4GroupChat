@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     path::PathBuf,
     sync::{
@@ -53,14 +53,22 @@ pub enum PlatformSender {
 }
 
 #[derive(Clone)]
-pub struct PlatformWorker {
-    kind: PlatformKindConfig,
-    sender: PlatformSender,
-    history: PlatformHistoryWorker,
+pub enum PlatformWorker {
+    Single {
+        kind: PlatformKindConfig,
+        sender: PlatformSender,
+        history: PlatformHistoryWorker,
+    },
+    /// Routes scheduled work and persisted outbox deliveries by the configured
+    /// room/channel ownership while realtime work keeps using a `Single` worker.
+    Multi {
+        workers: Arc<HashMap<PlatformKindConfig, PlatformWorker>>,
+        room_platforms: Arc<HashMap<String, PlatformKindConfig>>,
+    },
 }
 
 #[derive(Clone)]
-enum PlatformHistoryWorker {
+pub(crate) enum PlatformHistoryWorker {
     Wx4py(Wx4pyHistoryReader),
     Discord {
         http: Arc<Http>,
@@ -112,8 +120,8 @@ enum DiscordInbound {
 }
 
 impl PlatformClient {
-    pub async fn start(config: &AgentConfig) -> Result<Self> {
-        match config.platform.kind {
+    pub async fn start_kind(config: &AgentConfig, kind: PlatformKindConfig) -> Result<Self> {
+        match kind {
             PlatformKindConfig::Wx4py => Ok(Self::Wx4py(Wx4pyPlatform {
                 client: Wx4pyClient::start(&config.wx4py, &config.listen, &config.wx_cli)?,
                 send_options: Arc::new(RwLock::new(wx4py_send_options(config))),
@@ -153,12 +161,12 @@ impl PlatformClient {
 
     pub fn worker(&self) -> PlatformWorker {
         match self {
-            Self::Wx4py(platform) => PlatformWorker {
+            Self::Wx4py(platform) => PlatformWorker::Single {
                 kind: PlatformKindConfig::Wx4py,
                 sender: self.sender(),
                 history: PlatformHistoryWorker::Wx4py(platform.client.history_reader()),
             },
-            Self::Discord(platform) => PlatformWorker {
+            Self::Discord(platform) => PlatformWorker::Single {
                 kind: PlatformKindConfig::Discord,
                 sender: self.sender(),
                 history: PlatformHistoryWorker::Discord {
@@ -200,28 +208,60 @@ impl Wx4pyPlatform {
 }
 
 impl PlatformWorker {
-    pub fn kind(&self) -> PlatformKindConfig {
-        self.kind
-    }
-
     pub fn supports(&self, kind: PlatformKindConfig) -> bool {
-        self.kind == kind
+        match self {
+            Self::Single { kind: current, .. } => *current == kind,
+            Self::Multi { workers, .. } => workers.contains_key(&kind),
+        }
     }
 
-    pub fn sender(&self) -> PlatformSender {
-        self.sender.clone()
+    fn route(&self, room_id: &str) -> Result<&PlatformWorker> {
+        match self {
+            Self::Single { .. } => Ok(self),
+            Self::Multi {
+                workers,
+                room_platforms,
+            } => {
+                let kind = room_platforms.get(room_id).copied().or_else(|| {
+                    // Discord forum post threads have their own numeric IDs and
+                    // are not necessarily listed beside their parent channel.
+                    (room_id.parse::<u64>().is_ok()
+                        && workers.contains_key(&PlatformKindConfig::Discord))
+                    .then_some(PlatformKindConfig::Discord)
+                }).or_else(|| {
+                    (workers.len() == 1 && workers.contains_key(&PlatformKindConfig::Wx4py))
+                        .then_some(PlatformKindConfig::Wx4py)
+                }).ok_or_else(|| {
+                    anyhow!(
+                        "cannot route room {room_id:?}; add it to [wx4py].groups or [discord].channels"
+                    )
+                })?;
+                workers.get(&kind).ok_or_else(|| {
+                    anyhow!("configured platform {} is not connected", kind.as_str())
+                })
+            }
+        }
     }
 
     pub async fn send_text(&self, room_id: &str, text: &str) -> Result<()> {
-        self.sender.send_text(room_id, text).await
+        match self.route(room_id)? {
+            Self::Single { sender, .. } => sender.send_text(room_id, text).await,
+            Self::Multi { .. } => unreachable!("route always resolves a single worker"),
+        }
     }
 
     pub async fn send_image(&self, room_id: &str, image_path: &str) -> Result<()> {
-        self.sender.send_image(room_id, image_path).await
+        match self.route(room_id)? {
+            Self::Single { sender, .. } => sender.send_image(room_id, image_path).await,
+            Self::Multi { .. } => unreachable!("route always resolves a single worker"),
+        }
     }
 
     pub async fn send_file(&self, room_id: &str, file_path: &str) -> Result<()> {
-        self.sender.send_file(room_id, file_path).await
+        match self.route(room_id)? {
+            Self::Single { sender, .. } => sender.send_file(room_id, file_path).await,
+            Self::Multi { .. } => unreachable!("route always resolves a single worker"),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -235,7 +275,11 @@ impl PlatformWorker {
         media_decode_limit: Option<usize>,
         before: Option<&PlatformHistoryCursor>,
     ) -> Result<Vec<PlatformHistoryMessage>> {
-        match &self.history {
+        let routed = self.route(room_id)?;
+        let Self::Single { history, .. } = routed else {
+            unreachable!("route always resolves a single worker");
+        };
+        match history {
             PlatformHistoryWorker::Wx4py(reader) => reader
                 .query_text_messages(
                     room_id,

@@ -609,7 +609,7 @@ pub(crate) async fn run_summary_pipeline(
     if options.image_gen_enabled && !options.defer_text_until_image_ready {
         let image_sent = pipeline_delivery::run_background_image_pipeline(
             config.clone(),
-            client.sender(),
+            client.clone(),
             trigger.room_id.clone(),
             llm_input,
             chat_messages,
