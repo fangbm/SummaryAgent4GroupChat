@@ -314,9 +314,12 @@ impl DiscordPlatform {
             channels = ?allowed_channels,
             "starting Discord gateway client"
         );
-        let intents = GatewayIntents::GUILD_MESSAGES
-            | GatewayIntents::DIRECT_MESSAGES
-            | GatewayIntents::MESSAGE_CONTENT;
+        // Native Discord application commands arrive without the privileged
+        // Message Content intent. Avoid requesting it here: a disabled portal
+        // toggle would otherwise close the whole gateway with code 4014 and
+        // make even `/image` unusable. The HTTP history API will still expose
+        // message text when Message Content is enabled for the application.
+        let intents = discord_gateway_intents();
         let mut client = Client::builder(&token, intents)
             .event_handler(handler)
             .await
@@ -358,6 +361,10 @@ impl DiscordPlatform {
             Err(RecvTimeoutError::Disconnected) => bail!("Discord gateway event channel closed"),
         }
     }
+}
+
+fn discord_gateway_intents() -> GatewayIntents {
+    GatewayIntents::GUILD_MESSAGES | GatewayIntents::DIRECT_MESSAGES
 }
 
 async fn query_discord_history(
@@ -1431,6 +1438,15 @@ mod tests {
                 Some("/图片".to_string())
             );
         }
+    }
+
+    #[test]
+    fn discord_gateway_intents_do_not_require_message_content() {
+        let intents = discord_gateway_intents();
+
+        assert!(intents.contains(GatewayIntents::GUILD_MESSAGES));
+        assert!(intents.contains(GatewayIntents::DIRECT_MESSAGES));
+        assert!(!intents.contains(GatewayIntents::MESSAGE_CONTENT));
     }
 
     #[test]
