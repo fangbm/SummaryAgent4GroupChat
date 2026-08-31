@@ -897,37 +897,37 @@ public sealed partial class MainViewModel : ObservableObject
 
         AddListIfChanged(operations, "listen", "triggers", TriggerCommands);
         AddListIfChanged(operations, "listen", "whitelist_rooms", WhitelistRooms);
-        AddBoolIfChanged(operations, "listen", "require_allowed_users", RequireAllowedUsers);
+        AddBoolIfChanged(operations, "listen", "require_allowed_users", RequireAllowedUsers, false);
         AddListIfChanged(operations, "listen", "allowed_users", AllowedUsers);
-        AddBoolIfChanged(operations, "listen", "ignore_self", IgnoreSelf);
+        AddBoolIfChanged(operations, "listen", "ignore_self", IgnoreSelf, true);
         AddNumberIfChanged(operations, "rate_limit", "successful_request_cooldown_seconds", RequestCooldownSeconds, 300);
         AddNumberIfChanged(operations, "rate_limit", "successful_image_cooldown_seconds", ImageCooldownSeconds, 0);
-        AddBoolIfChanged(operations, "manual_summary", "image_by_default", ManualImagesByDefault);
+        AddBoolIfChanged(operations, "manual_summary", "image_by_default", ManualImagesByDefault, false);
         AddIfChanged(operations, "text_summary", "detail", SummaryDetail);
-        AddBoolIfChanged(operations, "budget", "enabled", BudgetEnabled);
+        AddBoolIfChanged(operations, "budget", "enabled", BudgetEnabled, false);
         AddNumberIfChanged(operations, "budget", "daily_summary_limit", DailySummaryLimit, 0);
         AddNumberIfChanged(operations, "budget", "daily_image_limit", DailyImageLimit, 0);
         AddNumberIfChanged(operations, "budget", "daily_media_limit", DailyMediaLimit, 0);
 
-        AddBoolIfChanged(operations, "scheduled_summary", "enabled", ScheduleEnabled);
+        AddBoolIfChanged(operations, "scheduled_summary", "enabled", ScheduleEnabled, true);
         var scheduleParts = ScheduleTime.Split(':', StringSplitOptions.TrimEntries);
         AddNumberIfChanged(operations, "scheduled_summary", "local_hour", scheduleParts.ElementAtOrDefault(0), 22);
         AddNumberIfChanged(operations, "scheduled_summary", "local_minute", scheduleParts.ElementAtOrDefault(1), 0);
         AddNumberIfChanged(operations, "scheduled_summary", "range_hours", ScheduleRangeHours, 24);
         AddListIfChanged(operations, "scheduled_summary", "rooms", ScheduleRooms);
-        AddBoolIfChanged(operations, "scheduled_summary", "send_text", ScheduleSendText);
-        AddBoolIfChanged(operations, "scheduled_summary", "send_image", ScheduleSendImage);
+        AddBoolIfChanged(operations, "scheduled_summary", "send_text", ScheduleSendText, true);
+        AddBoolIfChanged(operations, "scheduled_summary", "send_image", ScheduleSendImage, true);
 
         AddSecretKeysIfEntered(operations, "llm", LlmApiKeysInput);
         AddOptionalIfChanged(operations, "llm", "base_url", LlmBaseUrl);
         AddOptionalIfChanged(operations, "llm", "model", LlmModel);
         AddNumberIfChanged(operations, "llm", "timeout_seconds", LlmTimeoutSeconds, 120);
-        AddBoolIfChanged(operations, "llm", "stream", LlmStreamingEnabled);
+        AddBoolIfChanged(operations, "llm", "stream", LlmStreamingEnabled, true);
         AddNumberIfChanged(operations, "llm", "stream_first_event_timeout_seconds", LlmStreamFirstEventTimeoutSeconds, 30);
         AddNumberIfChanged(operations, "llm", "stream_idle_timeout_seconds", LlmStreamIdleTimeoutSeconds, 30);
         AddNumberIfChanged(operations, "llm", "max_output_tokens", LlmMaxOutputTokens, 2000);
         AddNumberIfChanged(operations, "llm", "max_concurrent_chunk_requests", LlmChunkConcurrency, 4);
-        AddBoolIfChanged(operations, "image_gen", "enabled", ImageGenerationEnabled);
+        AddBoolIfChanged(operations, "image_gen", "enabled", ImageGenerationEnabled, true);
         AddIfChanged(operations, "image_gen", "provider", ImageProvider);
         AddSecretKeysIfEntered(operations, "image_gen", ImageApiKeysInput);
         AddOptionalIfChanged(operations, "image_gen", "base_url", ImageBaseUrl);
@@ -935,7 +935,7 @@ public sealed partial class MainViewModel : ObservableObject
         AddIfChanged(operations, "image_gen", "size", ImageSize);
         AddOptionalIfChanged(operations, "image_gen", "resolution", ImageResolution);
         AddOptionalIfChanged(operations, "image_gen", "quality", ImageQuality);
-        AddBoolIfChanged(operations, "image_gen", "official_fallback", ImageOfficialFallback);
+        AddBoolIfChanged(operations, "image_gen", "official_fallback", ImageOfficialFallback, false);
         AddNumberIfChanged(operations, "image_gen", "poll_initial_delay_seconds", ImagePollInitialDelaySeconds, 10);
         AddNumberIfChanged(operations, "image_gen", "poll_interval_seconds", ImagePollIntervalSeconds, 5);
         AddNumberIfChanged(operations, "image_gen", "timeout_seconds", ImageTimeoutSeconds, 300);
@@ -943,7 +943,7 @@ public sealed partial class MainViewModel : ObservableObject
         AddNumberIfChanged(operations, "image_gen", "max_concurrent_per_key", ImageMaxConcurrentPerKey, 0);
         AddOptionalIfChanged(operations, "image_gen", "prompt_template", ImagePromptTemplate);
         AddJsonObjectOperation(operations, "image_gen", "request_body_overrides", ImageRequestBodyOverridesJson);
-        AddBoolIfChanged(operations, "novelai", "enabled", NovelAiEnabled);
+        AddBoolIfChanged(operations, "novelai", "enabled", NovelAiEnabled, false);
         AddSecretKeysIfEntered(operations, "novelai", NovelAiApiKeysInput);
         AddOptionalIfChanged(operations, "novelai", "base_url", NovelAiBaseUrl);
         AddOptionalIfChanged(operations, "novelai", "model", NovelAiModel);
@@ -955,9 +955,9 @@ public sealed partial class MainViewModel : ObservableObject
         AddNumberIfChanged(operations, "image_pipeline", "max_concurrent_requests", ImagePipelineMaxConcurrentRequests, 0);
         AddNumberIfChanged(operations, "image_pipeline", "summary_total_timeout_seconds", ImageSummaryTotalTimeoutSeconds, 240);
         AddNumberIfChanged(operations, "image_pipeline", "prompt_total_timeout_seconds", ImagePromptTotalTimeoutSeconds, 120);
-        AddBoolIfChanged(operations, "image_caption", "enabled", ImageCaptionEnabled);
-        AddBoolIfChanged(operations, "video_caption", "enabled", VideoCaptionEnabled);
-        AddBoolIfChanged(operations, "voice_transcription", "enabled", VoiceTranscriptionEnabled);
+        AddBoolIfChanged(operations, "image_caption", "enabled", ImageCaptionEnabled, false);
+        AddBoolIfChanged(operations, "video_caption", "enabled", VideoCaptionEnabled, false);
+        AddBoolIfChanged(operations, "voice_transcription", "enabled", VoiceTranscriptionEnabled, false);
         AddProviderFallbackOperations(operations, ProviderFallbacksJson);
 
         AddRoomCapabilityOperations(operations);
@@ -1012,9 +1012,14 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    private void AddBoolIfChanged(List<Dictionary<string, object?>> operations, string section, string key, bool current)
+    private void AddBoolIfChanged(
+        List<Dictionary<string, object?>> operations,
+        string section,
+        string key,
+        bool current,
+        bool defaultValue)
     {
-        if (current != ReadBool(section, key, current))
+        if (current != ReadBool(section, key, defaultValue))
         {
             AddOperation(operations, [section], key, current);
         }
