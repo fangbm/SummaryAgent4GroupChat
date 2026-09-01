@@ -28,6 +28,9 @@ token_env = "DISCORD_BOT_TOKEN"
 # Non-empty channels are automatically accepted by the trigger matcher and used by scheduled summaries.
 # Empty means the Discord adapter falls back to numeric channel IDs from listen.whitelist_rooms.
 channels = []
+# Discord /image and manga results are posted here; source channels still
+# control command authorization.
+image_output_channel_id = ""
 # chunks: Discord messages are split below the 2,000 character platform limit.
 # file: when chunk count reaches long_text_file_min_chunks, send one UTF-8 .txt attachment.
 long_text_delivery = "chunks"

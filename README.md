@@ -170,11 +170,12 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 | `/总结 dc 1d` | 在当前群中请求 Discord 平台最近一天的总结。 |
 | `/总结 微信 2h 图片` | 总结微信最近两小时，并按图片开关生成或跳过配图。 |
 | `/总结 24h 预览` | 生成文字预览，仅保存在任务中心，便于检查模型与提示词。 |
-| `/图片 [prompt]`、`/img [prompt]`、`/image [prompt]` | 带 prompt 时让 LLM 写 NovelAI V5 提示词并生成新图；不带 prompt 时从已有 NovelAI 产物中随机发一张到当前微信群、Discord 频道或论坛帖子线程。 |
+| `/图片 [prompt]`、`/img [prompt]`、`/image [prompt]` | 带 prompt 时让 LLM 按 NAI V5 工作流写提示词并生成新图；不带 prompt 时随机发送已有 NovelAI 产物。 |
+| `/image manga [2-8] [story]`、`/图片 漫画 [2-8] [故事]` | 规划并顺序生成连续多页漫画；页数省略时默认为 8，只有全部页面生成后才开始投递。 |
 
 `图片`、`image`、`img` 均可用。`[manual_summary].image_by_default = false` 时，只有包含图片参数才生成图片；设为 `true` 时含图片参数表示跳过生图。
 
-Discord 使用原生 Slash Commands：`/summary`、`/总结`（可选 `platform`、`time`、`image`），以及 `/image`、`/img`、`/图片`（可选 `prompt`；留空随机发送已有 NovelAI 图片）。这些命令会映射到同一条总结或手动生图链路；Discord 普通消息中的同名命令不会再触发。全局命令由 Discord 同步，首次出现可能需要短暂传播时间。Discord 长文本默认分段发送；在“接入平台”页选 `file` 后，达到阈值会改用 `.txt` 附件。图片、音频、视频和普通文件都通过同一个附件发送链路投递。
+Discord 使用原生 Slash Commands：`/summary`、`/总结`（可选 `platform`、`time`、`image`），以及 `/image`、`/img`、`/图片`（可选 `prompt`、`mode=single|manga`、`pages=2-8`）。Discord 图片任务要求 `[discord].image_output_channel_id`，命令来源频道只负责鉴权，进度和编号图片统一发送到该频道；机器人需要查看频道、发消息和上传附件权限。Discord 普通消息中的同名命令不会再触发。全局命令由 Discord 同步，首次出现可能需要短暂传播时间。Discord 长文本默认分段发送；在“接入平台”页选 `file` 后，达到阈值会改用 `.txt` 附件。
 
 定时总结由 `[scheduled_summary]` 控制，默认每天本地时间 22:00 汇总 24 小时。定时任务不受手动图片冷却影响。
 
@@ -210,9 +211,11 @@ sampler = "k_dpmpp_2m_sde"
 negative_prompt = "lowres, blurry, watermark"
 ```
 
+Discord 图片输出频道单独配置在 `[discord]`，例如 `image_output_channel_id = "123456789012345678"`。
+
 WinUI 的“模型与媒体”页也提供同一组参数输入。NovelAI API Token 是账号凭据，请只填自己的持久化 Token，不要写入日志、截图或提交到仓库。
 
-`/图片` 系列仅在 `[novelai].enabled = true` 时启用。它使用 NAI V5 的字段分工：标签式外观/场景、短句式动作/镜头、多人时以 `Character N` 和 `source#` / `target#` / `mutual#` 明确关系；不会把负面提示词或参数混入正向 Prompt。这个约束参考了 [nai-flow](https://github.com/fangbm/nai-flow) 的 V5 工作流字段与 [nai5-prompting](https://github.com/Miint-Sunny/nai5-prompting) 的提示词方法。
+`/图片` 系列仅在 `[novelai].enabled = true` 时启用。单图命令使用一个清晰的视觉事件、镜头、定格动作和可见光源；漫画命令先由 LLM 返回严格 JSON 分镜，再把场景放入基础 Prompt、把角色外观放入独立 Character 字段。默认漫画页面不加入文字，只有用户明确要求时才生成对话。显式请求 Mochizuki/望月时才加入 `artist:mochizuki kei`；其他请求不会强制该画风。这个约束参考了 [nai-flow](https://github.com/fangbm/nai-flow) 的 V5 工作流、[NAI 多角色文档](https://docs.novelai.net/en/image/multiplecharacters/) 与 [nai5-prompting](https://github.com/Miint-Sunny/nai5-prompting) 的提示词方法。
 
 ## 运行与排障
 

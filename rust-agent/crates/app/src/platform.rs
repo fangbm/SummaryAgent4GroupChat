@@ -52,6 +52,7 @@ pub enum PlatformSender {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum PlatformWorker {
     Single {
@@ -309,6 +310,7 @@ impl DiscordPlatform {
         let handler = DiscordHandler {
             sender: sender.clone(),
             allowed_channels: allowed_channels.clone(),
+            image_output_channel_id: config.discord.image_output_channel_id.trim().to_string(),
         };
         tracing::info!(
             channels = ?allowed_channels,
@@ -635,9 +637,21 @@ fn create_discord_summary_command(name: &str) -> CreateCommand {
 
 fn create_discord_image_command(name: &str) -> CreateCommand {
     CreateCommand::new(name)
-        .description("根据一句话生成图片；留空随机发送已有图片")
+        .description("根据提示生成图片或多页漫画；留空随机发送已有图片")
         .add_option(
             CreateCommandOption::new(CommandOptionType::String, "prompt", "你想画什么")
+                .required(false),
+        )
+        .add_option(
+            CreateCommandOption::new(CommandOptionType::String, "mode", "single 或 manga")
+                .add_string_choice("single", "single")
+                .add_string_choice("manga", "manga")
+                .required(false),
+        )
+        .add_option(
+            CreateCommandOption::new(CommandOptionType::Integer, "pages", "漫画页数（2-8）")
+                .min_int_value(2)
+                .max_int_value(8)
                 .required(false),
         )
 }
@@ -645,6 +659,7 @@ fn create_discord_image_command(name: &str) -> CreateCommand {
 struct DiscordHandler {
     sender: mpsc::Sender<DiscordInbound>,
     allowed_channels: HashSet<String>,
+    image_output_channel_id: String,
 }
 
 #[async_trait]
@@ -678,6 +693,7 @@ impl EventHandler for DiscordHandler {
             msg_type,
             timestamp: message.timestamp.to_utc(),
             is_self: false,
+            task_id_hint: None,
         };
         let _ = self.sender.send(DiscordInbound::Event(event));
     }
@@ -696,15 +712,81 @@ impl EventHandler for DiscordHandler {
             Some(content) => content,
             None => return,
         };
-        if let Err(error) = command
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Defer(
-                    CreateInteractionResponseMessage::new().ephemeral(true),
-                ),
-            )
-            .await
+
+        if is_discord_image_command_name(command.data.name.as_str())
+            && self.image_output_channel_id.trim().is_empty()
         {
+            let _ = command
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("Discord 图片输出频道尚未配置，请设置 [discord].image_output_channel_id。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        if is_discord_image_command_name(command.data.name.as_str())
+            && parse_discord_channel_id(&self.image_output_channel_id).is_err()
+        {
+            let _ = command
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("Discord 图片输出频道 ID 无效，必须是数字频道 ID。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        if is_discord_image_command_name(command.data.name.as_str()) {
+            let output_channel = match parse_discord_channel_id(&self.image_output_channel_id) {
+                Ok(channel) => channel,
+                Err(_) => return,
+            };
+            let header = format!(
+                "🖼️ 图片任务 `{}` 已排队 · <@{}> · 来源 <#{}>",
+                command.id, command.user.id, command.channel_id
+            );
+            if let Err(error) = output_channel
+                .send_message(&ctx.http, CreateMessage::new().content(header))
+                .await
+            {
+                tracing::warn!(error = %error, "Discord image output channel preflight failed");
+                let _ = command
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(
+                                    "无法发送到 Discord 图片输出频道；请检查频道权限。未开始生成。",
+                                )
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+        }
+        let response = if is_discord_image_command_name(command.data.name.as_str()) {
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!(
+                        "图片任务已接受，结果将发送到 <#{}>。",
+                        self.image_output_channel_id
+                    ))
+                    .ephemeral(true),
+            )
+        } else {
+            CreateInteractionResponse::Defer(
+                CreateInteractionResponseMessage::new().ephemeral(true),
+            )
+        };
+        if let Err(error) = command.create_response(&ctx.http, response).await {
             tracing::warn!(error = %error, "failed to acknowledge Discord slash command");
             return;
         }
@@ -721,6 +803,8 @@ impl EventHandler for DiscordHandler {
             msg_type: "text".to_string(),
             timestamp: Utc::now(),
             is_self: false,
+            task_id_hint: is_discord_image_command_name(command.data.name.as_str())
+                .then(|| command.id.to_string()),
         };
         let _ = self.sender.send(DiscordInbound::Event(event));
     }
@@ -753,12 +837,22 @@ fn discord_slash_command_content(command: &CommandInteraction) -> Option<String>
             .map(str::trim)
             .filter(|value| !value.is_empty())
     };
+    let int_value = |name: &str| {
+        command
+            .data
+            .options
+            .iter()
+            .find(|option| option.name == name)
+            .and_then(|option| option.value.as_i64())
+    };
     discord_slash_command_content_from_values(
         command.data.name.as_str(),
         value("platform"),
         value("time"),
         value("image"),
         value("prompt"),
+        value("mode"),
+        int_value("pages"),
     )
 }
 
@@ -768,6 +862,8 @@ fn discord_slash_command_content_from_values(
     time: Option<&str>,
     image: Option<&str>,
     prompt: Option<&str>,
+    mode: Option<&str>,
+    pages: Option<i64>,
 ) -> Option<String> {
     if is_discord_summary_command_name(name) {
         let mut content = String::from("/总结");
@@ -790,10 +886,22 @@ fn discord_slash_command_content_from_values(
         return Some(content);
     }
     if is_discord_image_command_name(name) {
-        return Some(match prompt {
-            Some(prompt) => format!("/图片 {prompt}"),
-            None => "/图片".to_string(),
-        });
+        let manga = mode.is_some_and(|value| value.eq_ignore_ascii_case("manga"))
+            || (mode.is_none() && pages.is_some());
+        let mut content = if manga {
+            String::from("/图片 manga")
+        } else {
+            String::from("/图片")
+        };
+        if let Some(pages) = pages {
+            content.push(' ');
+            content.push_str(&pages.to_string());
+        }
+        if let Some(prompt) = prompt {
+            content.push(' ');
+            content.push_str(prompt);
+        }
+        return Some(content);
     }
     None
 }
@@ -830,6 +938,7 @@ pub struct PlatformEvent {
     pub msg_type: String,
     pub timestamp: DateTime<Utc>,
     pub is_self: bool,
+    pub task_id_hint: Option<String>,
 }
 
 impl PlatformEvent {
@@ -846,6 +955,7 @@ impl PlatformEvent {
             msg_type: "text".to_string(),
             timestamp,
             is_self: false,
+            task_id_hint: None,
         })
     }
 }
@@ -1421,23 +1531,53 @@ mod tests {
                 Some("24h"),
                 Some("img"),
                 None,
+                None,
+                None,
             ),
             Some("/总结 wx 24h image".to_string())
         );
         assert_eq!(
-            discord_slash_command_content_from_values("summary", None, Some("1d"), None, None,),
+            discord_slash_command_content_from_values(
+                "summary",
+                None,
+                Some("1d"),
+                None,
+                None,
+                None,
+                None,
+            ),
             Some("/总结 1d".to_string())
         );
         for name in ["image", "img", "图片"] {
             assert_eq!(
-                discord_slash_command_content_from_values(name, None, None, None, Some("夜景")),
+                discord_slash_command_content_from_values(
+                    name,
+                    None,
+                    None,
+                    None,
+                    Some("夜景"),
+                    None,
+                    None
+                ),
                 Some("/图片 夜景".to_string())
             );
             assert_eq!(
-                discord_slash_command_content_from_values(name, None, None, None, None),
+                discord_slash_command_content_from_values(name, None, None, None, None, None, None),
                 Some("/图片".to_string())
             );
         }
+        assert_eq!(
+            discord_slash_command_content_from_values(
+                "image",
+                None,
+                None,
+                None,
+                Some("海边列车"),
+                Some("manga"),
+                Some(2)
+            ),
+            Some("/图片 manga 2 海边列车".to_string())
+        );
     }
 
     #[test]

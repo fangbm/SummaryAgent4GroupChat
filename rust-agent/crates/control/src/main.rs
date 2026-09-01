@@ -643,6 +643,9 @@ fn task_retry(state: &ControlState, params: &Value) -> Result<Value> {
     let original = store
         .task(required_id(params)?)?
         .ok_or_else(|| anyhow!("task not found"))?;
+    if original.source.starts_with("manual_image") {
+        bail!("图片任务请重新发送 /image 命令；任务中心仅支持重试总结任务");
+    }
     let retry = store.create_task(NewTask {
         room_id: &original.room_id,
         source: "manual_retry",

@@ -58,6 +58,16 @@ pub enum AiError {
     Base64(#[from] base64::DecodeError),
 }
 
+/// Structured NovelAI V5 prompt fields. The base caption describes the scene;
+/// Character captions stay isolated so appearance details do not leak between
+/// roles.
+#[derive(Debug, Clone, Default)]
+pub struct NovelAiPrompt {
+    pub base_caption: String,
+    pub character_captions: Vec<String>,
+    pub negative_prompt: String,
+}
+
 #[derive(Debug)]
 enum ChatCompletionRequestError {
     Http(reqwest::Error),
@@ -2943,7 +2953,10 @@ impl OpenAiImageClient {
         output_dir: impl AsRef<Path>,
     ) -> Result<ImageArtifact, AiError> {
         let output_dir = output_dir.as_ref();
-        match self.generate_from_prompt_primary(prompt, output_dir).await {
+        match self
+            .generate_from_prompt_primary(prompt, &[], "", output_dir)
+            .await
+        {
             Ok(artifact) => Ok(artifact),
             Err(error) if is_provider_failover_error(&error) && !self.fallbacks.is_empty() => {
                 let mut last_error = error;
@@ -2955,7 +2968,46 @@ impl OpenAiImageClient {
                         "image generation primary failed; trying fallback provider"
                     );
                     match fallback
-                        .generate_from_prompt_primary(prompt, output_dir)
+                        .generate_from_prompt_primary(prompt, &[], "", output_dir)
+                        .await
+                    {
+                        Ok(artifact) => return Ok(artifact),
+                        Err(error) if is_provider_failover_error(&error) => last_error = error,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(last_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn generate_from_novelai_prompt(
+        &self,
+        prompt: &NovelAiPrompt,
+        output_dir: impl AsRef<Path>,
+    ) -> Result<ImageArtifact, AiError> {
+        let output_dir = output_dir.as_ref();
+        match self
+            .generate_from_prompt_primary(
+                &prompt.base_caption,
+                &prompt.character_captions,
+                &prompt.negative_prompt,
+                output_dir,
+            )
+            .await
+        {
+            Ok(artifact) => Ok(artifact),
+            Err(error) if is_provider_failover_error(&error) && !self.fallbacks.is_empty() => {
+                let mut last_error = error;
+                for fallback in &self.fallbacks {
+                    match fallback
+                        .generate_from_prompt_primary(
+                            &prompt.base_caption,
+                            &prompt.character_captions,
+                            &prompt.negative_prompt,
+                            output_dir,
+                        )
                         .await
                     {
                         Ok(artifact) => return Ok(artifact),
@@ -2972,6 +3024,8 @@ impl OpenAiImageClient {
     async fn generate_from_prompt_primary(
         &self,
         prompt: &str,
+        character_captions: &[String],
+        negative_prompt: &str,
         output_dir: &Path,
     ) -> Result<ImageArtifact, AiError> {
         let novelai = is_novelai_image_provider(&self.config.provider);
@@ -2981,7 +3035,11 @@ impl OpenAiImageClient {
             image_generations_endpoint(&self.base_url)
         };
         let payload = if novelai {
-            self.novelai_image_generation_payload(prompt)
+            self.novelai_image_generation_payload_with_parts(
+                prompt,
+                character_captions,
+                negative_prompt,
+            )
         } else {
             self.image_generation_payload(prompt)
         };
@@ -3276,14 +3334,23 @@ impl OpenAiImageClient {
         payload
     }
 
+    #[cfg(test)]
     fn novelai_image_generation_payload(&self, prompt: &str) -> Value {
+        self.novelai_image_generation_payload_with_parts(prompt, &[], "")
+    }
+
+    fn novelai_image_generation_payload_with_parts(
+        &self,
+        prompt: &str,
+        character_captions: &[String],
+        negative_prompt: &str,
+    ) -> Value {
         let (width, height) = novelai_image_dimensions(&self.config.size);
         let params_version = if self.model.trim().starts_with("nai-diffusion-5") {
             4
         } else {
             3
         };
-        let negative_prompt = "";
         // Keep the V5 baseline aligned with the dedicated NAI flow. Overrides
         // remain available for users who want a different sampler or preset.
         let seed = u32::from_le_bytes(
@@ -3315,7 +3382,13 @@ impl OpenAiImageClient {
                 "legacy_v3_extend": false,
                 "add_original_image": true,
                 "v4_prompt": {
-                    "caption": { "base_caption": prompt, "char_captions": [] },
+                    "caption": {
+                        "base_caption": prompt,
+                        "char_captions": character_captions
+                            .iter()
+                            .map(|caption| json!({ "char_caption": caption, "centers": [] }))
+                            .collect::<Vec<_>>()
+                    },
                     "use_coords": false,
                     "use_order": true
                 },
@@ -4622,6 +4695,33 @@ mod tests {
             payload["parameters"]["v4_prompt"]["caption"]["base_caption"],
             "anime group summary poster"
         );
+    }
+
+    #[test]
+    fn novelai_payload_keeps_character_captions_in_separate_fields() {
+        let mut config = image_config();
+        config.provider = "novelai".into();
+        config.model = Some("nai-diffusion-5-full".into());
+        let client = image_client(config);
+        let payload = client.novelai_image_generation_payload_with_parts(
+            "two characters on a platform",
+            &["girl, black hair".into(), "boy, brown hair".into()],
+            "extra characters, bad hands",
+        );
+
+        assert_eq!(
+            payload["parameters"]["v4_prompt"]["caption"]["char_captions"][0]["char_caption"],
+            "girl, black hair"
+        );
+        assert_eq!(
+            payload["parameters"]["v4_prompt"]["caption"]["char_captions"][1]["char_caption"],
+            "boy, brown hair"
+        );
+        assert_eq!(
+            payload["parameters"]["negative_prompt"],
+            "extra characters, bad hands"
+        );
+        assert_eq!(payload["parameters"]["uc"], "extra characters, bad hands");
     }
 
     #[test]

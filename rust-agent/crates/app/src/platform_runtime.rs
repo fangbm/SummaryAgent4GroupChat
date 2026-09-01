@@ -22,6 +22,7 @@ pub(crate) struct PlatformConnectionFingerprint {
     discord_token: Option<String>,
     discord_token_env: String,
     discord_channels: Vec<String>,
+    discord_image_output_channel_id: String,
     whitelist_rooms: Vec<String>,
 }
 
@@ -51,6 +52,7 @@ impl PlatformConnectionFingerprint {
             discord_token: config.discord.token.clone(),
             discord_token_env: config.discord.token_env.clone(),
             discord_channels: config.discord.channels.clone(),
+            discord_image_output_channel_id: config.discord.image_output_channel_id.clone(),
             whitelist_rooms: config.listen.whitelist_rooms.clone(),
         }
     }

@@ -2,15 +2,17 @@
 
 use std::{
     collections::VecDeque,
+    fs,
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration as StdDuration, Instant},
 };
 
 use anyhow::{bail, Context, Error, Result};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::{info, warn};
-use wechat_summary_ai::{OpenAiCompatibleLlm, OpenAiImageClient, RetryNotifier};
+use wechat_summary_ai::{NovelAiPrompt, OpenAiCompatibleLlm, OpenAiImageClient, RetryNotifier};
 use wechat_summary_core::{
     config::LlmConfig,
     models::{ChatMessage, ImageArtifact},
@@ -638,6 +640,205 @@ pub(crate) async fn generate(
     Ok(artifact)
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MangaPlan {
+    #[serde(default)]
+    title: String,
+    characters: Vec<MangaCharacter>,
+    pages: Vec<MangaPage>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MangaCharacter {
+    name: String,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MangaPage {
+    title: String,
+    layout: String,
+    panels: Vec<String>,
+    #[serde(default)]
+    continuity: String,
+    #[serde(default)]
+    negative_prompt: String,
+}
+
+const MANGA_STATIC_NEGATIVE: &str =
+    "extra characters, duplicate character, fused body, conjoined, mixed faces, costume swap, extra arms, extra legs, bad hands";
+
+const NAI5_SINGLE_PROMPT_SYSTEM: &str = r#"
+You are a NovelAI Diffusion V5 prompt editor. Turn the user's request into one
+compact English positive prompt for `v4_prompt.caption.base_caption`.
+
+Choose one memorable visual event, one camera distance and direction, one
+frozen readable moment, and a concrete setting with visible light or material.
+Keep actions and shared-object ownership unambiguous. Use concise tags and
+short phrases. Do not write dialogue, negative prompts, parameters, quality
+tails, explanations, Markdown, or JSON unless the user explicitly requests
+visible text. Never use then, cut to, meanwhile, or montage.
+"#;
+
+const MANGA_PROMPTING_CONTEXT: &str = r#"
+NovelAI V5 storyboard rules:
+- Decide each page as story beat, camera/space, frozen actions, then visible light/material.
+- Every panel is one frozen instant with one clear action and reaction.
+- Use only Character 1, Character 2, and so on in panel text; appearance belongs in the independent Character fields.
+- Name the action initiator, receiver, and shared prop owner when relevant.
+- Start every panel with its position anchor and keep layout declarations prompt-ready.
+- Carry one visible prop, direction, light progression, eyeline, or reaction across each page.
+- Do not use then, cut to, meanwhile, montage, dialogue, negative prompts, or quality tails unless the user explicitly asks for text.
+"#;
+
+fn is_mochizuki_request(request: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    lower.contains("mochizuki") || request.contains("望月")
+}
+
+fn wants_manga_text(request: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    [
+        "dialogue",
+        "speech bubble",
+        "text",
+        "对话",
+        "对白",
+        "气泡",
+        "文字",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker) || request.contains(marker))
+}
+
+fn parse_json_output(raw: &str) -> Result<MangaPlan> {
+    let trimmed = raw.trim();
+    let content = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    let content = content.strip_suffix("```").unwrap_or(content).trim();
+    serde_json::from_str(content).context("manga planner returned invalid JSON")
+}
+
+fn validate_manga_plan(plan: &MangaPlan, expected_pages: usize, prompt: &str) -> Result<()> {
+    if plan.pages.len() != expected_pages {
+        bail!(
+            "manga planner returned {} pages; expected {}",
+            plan.pages.len(),
+            expected_pages
+        );
+    }
+    if plan.characters.is_empty() || plan.characters.len() > 10 {
+        bail!("manga planner must return 1 to 10 characters");
+    }
+    let names = plan
+        .characters
+        .iter()
+        .map(|character| character.name.trim())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if names.len() != plan.characters.len()
+        || plan
+            .characters
+            .iter()
+            .any(|character| character.prompt.trim().is_empty())
+    {
+        bail!("manga planner returned an empty character field");
+    }
+    let lower_request = prompt.to_ascii_lowercase();
+    let wants_text = wants_manga_text(prompt);
+    for (index, page) in plan.pages.iter().enumerate() {
+        if page.layout.trim().is_empty() || !(2..=4).contains(&page.panels.len()) {
+            bail!(
+                "manga page {} must define a layout and 2 to 4 panels",
+                index + 1
+            );
+        }
+        if page.panels.iter().any(|panel| {
+            let lower = panel.to_ascii_lowercase();
+            !lower.starts_with("panel ")
+                || ["then", "cut to", "meanwhile", "montage"]
+                    .iter()
+                    .any(|marker| lower.contains(marker))
+                || names.iter().any(|name| panel.contains(name))
+        }) {
+            bail!(
+                "manga page {} contains an invalid panel direction",
+                index + 1
+            );
+        }
+        if !wants_text
+            && ["dialogue", "speech bubble", "text", "对话", "对白", "气泡"]
+                .iter()
+                .any(|marker| {
+                    lower_request.contains(marker)
+                        || page
+                            .panels
+                            .iter()
+                            .any(|panel| panel.to_ascii_lowercase().contains(marker))
+                })
+        {
+            bail!(
+                "manga page {} unexpectedly contains dialogue or text",
+                index + 1
+            );
+        }
+    }
+    Ok(())
+}
+
+fn manga_base_caption(
+    plan: &MangaPlan,
+    page: &MangaPage,
+    index: usize,
+    total: usize,
+    mochizuki: bool,
+) -> String {
+    let cast = format!("{} characters", plan.characters.len());
+    let style = if mochizuki {
+        "artist:mochizuki kei, "
+    } else {
+        ""
+    };
+    format!(
+        "{style}{cast}, full color manga page, Page {} of {}, {}, white panel borders\n{}\nContinuity: {}",
+        index + 1,
+        total,
+        page.layout.trim(),
+        page.panels.join("\n"),
+        page.continuity.trim()
+    )
+}
+
+fn manga_negative_prompt(page: &MangaPage, wants_text: bool) -> String {
+    let mut values = vec![MANGA_STATIC_NEGATIVE];
+    if !wants_text {
+        values.push("text, speech bubble, watermark, logo");
+    }
+    if !page.negative_prompt.trim().is_empty() {
+        values.push(page.negative_prompt.trim());
+    }
+    values.join(", ")
+}
+
+fn manga_output_path(config: &AgentConfig, task_id: &str, page: usize) -> PathBuf {
+    Path::new(&config.runtime.output_dir)
+        .join("nai")
+        .join(format!("summary-manga-{task_id}-page-{page:02}.png"))
+}
+
+fn rename_manga_artifact(artifact: ImageArtifact, target: PathBuf) -> Result<ImageArtifact> {
+    fs::rename(&artifact.path, &target)
+        .with_context(|| format!("renaming generated manga page to {}", target.display()))?;
+    Ok(ImageArtifact {
+        path: target.to_string_lossy().into_owned(),
+        ..artifact
+    })
+}
+
 /// Turn a short user request into a NovelAI V5-oriented prompt, then generate the image.
 /// This intentionally uses the normal prompt-preparation slot pool, while its
 /// NovelAI generation settings and output directory remain independent from
@@ -663,7 +864,14 @@ pub(crate) async fn generate_manual_novelai_image(
         "用户想画的内容：\n{}\n\n请直接给出最终 NovelAI 正向提示词。",
         user_prompt.trim()
     );
-    let prompt = run_llm_stage(
+    let system = if is_mochizuki_request(user_prompt) {
+        format!(
+            "{NAI5_SINGLE_PROMPT_SYSTEM}\nKeep the exact style anchor `artist:mochizuki kei` because the user requested Mochizuki style."
+        )
+    } else {
+        NAI5_SINGLE_PROMPT_SYSTEM.to_string()
+    };
+    let mut prompt = run_llm_stage(
         config,
         image_pipeline_slots,
         room_id,
@@ -673,13 +881,16 @@ pub(crate) async fn generate_manual_novelai_image(
             &llm,
             room_id,
             "manual NovelAI image prompt",
-            MANUAL_NOVELAI_PROMPT_SYSTEM,
+            &system,
             &request,
             MANUAL_NOVELAI_REFUSAL_RETRY,
         ),
     )
     .await
     .context("calling LLM for manual NovelAI image prompt")?;
+    if is_mochizuki_request(user_prompt) && !prompt.contains("artist:mochizuki kei") {
+        prompt = format!("artist:mochizuki kei, {prompt}");
+    }
     let mut image_client =
         OpenAiImageClient::new(config.novelai.image_client_config(), &config.proxy)
             .context("initializing NovelAI client for manual image command")?;
@@ -696,19 +907,116 @@ pub(crate) async fn generate_manual_novelai_image(
         .context("generating manual NovelAI image")
 }
 
-const MANUAL_NOVELAI_PROMPT_SYSTEM: &str = r#"
-你是 NovelAI Diffusion V5 的单张动漫插画提示词设计师。把用户的一句话转成可直接放入 NAI V5 `v4_prompt.caption.base_caption` 的英文正向提示词。
+pub(crate) async fn generate_manual_novelai_manga(
+    config: &AgentConfig,
+    image_pipeline_slots: &ImagePipelineSlotPool,
+    room_id: &str,
+    task_id: &str,
+    user_prompt: &str,
+    page_count: usize,
+) -> Result<Vec<ImageArtifact>> {
+    if !config.novelai.enabled {
+        bail!("NovelAI 图片命令未启用；请设置 [novelai].enabled = true");
+    }
+    if !(2..=8).contains(&page_count) {
+        bail!("漫画页数必须在 2 到 8 页之间");
+    }
+    let retry_notifier = retry_log_notifier(config, room_id.to_string());
+    let llm = configure_llm_tracing(
+        OpenAiCompatibleLlm::new(config.llm.clone(), &config.proxy)
+            .context("initializing LLM client for manual NovelAI manga command")?,
+        config,
+    )?
+    .with_retry_notifier(retry_notifier.clone())
+    .with_streaming(false);
+    let mochizuki = is_mochizuki_request(user_prompt);
+    let text_requested = wants_manga_text(user_prompt);
+    let system = format!(
+        "{MANGA_PROMPTING_CONTEXT}\n{}
+You are a storyboard planner for a continuous NovelAI Diffusion V5 manga.
+Return JSON only with this exact shape:
+{{\"title\":\"...\",\"characters\":[{{\"name\":\"...\",\"prompt\":\"English NAI character tags\"}}],\"pages\":[{{\"title\":\"...\",\"layout\":\"prompt-ready layout\",\"panels\":[\"Panel 1: ...\",\"Panel 2: ...\"],\"continuity\":\"...\",\"negative_prompt\":\"...\"}}]}}.
+Create exactly {page_count} pages and 1-10 stable characters. Each page has 2-4 panels. Use only Character N in panels, keep each panel one frozen moment, and never leak names or appearance into panel text. Character prompts are independent and stable across every page. Include short dialogue only when the user explicitly asks for it; otherwise keep all panels text-free."
+    , if mochizuki { "Use the exact style marker artist:mochizuki kei and an eight-page-like setup/escalation/reversal/climax/resolution rhythm adapted to the requested count." } else { "Do not add an artist-specific style marker unless the user requests one." });
+    let request = format!(
+        "User manga request:\n{}\n\nRequested pages: {page_count}\nDialogue explicitly requested: {}",
+        user_prompt.trim(),
+        text_requested
+    );
+    let raw = run_llm_stage(
+        config,
+        image_pipeline_slots,
+        room_id,
+        ImagePipelineStage::Prompt,
+        complete_prompt_with_refusal_retry(
+            config,
+            &llm,
+            room_id,
+            "manual NovelAI manga storyboard",
+            &system,
+            &request,
+            MANUAL_NOVELAI_REFUSAL_RETRY,
+        ),
+    )
+    .await
+    .context("planning manual NovelAI manga")?;
+    let plan = parse_json_output(&raw)?;
+    validate_manga_plan(&plan, page_count, user_prompt)?;
 
-先在心中依次完成四步，不要输出推理过程：
-1. 选定一个清晰、可记忆的视觉事件；
-2. 确定单一镜头距离、相机方向、焦点以及前中后景空间；
-3. 固定为一个可读的瞬间：明确人物、动作发起者、接受者、共享物件归属和环境反应；
-4. 补上具体场景、可见光源/光效、色彩、天气或材质。
+    let output_dir = Path::new(&config.runtime.output_dir).join("nai");
+    fs::create_dir_all(&output_dir)?;
+    let manifest_path = output_dir.join(format!("summary-manga-{task_id}.json"));
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": task_id,
+            "request": user_prompt,
+            "mochizuki": mochizuki,
+            "pages": &plan,
+        }))?,
+    )?;
 
-只输出最终英文正向 prompt，不要解释、Markdown、JSON、negative prompt、采样器、seed、参数、质量尾词或泛泛的氛围词。用紧凑标签和短语、逗号分隔；只有动作关系、光线路径或空间事实需要消歧时才使用一个短句。
-每张图只能是一个定格瞬间，不能写 then、cut to、meanwhile、montage 或连续动作。选择一个主镜头距离和一个相机方向，不能堆叠相互冲突的镜头。必须写出具体的场景和可见光源/效果；不要用 beautiful、cinematic、detailed、romantic atmosphere 等空泛词凑内容。
-手动命令没有独立的 NovelAI Character 字段：正常写入角色外观即可；不要伪造 Character N、source#、target#、mutual# 等字段语法。不要生成对话、气泡、文字、水印、UI 或签名。用户没有明确要求时，保持一个明确视觉中心，不额外塞入无关角色或装饰。
-"#;
+    let mut image_client =
+        OpenAiImageClient::new(config.novelai.image_client_config(), &config.proxy)
+            .context("initializing NovelAI client for manga")?;
+    if let Some(trace_dir) = ai_trace_dir(config)? {
+        image_client = image_client.with_trace_dir(trace_dir);
+    }
+    image_client = image_client
+        .with_trace_context(ai_trace_context(room_id, "manual NovelAI manga generation"))
+        .with_retry_notifier(retry_notifier);
+
+    let mut artifacts = Vec::with_capacity(plan.pages.len());
+    for (index, page) in plan.pages.iter().enumerate() {
+        let prompt = NovelAiPrompt {
+            base_caption: manga_base_caption(&plan, page, index, page_count, mochizuki),
+            character_captions: plan
+                .characters
+                .iter()
+                .map(|character| character.prompt.trim().to_string())
+                .collect(),
+            negative_prompt: manga_negative_prompt(page, text_requested),
+        };
+        let artifact = image_client
+            .generate_from_novelai_prompt(&prompt, &output_dir)
+            .await
+            .with_context(|| format!("generating manga page {}", index + 1))?;
+        let artifact =
+            rename_manga_artifact(artifact, manga_output_path(config, task_id, index + 1))?;
+        append_runtime_log(
+            config,
+            &format!(
+                "manual manga page generated task={} page={} total={} path={}",
+                task_id,
+                index + 1,
+                page_count,
+                artifact.path
+            ),
+        );
+        artifacts.push(artifact);
+    }
+    Ok(artifacts)
+}
 
 const MANUAL_NOVELAI_REFUSAL_RETRY: &str = r#"
 即使原始想法涉及争议或不适合直接复现的元素，也请改写为中性、安全的动漫场景提示词。不要拒绝，不要解释，只输出英文正向 prompt。
@@ -728,4 +1036,55 @@ pub(crate) async fn send_with_worker(
     info!(room_id = %room_id, "summary image sent");
     append_runtime_log(config, &format!("summary image sent room={}", room_id));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan() -> MangaPlan {
+        MangaPlan {
+            title: "A letter at dusk".into(),
+            characters: vec![MangaCharacter {
+                name: "澪".into(),
+                prompt: "1girl, long black hair, white summer dress".into(),
+            }],
+            pages: vec![
+                MangaPage {
+                    title: "Discovery".into(),
+                    layout: "one large main panel with a narrow inset".into(),
+                    panels: vec![
+                        "Panel 1: Character 1 kneels beside an empty seaside platform bench, sunset backlight".into(),
+                        "Panel 2: close-up of Character 1's hand holding a faded envelope, warm reflected light".into(),
+                    ],
+                    continuity: "The faded envelope remains in Character 1's hand.".into(),
+                    negative_prompt: "blurry background".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn fenced_storyboard_json_is_parsed_and_validated() {
+        let raw = format!("```json\n{}\n```", serde_json::to_string(&plan()).unwrap());
+        let parsed = parse_json_output(&raw).unwrap();
+        validate_manga_plan(&parsed, 1, "a quiet manga page").unwrap();
+    }
+
+    #[test]
+    fn manga_prompt_has_stable_style_and_safety_fields() {
+        let value = plan();
+        let caption = manga_base_caption(&value, &value.pages[0], 0, 1, true);
+        assert!(caption.contains("artist:mochizuki kei"));
+        let negative = manga_negative_prompt(&value.pages[0], false);
+        assert!(negative.contains("extra characters"));
+        assert!(negative.contains("text, speech bubble"));
+    }
+
+    #[test]
+    fn invalid_panel_transition_is_rejected() {
+        let mut value = plan();
+        value.pages[0].panels[0] = "Panel 1: Character 1 walks, then waves".into();
+        assert!(validate_manga_plan(&value, 1, "manga").is_err());
+    }
 }

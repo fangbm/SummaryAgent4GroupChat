@@ -264,9 +264,17 @@ impl SqliteStateStore {
     }
 
     pub fn create_task(&self, task: NewTask<'_>) -> Result<TaskRecord, StorageError> {
+        self.create_task_with_id(&Uuid::new_v4().to_string(), task)
+    }
+
+    pub fn create_task_with_id(
+        &self,
+        id: &str,
+        task: NewTask<'_>,
+    ) -> Result<TaskRecord, StorageError> {
         let now = Utc::now();
         let record = TaskRecord {
-            id: Uuid::new_v4().to_string(),
+            id: id.to_string(),
             room_id: task.room_id.to_string(),
             source: task.source.to_string(),
             state: TaskState::Queued,
