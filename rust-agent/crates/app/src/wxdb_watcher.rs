@@ -456,7 +456,11 @@ fn poll_room(
             timestamp,
             is_self: message.is_self,
         };
-        if matcher.match_message(&incoming).is_none() {
+        // wxdb is the recovery path for messages which the UIAutomation
+        // listener misses while the WeChat window is unavailable. Keep the
+        // built-in image commands on that path too, rather than recovering
+        // only configurable summary triggers.
+        if !is_recoverable_command(matcher, &incoming) {
             continue;
         }
         state.remember(key);
@@ -496,6 +500,12 @@ fn poll_room(
     Ok(events)
 }
 
+fn is_recoverable_command(matcher: &TriggerMatcher, incoming: &IncomingMessage) -> bool {
+    matcher.match_message(incoming).is_some()
+        || (matcher.allows_message(incoming)
+            && crate::parse_image_command(&incoming.content).is_some())
+}
+
 fn effective_cache_dir(config: &AgentConfig) -> String {
     let cache_dir = config.wx_cli.cache_dir.trim();
     if cache_dir.is_empty() {
@@ -512,4 +522,52 @@ fn seen_message_key(
     message
         .local_id
         .map(|local_id| format!("{chat_name}:local:{local_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use wechat_summary_core::config::{ListenConfig, MatchMode};
+
+    use super::*;
+
+    fn matcher() -> TriggerMatcher {
+        TriggerMatcher::new(ListenConfig {
+            triggers: vec!["/总结".to_string()],
+            match_mode: MatchMode::Prefix,
+            whitelist_rooms: vec!["room".to_string()],
+            blacklist_users: Vec::new(),
+            content_types: vec!["text".to_string()],
+            ignore_self: true,
+            require_allowed_users: false,
+            allowed_users: Vec::new(),
+        })
+        .expect("valid matcher")
+    }
+
+    fn incoming(content: &str) -> IncomingMessage {
+        IncomingMessage {
+            room_id: "room".to_string(),
+            room_name: Some("room".to_string()),
+            stable_id: Some("local:1".to_string()),
+            sender_id: "sender".to_string(),
+            sender_name: None,
+            content: content.to_string(),
+            msg_type: "text".to_string(),
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            is_self: false,
+        }
+    }
+
+    #[test]
+    fn recovers_builtin_image_commands_when_realtime_listener_misses_them() {
+        let matcher = matcher();
+        assert!(is_recoverable_command(&matcher, &incoming("/图片")));
+        assert!(is_recoverable_command(&matcher, &incoming("/image city at night")));
+    }
+
+    #[test]
+    fn does_not_recover_arbitrary_room_text() {
+        assert!(!is_recoverable_command(&matcher(), &incoming("普通聊天内容")));
+    }
 }

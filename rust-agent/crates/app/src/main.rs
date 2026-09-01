@@ -357,20 +357,22 @@ async fn run_agent(config_path: &str) -> Result<()> {
         let event = tokio::task::spawn_blocking(move || {
             let per_client_timeout =
                 StdDuration::from_millis((1_000 / event_clients.len().max(1) as u64).max(1));
-            for event_client in event_clients {
+            for (kind, event_client) in event_clients {
                 let client_guard = event_client
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("platform client mutex poisoned"))?;
-                if let Some(event) = client_guard.next_event_timeout(per_client_timeout)? {
-                    return Ok(Some(event));
+                    .map_err(|_| (kind, "platform client mutex poisoned".to_string()))?;
+                match client_guard.next_event_timeout(per_client_timeout) {
+                    Ok(Some(event)) => return Ok((kind, Some(event))),
+                    Ok(None) => {}
+                    Err(error) => return Err((kind, format_error_chain(&error))),
                 }
             }
-            Ok(None)
+            Ok((PlatformKindConfig::Wx4py, None))
         })
         .await
         .context("joining platform event wait")?;
         match event {
-            Ok(Some(event)) => {
+            Ok((_, Some(event))) => {
                 let config = config_reloader.config();
                 let matcher = config_reloader.matcher();
                 let Some(worker) = platform.worker_for(event.platform) else {
@@ -393,16 +395,21 @@ async fn run_agent(config_path: &str) -> Result<()> {
                     &mut scheduler,
                 );
             }
-            Ok(None) => {}
-            Err(error) => {
-                let message = format_error_chain(&error);
-                error!(error = %message, "platform event listener failed; scheduling reconnect");
+            Ok((_, None)) => {}
+            Err((kind, message)) => {
+                error!(platform = kind.as_str(), error = %message, "platform event listener failed; scheduling reconnect");
                 append_runtime_log(
                     config_reloader.config(),
-                    &format!("platform event listener failed error={message}; reconnect scheduled"),
+                    &format!(
+                        "platform event listener failed platform={} error={message}; reconnect scheduled",
+                        kind.as_str()
+                    ),
                 );
-                platform
-                    .request_reconnect(config_reloader.config(), "platform event listener failed");
+                platform.request_reconnect_kind(
+                    config_reloader.config(),
+                    kind,
+                    "platform event listener failed",
+                );
             }
         }
     }

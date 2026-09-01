@@ -499,6 +499,14 @@ async fn handle_manual_image_command(
                 return Ok(());
             }
         };
+        info!(
+            room_id = %trigger.room_id,
+            artifact_size_bytes = artifact.size_bytes,
+            "manual random image delivery starting"
+        );
+        let _ = client
+            .send_text(&trigger.room_id, "正在随机发送一张已生成图片...")
+            .await;
         match outbox::deliver_image(config, &task, client, &trigger.room_id, &artifact).await {
             Ok(()) => {
                 task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
@@ -512,6 +520,14 @@ async fn handle_manual_image_command(
             }
             Err(error) => {
                 let detail = format_error_chain(&error);
+                error!(room_id = %trigger.room_id, error = %detail, "manual random image delivery failed");
+                append_runtime_log(
+                    config,
+                    &format!(
+                        "manual random image delivery failed room={} error={detail}",
+                        trigger.room_id
+                    ),
+                );
                 task.set_stage(
                     TaskState::Failed,
                     "delivery_failed",

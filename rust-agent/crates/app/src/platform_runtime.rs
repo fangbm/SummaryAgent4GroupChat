@@ -174,6 +174,53 @@ impl PlatformRuntime {
         Ok((clients, workers, rooms, worker))
     }
 
+    fn rebuild_routes(&mut self, config: &AgentConfig) -> Result<()> {
+        let mut rooms = Vec::new();
+        let mut room_platforms = HashMap::new();
+        for kind in config.platform.enabled_kinds() {
+            let Some(client) = self.clients.get(&kind) else {
+                continue;
+            };
+            let client = client
+                .lock()
+                .map_err(|_| anyhow::anyhow!("platform client mutex poisoned"))?;
+            for room in client.configured_rooms(config) {
+                if let Some(existing) = room_platforms.insert(room.clone(), kind) {
+                    if existing != kind {
+                        anyhow::bail!(
+                            "room {room:?} is configured for both {} and {}; use unique room/channel identifiers",
+                            existing.as_str(),
+                            kind.as_str()
+                        );
+                    }
+                }
+                if !rooms.contains(&room) {
+                    rooms.push(room);
+                }
+            }
+        }
+        self.rooms = rooms;
+        self.worker = PlatformWorker::Multi {
+            workers: Arc::new(self.workers.clone()),
+            room_platforms: Arc::new(room_platforms),
+        };
+        Ok(())
+    }
+
+    async fn reconnect_kind(
+        &mut self,
+        config: &AgentConfig,
+        kind: PlatformKindConfig,
+    ) -> Result<()> {
+        let client = PlatformClient::start_kind(config, kind)
+            .await
+            .with_context(|| format!("starting {} platform client", kind.as_str()))?;
+        let worker = client.worker();
+        self.clients.insert(kind, Arc::new(Mutex::new(client)));
+        self.workers.insert(kind, worker);
+        self.rebuild_routes(config)
+    }
+
     pub(crate) fn request_reconnect(&mut self, config: &AgentConfig, reason: &str) {
         let now = Instant::now() + PLATFORM_RECONNECT_DELAY;
         let mut scheduled = Vec::new();
@@ -193,6 +240,30 @@ impl PlatformRuntime {
         }
     }
 
+    pub(crate) fn request_reconnect_kind(
+        &mut self,
+        config: &AgentConfig,
+        kind: PlatformKindConfig,
+        reason: &str,
+    ) {
+        if !config.platform.enabled_kinds().contains(&kind) {
+            return;
+        }
+        if self
+            .reconnect_at
+            .insert(kind, Instant::now() + PLATFORM_RECONNECT_DELAY)
+            .is_none()
+        {
+            append_runtime_log(
+                config,
+                &format!(
+                    "platform reconnect scheduled kinds={} reason={reason} delay_seconds=2",
+                    kind.as_str()
+                ),
+            );
+        }
+    }
+
     pub(crate) async fn reconnect_if_due(&mut self, config: &AgentConfig) {
         let due = self
             .reconnect_at
@@ -203,43 +274,51 @@ impl PlatformRuntime {
         if due.is_empty() {
             return;
         }
-        match Self::connect_all(config).await {
-            Ok((clients, workers, rooms, worker)) => {
-                let previous_state_path = self.watcher.state_path().map(Path::to_path_buf);
-                self.clients = clients;
-                self.workers = workers;
-                self.worker = worker;
-                self.rooms = rooms;
-                self.fingerprint = PlatformConnectionFingerprint::from_config(config);
-                let old_watcher =
-                    std::mem::replace(&mut self.watcher, WxdbCommandWatcher::stopped());
-                drop(old_watcher);
-                self.watcher =
-                    WxdbCommandWatcher::start_with_state_path(config, previous_state_path);
-                self.watcher_fingerprint = WxdbWatcherFingerprint::from_config(config);
-                self.watcher_restart_at = None;
-                self.reconnect_at.clear();
-                info!(
-                    platforms = ?self.fingerprint.kinds,
-                    "platform reconnected"
-                );
-                append_runtime_log(
-                    config,
-                    &format!("platform reconnected kinds={:?}", self.fingerprint.kinds),
-                );
+        let enabled = config.platform.enabled_kinds();
+        self.clients.retain(|kind, _| enabled.contains(kind));
+        self.workers.retain(|kind, _| enabled.contains(kind));
+
+        let mut reconnected = Vec::new();
+        for kind in due {
+            if !enabled.contains(&kind) {
+                self.reconnect_at.remove(&kind);
+                continue;
             }
-            Err(error) => {
-                let message = format_error_chain(&error);
-                error!(error = %message, "platform reconnect failed; retrying");
-                append_runtime_log(
-                    config,
-                    &format!("platform reconnect failed error={message}; retrying"),
-                );
-                let next = Instant::now() + PLATFORM_RECONNECT_DELAY;
-                for kind in due {
-                    self.reconnect_at.insert(kind, next);
+            match self.reconnect_kind(config, kind).await {
+                Ok(()) => {
+                    self.reconnect_at.remove(&kind);
+                    reconnected.push(kind);
+                }
+                Err(error) => {
+                    let message = format_error_chain(&error);
+                    error!(platform = kind.as_str(), error = %message, "platform reconnect failed; retrying");
+                    append_runtime_log(
+                        config,
+                        &format!(
+                            "platform reconnect failed platform={} error={message}; retrying",
+                            kind.as_str()
+                        ),
+                    );
+                    self.reconnect_at
+                        .insert(kind, Instant::now() + PLATFORM_RECONNECT_DELAY);
                 }
             }
+        }
+        if !reconnected.is_empty() {
+            self.fingerprint = PlatformConnectionFingerprint::from_config(config);
+            if let Err(error) = self.rebuild_routes(config) {
+                let message = format_error_chain(&error);
+                error!(error = %message, "platform route rebuild failed after reconnect");
+                append_runtime_log(
+                    config,
+                    &format!("platform route rebuild failed error={message}"),
+                );
+            }
+            info!(platforms = ?reconnected, "platforms reconnected");
+            append_runtime_log(
+                config,
+                &format!("platforms reconnected kinds={reconnected:?}"),
+            );
         }
     }
 
@@ -253,8 +332,11 @@ impl PlatformRuntime {
         Ok(())
     }
 
-    pub(crate) fn event_clients(&self) -> Vec<Arc<Mutex<PlatformClient>>> {
-        self.clients.values().cloned().collect()
+    pub(crate) fn event_clients(&self) -> Vec<(PlatformKindConfig, Arc<Mutex<PlatformClient>>)> {
+        self.clients
+            .iter()
+            .map(|(kind, client)| (*kind, Arc::clone(client)))
+            .collect()
     }
 
     pub(crate) fn worker_for(&self, kind: PlatformKindConfig) -> Option<PlatformWorker> {

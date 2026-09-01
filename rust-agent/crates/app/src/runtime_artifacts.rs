@@ -19,7 +19,17 @@ static RANDOM_IMAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// directory selected by `[image_gen]`.
 pub(crate) fn random_generated_image(config: &AgentConfig) -> Result<Option<ImageArtifact>> {
     let output_dir = Path::new(&config.runtime.output_dir).join("nai");
-    random_generated_image_from_dir(&output_dir)
+    if let Some(artifact) = random_generated_image_from_dir(&output_dir)? {
+        return Ok(Some(artifact));
+    }
+
+    // The legacy launcher could start the agent with an arbitrary working
+    // directory. Keep existing local NAI artifacts usable after that upgrade.
+    let fallback_dir = installed_runtime_output_dir().join("nai");
+    if fallback_dir != output_dir {
+        return random_generated_image_from_dir(&fallback_dir);
+    }
+    Ok(None)
 }
 
 fn random_generated_image_from_dir(output_dir: &Path) -> Result<Option<ImageArtifact>> {
@@ -45,6 +55,7 @@ fn random_generated_image_from_dir(output_dir: &Path) -> Result<Option<ImageArti
         })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
+        tracing::info!(directory = %output_dir.display(), candidate_count = 0, "manual random image lookup completed");
         return Ok(None);
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
@@ -58,6 +69,12 @@ fn random_generated_image_from_dir(output_dir: &Path) -> Result<Option<ImageArti
     let index = ((now ^ u128::from(sequence) ^ u128::from(std::process::id()))
         % candidates.len() as u128) as usize;
     let (path, size_bytes, mime_type) = candidates.swap_remove(index);
+    tracing::info!(
+        directory = %output_dir.display(),
+        candidate_count = candidates.len() + 1,
+        size_bytes,
+        "manual random image selected"
+    );
     Ok(Some(ImageArtifact {
         path: path.to_string_lossy().into_owned(),
         mime_type: mime_type.into(),
@@ -66,6 +83,22 @@ fn random_generated_image_from_dir(output_dir: &Path) -> Result<Option<ImageArti
         // large image merely to replay an already written artifact.
         sha256: String::new(),
     }))
+}
+
+fn installed_runtime_output_dir() -> PathBuf {
+    let Ok(executable) = std::env::current_exe() else {
+        return PathBuf::from("runtime/rust-output");
+    };
+    let Some(executable_dir) = executable.parent() else {
+        return PathBuf::from("runtime/rust-output");
+    };
+    let root = executable_dir
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+        .then(|| executable_dir.parent())
+        .flatten()
+        .unwrap_or(executable_dir);
+    root.join("runtime/rust-output")
 }
 
 pub(crate) fn cleanup(config: &AgentConfig) {
