@@ -15,6 +15,7 @@ pub(crate) async fn handle_platform_event(
     event: PlatformEvent,
 ) -> Result<()> {
     let source_platform = event.platform;
+    let task_id_hint = event.task_id_hint.clone();
     let incoming = IncomingMessage::from(event);
     if matcher.allows_message(&incoming) {
         if let Some(command) = parse_image_command(&incoming.content) {
@@ -28,6 +29,7 @@ pub(crate) async fn handle_platform_event(
                 event_source,
                 &incoming,
                 command,
+                task_id_hint,
             )
             .await;
         }
@@ -380,6 +382,7 @@ async fn handle_manual_image_command(
     event_source: PlatformEventSource,
     incoming: &IncomingMessage,
     command: crate::image_command::ImageCommand,
+    task_id_hint: Option<String>,
 ) -> Result<()> {
     let trigger = TriggerMatch {
         room_id: incoming.room_id.clone(),
@@ -416,37 +419,71 @@ async fn handle_manual_image_command(
         );
         return Ok(());
     }
+
+    let delivery_room_id = if source_platform == PlatformKindConfig::Discord {
+        let output = config.discord.image_output_channel_id.trim();
+        if output.is_empty() {
+            let _ = client
+                .send_text(
+                    &trigger.room_id,
+                    "Discord 图片输出频道未配置，请设置 [discord].image_output_channel_id。",
+                )
+                .await;
+            return Ok(());
+        }
+        output.to_string()
+    } else {
+        trigger.room_id.clone()
+    };
+
+    if let Some(error) = command.error.as_deref() {
+        let _ = client.send_text(&delivery_room_id, error).await;
+        return Ok(());
+    }
+    let is_manga = matches!(command.mode, crate::image_command::ImageMode::Manga { .. });
+    if is_manga && command.prompt.is_none() {
+        let _ = client
+            .send_text(&delivery_room_id, "漫画模式需要提供故事或画面描述。")
+            .await;
+        return Ok(());
+    }
     if !config.novelai.enabled {
         let _ = client
-            .send_text(&trigger.room_id, "NovelAI 图片命令未启用。")
+            .send_text(&delivery_room_id, "NovelAI 图片命令未启用。")
             .await;
         return Ok(());
     }
 
+    let task_source = match (is_manga, event_source, command.prompt.is_some()) {
+        (true, PlatformEventSource::Realtime, _) => "manual_image_manga",
+        (true, PlatformEventSource::WxdbRecovered, _) => "manual_image_manga_wxdb_recovered",
+        (_, PlatformEventSource::Realtime, true) => "manual_image",
+        (_, PlatformEventSource::WxdbRecovered, true) => "manual_image_wxdb_recovered",
+        (_, PlatformEventSource::Realtime, false) => "manual_image_random",
+        (_, PlatformEventSource::WxdbRecovered, false) => "manual_image_random_wxdb_recovered",
+    };
+    let new_task = NewTask {
+        room_id: &trigger.room_id,
+        source: task_source,
+        since: incoming.timestamp,
+        until: incoming.timestamp,
+        config_revision: &config_revision(config),
+        retry_of: None,
+    };
+    let record = match task_id_hint.as_deref() {
+        Some(id) => store.create_task_with_id(id, new_task)?,
+        None => store.create_task(new_task)?,
+    };
     let task = OperationalTask {
-        id: store
-            .create_task(NewTask {
-                room_id: &trigger.room_id,
-                source: match (event_source, command.prompt.is_some()) {
-                    (PlatformEventSource::Realtime, true) => "manual_image",
-                    (PlatformEventSource::WxdbRecovered, true) => "manual_image_wxdb_recovered",
-                    (PlatformEventSource::Realtime, false) => "manual_image_random",
-                    (PlatformEventSource::WxdbRecovered, false) => {
-                        "manual_image_random_wxdb_recovered"
-                    }
-                },
-                since: incoming.timestamp,
-                until: incoming.timestamp,
-                config_revision: &config_revision(config),
-                retry_of: None,
-            })?
-            .id,
+        id: record.id,
         store: store.clone(),
     };
     let replay_generated_image = command.prompt.is_none();
     task.set_stage(
         TaskState::Running,
-        if replay_generated_image {
+        if is_manga {
+            "manual_image_manga"
+        } else if replay_generated_image {
             "manual_image_random"
         } else {
             "manual_image_prompt"
@@ -458,11 +495,14 @@ async fn handle_manual_image_command(
     );
     info!(
         room_id = %trigger.room_id,
+        delivery_room_id = %delivery_room_id,
         source_platform = source_platform.as_str(),
         prompt_chars = command.prompt.as_deref().unwrap_or_default().chars().count(),
         replay_generated_image,
+        is_manga,
         "manual image command accepted"
     );
+
     if replay_generated_image {
         let artifact = match runtime_artifacts::random_generated_image(config) {
             Ok(Some(artifact)) => artifact,
@@ -476,7 +516,7 @@ async fn handle_manual_image_command(
                     0,
                 );
                 let _ = client
-                    .send_text(&trigger.room_id, "暂无可随机发送的已生成图片。")
+                    .send_text(&delivery_room_id, "暂无可随机发送的已生成图片。")
                     .await;
                 return Ok(());
             }
@@ -492,7 +532,7 @@ async fn handle_manual_image_command(
                 );
                 let _ = client
                     .send_text(
-                        &trigger.room_id,
+                        &delivery_room_id,
                         &format_failure_message_for_chat("读取已生成图片失败", &detail),
                     )
                     .await;
@@ -501,21 +541,19 @@ async fn handle_manual_image_command(
         };
         info!(
             room_id = %trigger.room_id,
+            delivery_room_id = %delivery_room_id,
             artifact_size_bytes = artifact.size_bytes,
             "manual random image delivery starting"
         );
         let _ = client
-            .send_text(&trigger.room_id, "正在随机发送一张已生成图片...")
+            .send_text(&delivery_room_id, "正在随机发送一张已生成图片...")
             .await;
-        match outbox::deliver_image(config, &task, client, &trigger.room_id, &artifact).await {
+        match outbox::deliver_image(config, &task, client, &delivery_room_id, &artifact).await {
             Ok(()) => {
                 task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
                 append_runtime_log(
                     config,
-                    &format!(
-                        "manual random image command completed room={}",
-                        trigger.room_id
-                    ),
+                    &format!("manual random image command completed room={}", trigger.room_id),
                 );
             }
             Err(error) => {
@@ -538,7 +576,7 @@ async fn handle_manual_image_command(
                 );
                 let _ = client
                     .send_text(
-                        &trigger.room_id,
+                        &delivery_room_id,
                         &format_failure_message_for_chat("图片发送失败", &detail),
                     )
                     .await;
@@ -551,17 +589,129 @@ async fn handle_manual_image_command(
         .prompt
         .as_deref()
         .expect("prompt is present after replay branch");
-    let _ = client.send_text(&trigger.room_id, "正在生成图片...").await;
+    if is_manga {
+        let pages = match command.mode {
+            crate::image_command::ImageMode::Manga { pages } => pages,
+            crate::image_command::ImageMode::Single => unreachable!(),
+        };
+        if let Err(error) = client
+            .send_text(
+                &delivery_room_id,
+                &if source_platform == PlatformKindConfig::Discord {
+                    format!("正在规划并生成 {} 页漫画（任务 `{}`）...", pages, task.id)
+                } else {
+                    format!("正在规划并生成 {pages} 页漫画（任务 {}）...", task.id)
+                },
+            )
+            .await
+        {
+            let detail = format_error_chain(&error);
+            task.set_stage(
+                TaskState::Failed,
+                "output_unavailable",
+                None,
+                Some(&detail),
+                0,
+                0,
+            );
+            let _ = client
+                .send_text(&trigger.room_id, "Discord 图片输出频道不可用，未开始生成。")
+                .await;
+            return Ok(());
+        }
+        match summary_image::generate_manual_novelai_manga(
+            config,
+            image_pipeline_slots,
+            &delivery_room_id,
+            &task.id,
+            prompt,
+            pages,
+        )
+        .await
+        {
+            Ok(artifacts) => {
+                for artifact in &artifacts {
+                    if let Err(error) =
+                        outbox::deliver_image(config, &task, client, &delivery_room_id, artifact)
+                            .await
+                    {
+                        let detail = format_error_chain(&error);
+                        task.set_stage(
+                            TaskState::Failed,
+                            "delivery_failed",
+                            None,
+                            Some(&detail),
+                            0,
+                            artifacts.len() as u64,
+                        );
+                        let _ = client
+                            .send_text(
+                                &delivery_room_id,
+                                &format_failure_message_for_chat("漫画发送失败", &detail),
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                }
+                let _ = client
+                    .send_text(
+                        &delivery_room_id,
+                        &format!("漫画任务 {} 已完成，共 {} 页。", task.id, artifacts.len()),
+                    )
+                    .await;
+                task.set_stage(
+                    TaskState::Succeeded,
+                    "completed",
+                    None,
+                    None,
+                    0,
+                    artifacts.len() as u64,
+                );
+            }
+            Err(error) => {
+                let detail = format_error_chain(&error);
+                task.set_stage(TaskState::Failed, "failed", None, Some(&detail), 0, 0);
+                let _ = client
+                    .send_text(
+                        &delivery_room_id,
+                        &format_failure_message_for_chat("漫画生成失败", &detail),
+                    )
+                    .await;
+            }
+        }
+        return Ok(());
+    }
+
+    let progress = if source_platform == PlatformKindConfig::Discord {
+        format!("正在生成图片（任务 `{}`）...", task.id)
+    } else {
+        "正在生成图片...".to_string()
+    };
+    if let Err(error) = client.send_text(&delivery_room_id, &progress).await {
+        let detail = format_error_chain(&error);
+        task.set_stage(
+            TaskState::Failed,
+            "output_unavailable",
+            None,
+            Some(&detail),
+            0,
+            0,
+        );
+        let _ = client
+            .send_text(&trigger.room_id, "Discord 图片输出频道不可用，未开始生成。")
+            .await;
+        return Ok(());
+    }
     match summary_image::generate_manual_novelai_image(
         config,
         image_pipeline_slots,
-        &trigger.room_id,
+        &delivery_room_id,
         prompt,
     )
     .await
     {
         Ok(artifact) => {
-            match outbox::deliver_image(config, &task, client, &trigger.room_id, &artifact).await {
+            match outbox::deliver_image(config, &task, client, &delivery_room_id, &artifact).await {
                 Ok(()) => {
                     task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
                     append_runtime_log(
@@ -581,7 +731,7 @@ async fn handle_manual_image_command(
                     );
                     let _ = client
                         .send_text(
-                            &trigger.room_id,
+                            &delivery_room_id,
                             &format_failure_message_for_chat("图片发送失败", &detail),
                         )
                         .await;
@@ -592,9 +742,13 @@ async fn handle_manual_image_command(
             let detail = format_error_chain(&error);
             task.set_stage(TaskState::Failed, "failed", None, Some(&detail), 0, 0);
             error!(room_id = %trigger.room_id, error = %detail, "manual image command failed");
+            append_runtime_log(
+                config,
+                &format!("manual image command failed room={} error={detail}", trigger.room_id),
+            );
             let _ = client
                 .send_text(
-                    &trigger.room_id,
+                    &delivery_room_id,
                     &format_failure_message_for_chat("图片生成失败", &detail),
                 )
                 .await;

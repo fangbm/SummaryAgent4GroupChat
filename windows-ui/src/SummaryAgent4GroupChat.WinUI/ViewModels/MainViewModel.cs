@@ -49,6 +49,7 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty] private bool _discordPlatformEnabled;
     [ObservableProperty] private string _weChatGroups = string.Empty;
     [ObservableProperty] private string _discordChannels = string.Empty;
+    [ObservableProperty] private string _discordImageOutputChannelId = string.Empty;
     // Discord bot token is write-only for the same reason as model API keys.
     [ObservableProperty] private string _discordTokenInput = string.Empty;
     [ObservableProperty] private string _discordLongTextDelivery = "chunks";
@@ -386,6 +387,7 @@ public sealed partial class MainViewModel : ObservableObject
         DiscordPlatformEnabled = enabledPlatforms.Contains("discord") || enabledPlatforms.Contains("dc");
         WeChatGroups = ReadList("wx4py", "groups");
         DiscordChannels = ReadList("discord", "channels");
+        DiscordImageOutputChannelId = ReadString("discord", "image_output_channel_id", string.Empty);
         DiscordTokenInput = string.Empty;
         DiscordLongTextDelivery = ReadString("discord", "long_text_delivery", "chunks");
         DiscordLongTextFileMinChunks = ReadString("discord", "long_text_file_min_chunks", "3");
@@ -888,6 +890,7 @@ public sealed partial class MainViewModel : ObservableObject
         AddListIfChanged(operations, "platform", "kinds", string.Join(", ", enabledPlatforms));
         AddListIfChanged(operations, "wx4py", "groups", WeChatGroups);
         AddListIfChanged(operations, "discord", "channels", DiscordChannels);
+        AddOptionalIfChanged(operations, "discord", "image_output_channel_id", DiscordImageOutputChannelId);
         AddSecretIfEntered(operations, "discord", "token", DiscordTokenInput);
         AddIfChanged(operations, "discord", "long_text_delivery", DiscordLongTextDelivery);
         AddNumberIfChanged(operations, "discord", "long_text_file_min_chunks", DiscordLongTextFileMinChunks, 3);

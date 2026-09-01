@@ -32,6 +32,7 @@ pub(crate) struct WxdbCommandWatcher {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum WxdbCommandWatcherRecv {
     Event(PlatformEvent),
     Empty,
@@ -475,6 +476,7 @@ fn poll_room(
             msg_type: incoming.msg_type,
             timestamp: incoming.timestamp,
             is_self: incoming.is_self,
+            task_id_hint: None,
         });
     }
     state.last_seen_local_id = max_local_id.or(state.last_seen_local_id);

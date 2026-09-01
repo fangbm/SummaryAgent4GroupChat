@@ -397,6 +397,10 @@ pub struct DiscordConfig {
     pub token_env: String,
     #[serde(default)]
     pub channels: Vec<String>,
+    /// Destination for Discord /image results. Source channels remain the
+    /// authorization boundary; this channel is only used for delivery.
+    #[serde(default)]
+    pub image_output_channel_id: String,
     #[serde(default)]
     pub long_text_delivery: DiscordLongTextDelivery,
     #[serde(default = "default_discord_long_text_file_min_chunks")]
@@ -411,6 +415,7 @@ impl Default for DiscordConfig {
             token: None,
             token_env: default_discord_token_env(),
             channels: Vec::new(),
+            image_output_channel_id: String::new(),
             long_text_delivery: DiscordLongTextDelivery::default(),
             long_text_file_min_chunks: default_discord_long_text_file_min_chunks(),
             long_text_file_dir: String::new(),
@@ -1187,7 +1192,7 @@ pub struct OperationsConfig {
     pub outbox_retry_window_seconds: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct BudgetConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1198,17 +1203,6 @@ pub struct BudgetConfig {
     pub daily_image_limit: u32,
     #[serde(default)]
     pub daily_media_limit: u32,
-}
-
-impl Default for BudgetConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            daily_summary_limit: 0,
-            daily_image_limit: 0,
-            daily_media_limit: 0,
-        }
-    }
 }
 
 impl Default for OperationsConfig {
