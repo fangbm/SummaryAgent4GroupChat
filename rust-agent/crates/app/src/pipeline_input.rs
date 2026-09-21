@@ -150,7 +150,7 @@ pub(super) async fn prepare_pipeline_input(
     config: &AgentConfig,
     client: &PlatformWorker,
     room_id: &str,
-    options: PipelineOptions,
+    options: &PipelineOptions,
     task: Option<&OperationalTask>,
     mut history: Vec<crate::platform::PlatformHistoryMessage>,
 ) -> Result<Option<PreparedPipelineInput>> {

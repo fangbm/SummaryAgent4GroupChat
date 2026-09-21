@@ -2,12 +2,13 @@
 
 use wechat_summary_core::{config::PlatformKindConfig, TriggerMatch};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct SummaryCommand {
     pub(crate) target_platform: PlatformKindConfig,
     pub(crate) range_minutes: Option<i64>,
     pub(crate) image_token_present: bool,
     pub(crate) preview_only: bool,
+    pub(crate) sender_filter: Option<String>,
 }
 
 pub(crate) fn parse(
@@ -33,12 +34,14 @@ pub(crate) fn parse_args(
             range_minutes: None,
             image_token_present: false,
             preview_only: false,
+            sender_filter: None,
         });
     }
 
     let mut target_platform = default_platform;
     let mut image_token_present = false;
     let mut preview_only = false;
+    let mut sender_filter = None;
     let mut range_tokens: Vec<&str> = Vec::new();
     for token in args.split_whitespace() {
         if let Some(platform) = PlatformKindConfig::parse_alias(token) {
@@ -47,6 +50,8 @@ pub(crate) fn parse_args(
             image_token_present = true;
         } else if is_preview_token(token) {
             preview_only = true;
+        } else if let Some(sender) = token.strip_prefix('@').filter(|sender| !sender.is_empty()) {
+            sender_filter = Some(sender.to_string());
         } else {
             range_tokens.push(token);
         }
@@ -63,6 +68,7 @@ pub(crate) fn parse_args(
         range_minutes,
         image_token_present,
         preview_only,
+        sender_filter,
     })
 }
 
@@ -137,5 +143,26 @@ fn parse_strict_duration_minutes(tokens: &[&str]) -> Option<i64> {
         }
         "d" | "day" | "days" | "天" | "天内" | "日" | "日内" => Some(amount * 24 * 60),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sender_filter_after_time_range() {
+        let command = parse_args("24h @Alice", PlatformKindConfig::Wx4py).unwrap();
+
+        assert_eq!(command.range_minutes, Some(24 * 60));
+        assert_eq!(command.sender_filter.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn parses_sender_filter_before_time_range() {
+        let command = parse_args("@Alice 24h", PlatformKindConfig::Wx4py).unwrap();
+
+        assert_eq!(command.range_minutes, Some(24 * 60));
+        assert_eq!(command.sender_filter.as_deref(), Some("Alice"));
     }
 }
