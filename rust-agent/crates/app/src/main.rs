@@ -619,7 +619,7 @@ fn record_image_cooldown_success(
     Ok(())
 }
 
-fn progress_message(options: PipelineOptions) -> &'static str {
+fn progress_message(options: &PipelineOptions) -> &'static str {
     match (options.text_summary_enabled, options.image_gen_enabled) {
         (true, true) => "收到 /总结，正在整理群聊并生成图片。",
         (true, false) => "收到 /总结，正在整理文字总结。",
@@ -1512,6 +1512,7 @@ mod tests {
                 range_minutes: Some(60),
                 image_token_present: false,
                 preview_only: false,
+                sender_filter: None,
             })
         );
     }
@@ -1531,6 +1532,7 @@ mod tests {
                 range_minutes: Some(60),
                 image_token_present: false,
                 preview_only: false,
+                sender_filter: None,
             })
         );
     }
@@ -1575,6 +1577,7 @@ mod tests {
                 range_minutes: Some(120),
                 image_token_present: false,
                 preview_only: false,
+                sender_filter: None,
             }
         );
     }
@@ -1590,6 +1593,7 @@ mod tests {
                 range_minutes: Some(24 * 60),
                 image_token_present: false,
                 preview_only: false,
+                sender_filter: None,
             }
         );
     }
@@ -1618,6 +1622,7 @@ mod tests {
                 range_minutes: None,
                 image_token_present: false,
                 preview_only: false,
+                sender_filter: None,
             }
         );
     }
@@ -1633,6 +1638,7 @@ mod tests {
                     range_minutes: None,
                     image_token_present: true,
                     preview_only: false,
+                    sender_filter: None,
                 }
             );
         }
@@ -1650,6 +1656,7 @@ mod tests {
                 range_minutes: Some(24 * 60),
                 image_token_present: true,
                 preview_only: false,
+                sender_filter: None,
             }
         );
     }
@@ -1665,6 +1672,7 @@ mod tests {
                 range_minutes: Some(60),
                 image_token_present: true,
                 preview_only: false,
+                sender_filter: None,
             }
         );
     }
