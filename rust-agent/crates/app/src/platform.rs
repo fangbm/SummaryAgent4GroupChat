@@ -380,6 +380,7 @@ fn discord_gateway_intents() -> GatewayIntents {
     GatewayIntents::GUILD_MESSAGES | GatewayIntents::DIRECT_MESSAGES
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query_discord_history(
     http: &Http,
     bot_user_id: UserId,
@@ -909,6 +910,7 @@ fn discord_slash_command_content(command: &CommandInteraction) -> Option<String>
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discord_slash_command_content_from_values(
     name: &str,
     platform: Option<&str>,
