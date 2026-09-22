@@ -184,6 +184,7 @@ pub(crate) async fn handle_platform_event(
         command.image_token_present,
         command.preview_only,
     );
+    pipeline_options.sender_filter = command.sender_filter.clone();
     if config.image_gen.enabled && !config.image_summary_enabled_for_room(&trigger.room_id) {
         info!(room_id = %trigger.room_id, "image summary disabled by room capability");
         append_runtime_log(
@@ -553,10 +554,7 @@ async fn handle_manual_image_command(
                 task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
                 append_runtime_log(
                     config,
-                    &format!(
-                        "manual random image command completed room={}",
-                        trigger.room_id
-                    ),
+                    &format!("manual random image command completed room={}", trigger.room_id),
                 );
             }
             Err(error) => {
@@ -747,10 +745,7 @@ async fn handle_manual_image_command(
             error!(room_id = %trigger.room_id, error = %detail, "manual image command failed");
             append_runtime_log(
                 config,
-                &format!(
-                    "manual image command failed room={} error={detail}",
-                    trigger.room_id
-                ),
+                &format!("manual image command failed room={} error={detail}", trigger.room_id),
             );
             let _ = client
                 .send_text(
