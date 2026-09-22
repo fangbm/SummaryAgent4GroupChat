@@ -673,12 +673,8 @@ fn create_discord_summary_command(name: &str) -> CreateCommand {
             .required(false),
         )
         .add_option(
-            CreateCommandOption::new(
-                CommandOptionType::User,
-                "user",
-                "可选：只总结该用户的消息",
-            )
-            .required(false),
+            CreateCommandOption::new(CommandOptionType::User, "user", "可选：只总结该用户的消息")
+                .required(false),
         )
 }
 
@@ -1627,7 +1623,9 @@ mod tests {
                 Some("/图片 夜景".to_string())
             );
             assert_eq!(
-                discord_slash_command_content_from_values(name, None, None, None, None, None, None, None),
+                discord_slash_command_content_from_values(
+                    name, None, None, None, None, None, None, None
+                ),
                 Some("/图片".to_string())
             );
         }
