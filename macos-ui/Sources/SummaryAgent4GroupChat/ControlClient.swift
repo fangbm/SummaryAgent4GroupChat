@@ -49,6 +49,7 @@ struct LogTail: Decodable {
     let text: String
 }
 
+@MainActor
 final class ControlClient {
     private let socketPath: String
     private let token: String
