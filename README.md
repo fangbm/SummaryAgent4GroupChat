@@ -147,7 +147,7 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 # db_dir = "D:\\Temp\\xwechat_files\\wxid_xxx\\db_storage"
 ```
 
-`wxdb init` 会刷新本地密钥缓存。成员过滤依赖支持 `wxdb history --sender` 的新版 wxdb；该过滤会在媒体解码预算扣减前执行。缓存和密钥数据敏感，请放在受信任磁盘；缓存目录可在 GUI 的接入平台页修改。
+`wxdb init` 会刷新本地密钥缓存。成员过滤依赖 `wxdb v0.1.2+` 的 `wxdb history --sender`；该过滤会在媒体解码预算扣减前执行。缓存和密钥数据敏感，请放在受信任磁盘；缓存目录可在 GUI 的接入平台页修改。
 
 ### 按群聊/频道能力覆盖
 
