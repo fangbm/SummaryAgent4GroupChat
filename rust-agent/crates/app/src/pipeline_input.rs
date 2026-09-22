@@ -24,6 +24,7 @@ pub(super) async fn load_summary_history(
     range: &ResolvedTimeRange,
     recent_observed_messages: Option<&RecentObservedMessages>,
     media_decode_limit_override: Option<usize>,
+    sender_filter: Option<&str>,
 ) -> Result<Option<Vec<crate::platform::PlatformHistoryMessage>>> {
     let history_page_limit = config.history_message_limit();
     let media_decode_limit = match (
@@ -62,10 +63,11 @@ pub(super) async fn load_summary_history(
         range.until,
         history_page_limit,
         media_decode_limit,
+        sender_filter,
     )
     .await
     .context("querying platform chat history")?;
-    if !history.is_empty() {
+    if !history.is_empty() || sender_filter.is_some() {
         return Ok(Some(history));
     }
 
@@ -112,6 +114,7 @@ pub(super) async fn load_summary_history(
             range.until,
             history_page_limit,
             media_decode_limit,
+            sender_filter,
         )
         .await
         .context("retrying platform chat history after suspicious empty result")?;
