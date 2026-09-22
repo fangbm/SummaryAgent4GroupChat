@@ -255,6 +255,7 @@ impl Wx4pyClient {
                 limit,
                 media_decode_limit,
                 None,
+                None,
             )
             .await
     }
@@ -357,11 +358,13 @@ impl Wx4pyHistoryReader {
         until: DateTime<Utc>,
         limit: u32,
         media_decode_limit: Option<usize>,
+        sender_filter: Option<&str>,
         before_local_id: Option<i64>,
     ) -> Result<Vec<Wx4pyHistoryMessage>> {
         let chat_name = self.chat_name(room_id, room_name);
         let output = self.temp_output_path(room_id);
         let wx_cli = self.wx_cli.clone();
+        let sender_filter = sender_filter.map(ToOwned::to_owned);
         let total_timeout_seconds = history_query_timeout_seconds(&wx_cli);
         let started = Instant::now();
         tracing::debug!(
@@ -382,6 +385,7 @@ impl Wx4pyHistoryReader {
                 until,
                 limit,
                 media_decode_limit,
+                sender_filter.as_deref(),
                 before_local_id,
                 &output,
             )
@@ -477,6 +481,7 @@ fn query_text_messages_inner(
     until: DateTime<Utc>,
     limit: u32,
     media_decode_limit: Option<usize>,
+    sender_filter: Option<&str>,
     before_local_id: Option<i64>,
     output: &Path,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
@@ -498,10 +503,11 @@ fn query_text_messages_inner(
         until,
         limit,
         media_decode_limit,
+        sender_filter,
         before_local_id,
         deadline,
     ) {
-        Ok(messages) if !messages.is_empty() => return Ok(messages),
+        Ok(messages) if !messages.is_empty() || sender_filter.is_some() => return Ok(messages),
         Ok(_) => {
             tracing::warn!(
                 chat_name,
@@ -511,7 +517,7 @@ fn query_text_messages_inner(
             );
         }
         Err(error) => {
-            if should_skip_export_after_history_error(&error) {
+            if sender_filter.is_some() || should_skip_export_after_history_error(&error) {
                 return Err(error);
             }
             tracing::warn!(
@@ -542,6 +548,7 @@ pub fn query_external_history_page(
     until: DateTime<Utc>,
     limit: u32,
     media_decode_limit: Option<usize>,
+    sender_filter: Option<&str>,
     before_local_id: Option<i64>,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     let output = PathBuf::from(&wx_cli.temp_dir).join(format!(
@@ -556,6 +563,7 @@ pub fn query_external_history_page(
         until,
         limit,
         media_decode_limit,
+        sender_filter,
         before_local_id,
         &output,
     )
@@ -574,14 +582,22 @@ fn query_text_messages_via_history(
     until: DateTime<Utc>,
     limit: u32,
     media_decode_limit: Option<usize>,
+    sender_filter: Option<&str>,
     before_local_id: Option<i64>,
     deadline: Instant,
 ) -> Result<Vec<Wx4pyHistoryMessage>> {
     let mut last_error = None;
     let mut empty_messages = None;
     for candidate in wx_cli_chat_candidates(chat_name) {
-        let mut cmd =
-            build_wx_cli_history_command(wx_cli, &candidate, since, until, limit, before_local_id);
+        let mut cmd = build_wx_cli_history_command(
+            wx_cli,
+            &candidate,
+            since,
+            until,
+            limit,
+            sender_filter,
+            before_local_id,
+        );
         if let Some(media_decode_limit) = media_decode_limit {
             cmd.extend([
                 "--media-decode-limit".to_string(),
@@ -1017,6 +1033,7 @@ pub fn build_wx_cli_history_command(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    sender_filter: Option<&str>,
     before_local_id: Option<i64>,
 ) -> Vec<String> {
     let mut command = vec![
@@ -1033,6 +1050,12 @@ pub fn build_wx_cli_history_command(
         "-n".to_string(),
         limit.to_string(),
     ];
+    if let Some(sender_filter) = sender_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.extend(["--sender".to_string(), sender_filter.to_string()]);
+    }
     if let Some(local_id) = before_local_id {
         command.extend(["--before-local-id".to_string(), local_id.to_string()]);
     }
@@ -1430,6 +1453,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 24, 1, 0, 0).unwrap(),
             Utc.with_ymd_and_hms(2026, 5, 24, 2, 0, 0).unwrap(),
             100,
+            Some("Alice Smith"),
             Some(9001),
         );
 
@@ -1440,6 +1464,11 @@ mod tests {
         assert!(cmd.contains(&"--json".to_string()));
         assert!(cmd.contains(&"--type".to_string()));
         assert!(cmd.contains(&"all".to_string()));
+        let sender_index = cmd
+            .iter()
+            .position(|value| value == "--sender")
+            .expect("sender filter flag");
+        assert_eq!(cmd[sender_index + 1], "Alice Smith");
         let cursor_index = cmd
             .iter()
             .position(|value| value == "--before-local-id")
