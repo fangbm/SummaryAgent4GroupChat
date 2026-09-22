@@ -16,6 +16,7 @@ use crate::{
     media_service, platform::PlatformWorker, runtime_log::append_runtime_log, summary_input,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn load_summary_history(
     config: &AgentConfig,
     client: &PlatformWorker,
