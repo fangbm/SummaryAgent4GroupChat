@@ -91,7 +91,13 @@ pub(crate) async fn apply_image_captions(
     let candidates: Vec<_> = selection
         .candidates
         .into_iter()
-        .map(|candidate| (candidate.history_index, candidate.attempted, candidate.source))
+        .map(|candidate| {
+            (
+                candidate.history_index,
+                candidate.attempted,
+                candidate.source,
+            )
+        })
         .collect();
 
     let attempted = candidates.len();
@@ -282,7 +288,13 @@ pub(crate) async fn apply_video_captions(
     let candidates: Vec<_> = selection
         .candidates
         .into_iter()
-        .map(|candidate| (candidate.history_index, candidate.attempted, candidate.source))
+        .map(|candidate| {
+            (
+                candidate.history_index,
+                candidate.attempted,
+                candidate.source,
+            )
+        })
         .collect();
 
     let attempted = candidates.len();
@@ -480,7 +492,13 @@ pub(crate) async fn apply_voice_transcriptions(
     let candidates: Vec<_> = selection
         .candidates
         .into_iter()
-        .map(|candidate| (candidate.history_index, candidate.attempted, candidate.source))
+        .map(|candidate| {
+            (
+                candidate.history_index,
+                candidate.attempted,
+                candidate.source,
+            )
+        })
         .collect();
 
     let attempted = candidates.len();
@@ -608,19 +626,21 @@ fn spawn_voice_transcription_task(
     let (history_index, attempted, source) = (candidate.0, candidate.1, candidate.2.clone());
     let room_id = room_id.to_string();
     join_set.spawn(async move {
-        let transcriber = transcriber
-            .as_ref()
-            .clone()
-            .with_trace_context(ai_trace_context_for_item(
-                &room_id,
-                "voice transcription",
-                attempted,
-                item_total,
-            ));
-        let result = match crate::media_audio::prepare_voice_transcription_audio(audio_prep, source).await {
-            Ok(source) => transcriber.transcribe_audio(&source).await,
-            Err(error) => Err(error),
-        };
+        let transcriber =
+            transcriber
+                .as_ref()
+                .clone()
+                .with_trace_context(ai_trace_context_for_item(
+                    &room_id,
+                    "voice transcription",
+                    attempted,
+                    item_total,
+                ));
+        let result =
+            match crate::media_audio::prepare_voice_transcription_audio(audio_prep, source).await {
+                Ok(source) => transcriber.transcribe_audio(&source).await,
+                Err(error) => Err(error),
+            };
         VoiceTranscriptionTaskResult {
             history_index,
             attempted,

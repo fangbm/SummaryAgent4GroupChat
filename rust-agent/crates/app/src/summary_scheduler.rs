@@ -77,11 +77,7 @@ impl SummaryTaskScheduler {
         }
     }
 
-    pub(crate) fn enqueue(
-        &mut self,
-        room_id: String,
-        future: SummaryFuture,
-    ) -> ScheduleResult {
+    pub(crate) fn enqueue(&mut self, room_id: String, future: SummaryFuture) -> ScheduleResult {
         if self.in_flight.contains(&room_id) {
             return ScheduleResult::DuplicateRoom;
         }

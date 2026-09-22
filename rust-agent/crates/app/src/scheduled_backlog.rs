@@ -30,7 +30,11 @@ impl ScheduledSummaryBacklog {
         due_at: DateTime<Utc>,
     ) {
         for room_id in rooms {
-            if self.requests.iter().any(|request| request.room_id == room_id) {
+            if self
+                .requests
+                .iter()
+                .any(|request| request.room_id == room_id)
+            {
                 continue;
             }
             self.requests.push_back(ScheduledSummaryRequest {

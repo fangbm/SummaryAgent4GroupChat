@@ -553,7 +553,10 @@ async fn handle_manual_image_command(
                 task.set_stage(TaskState::Succeeded, "completed", None, None, 0, 0);
                 append_runtime_log(
                     config,
-                    &format!("manual random image command completed room={}", trigger.room_id),
+                    &format!(
+                        "manual random image command completed room={}",
+                        trigger.room_id
+                    ),
                 );
             }
             Err(error) => {
@@ -744,7 +747,10 @@ async fn handle_manual_image_command(
             error!(room_id = %trigger.room_id, error = %detail, "manual image command failed");
             append_runtime_log(
                 config,
-                &format!("manual image command failed room={} error={detail}", trigger.room_id),
+                &format!(
+                    "manual image command failed room={} error={detail}",
+                    trigger.room_id
+                ),
             );
             let _ = client
                 .send_text(

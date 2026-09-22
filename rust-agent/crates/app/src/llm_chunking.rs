@@ -1,9 +1,7 @@
 //! Pure data preparation for long-chat LLM requests.
 
 use wechat_summary_core::{
-    config::PrivacyConfig,
-    models::ChatMessage,
-    ChatFormatter, PrivacyFilter,
+    config::PrivacyConfig, models::ChatMessage, ChatFormatter, PrivacyFilter,
 };
 
 use crate::{format_local_time, render_prompt_template};
@@ -124,7 +122,9 @@ pub(crate) fn build_llm_chunk_requests(
     fitted_chunks
         .into_iter()
         .enumerate()
-        .map(|(index, messages)| build_llm_chunk_request(index, messages, privacy, user_prompt_template))
+        .map(|(index, messages)| {
+            build_llm_chunk_request(index, messages, privacy, user_prompt_template)
+        })
         .collect()
 }
 
@@ -168,8 +168,20 @@ fn push_fitted_llm_chunks(
     let midpoint = chunk.len() / 2;
     let right = chunk[midpoint..].to_vec();
     let left = chunk[..midpoint].to_vec();
-    push_fitted_llm_chunks(left, privacy, user_prompt_template, max_prompt_chars, output);
-    push_fitted_llm_chunks(right, privacy, user_prompt_template, max_prompt_chars, output);
+    push_fitted_llm_chunks(
+        left,
+        privacy,
+        user_prompt_template,
+        max_prompt_chars,
+        output,
+    );
+    push_fitted_llm_chunks(
+        right,
+        privacy,
+        user_prompt_template,
+        max_prompt_chars,
+        output,
+    );
 }
 
 pub(crate) fn private_formatted_chat_input(
