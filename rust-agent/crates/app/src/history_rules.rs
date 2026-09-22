@@ -36,6 +36,18 @@ pub(crate) fn is_agent_status(message: &PlatformHistoryMessage) -> bool {
     is_agent_status_content(&message.content)
 }
 
+pub(crate) fn matches_sender_filter(message: &PlatformHistoryMessage, filter: &str) -> bool {
+    let filter = normalize_sender(filter);
+    !filter.is_empty()
+        && [
+            Some(message.sender_id.as_str()),
+            message.sender_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|sender| normalize_sender(sender) == filter)
+}
+
 pub(crate) fn is_agent_status_content(content: &str) -> bool {
     let content = content.trim();
     content.starts_with("收到 /总结")
@@ -52,6 +64,7 @@ fn stable_ids_match(left: &str, right: &str) -> bool {
     left == right
         || stable_id_number(left).is_some() && stable_id_number(left) == stable_id_number(right)
 }
+
 fn stable_id_number(value: &str) -> Option<u64> {
     value
         .rsplit_once(':')
@@ -59,4 +72,39 @@ fn stable_id_number(value: &str) -> Option<u64> {
         .unwrap_or(value)
         .parse()
         .ok()
+}
+
+fn normalize_sender(value: &str) -> String {
+    value.trim().trim_start_matches('@').to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+
+    fn message(sender_id: &str, sender_name: Option<&str>) -> PlatformHistoryMessage {
+        PlatformHistoryMessage {
+            stable_id: None,
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            sender_id: sender_id.to_string(),
+            sender_name: sender_name.map(str::to_string),
+            content: "hello".to_string(),
+            msg_type: "text".to_string(),
+            media_path: None,
+            thumbnail_path: None,
+            decoded_media_path: None,
+            media_decode_error: None,
+            is_self: false,
+        }
+    }
+
+    #[test]
+    fn sender_filter_matches_name_or_id_exactly() {
+        let message = message("wxid_alice", Some("Alice"));
+        assert!(matches_sender_filter(&message, "@Alice"));
+        assert!(matches_sender_filter(&message, "wxid_alice"));
+        assert!(!matches_sender_filter(&message, "Ali"));
+    }
 }
