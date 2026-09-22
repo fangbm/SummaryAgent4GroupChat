@@ -2,7 +2,7 @@
 
 use crate::*;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct PipelineOptions {
     pub(crate) text_summary_enabled: bool,
     pub(crate) image_gen_enabled: bool,
@@ -13,6 +13,7 @@ pub(crate) struct PipelineOptions {
     pub(crate) preview_only: bool,
     pub(crate) detail: wechat_summary_core::config::SummaryDetail,
     pub(crate) media_decode_limit: Option<usize>,
+    pub(crate) sender_filter: Option<String>,
 }
 
 #[derive(Clone)]
@@ -73,6 +74,7 @@ impl PipelineOptions {
                 .summary_detail
                 .unwrap_or(config.text_summary.detail),
             media_decode_limit: None,
+            sender_filter: None,
         }
     }
 
@@ -92,6 +94,7 @@ impl PipelineOptions {
                 .summary_detail
                 .unwrap_or(config.text_summary.detail),
             media_decode_limit: None,
+            sender_filter: None,
         }
     }
 }
@@ -130,6 +133,7 @@ pub(crate) async fn query_platform_history_paginated(
     until: DateTime<Utc>,
     page_limit: usize,
     media_decode_limit: Option<usize>,
+    sender_filter: Option<&str>,
 ) -> Result<Vec<PlatformHistoryMessage>> {
     let page_limit = page_limit.max(1);
     let query_limit = page_limit.min(u32::MAX as usize) as u32;
@@ -150,6 +154,7 @@ pub(crate) async fn query_platform_history_paginated(
                 page_until,
                 query_limit,
                 remaining_media_decode_limit,
+                sender_filter,
                 cursor.as_ref(),
             )
             .await
@@ -353,7 +358,7 @@ pub(crate) async fn run_summary_pipeline(
 
     if options.send_progress {
         if let Err(error) = client
-            .send_text(&trigger.room_id, progress_message(options))
+            .send_text(&trigger.room_id, progress_message(&options))
             .await
         {
             warn!(
@@ -394,6 +399,7 @@ pub(crate) async fn run_summary_pipeline(
         range,
         recent_observed_messages,
         options.media_decode_limit,
+        options.sender_filter.as_deref(),
     )
     .await?
     else {
@@ -464,6 +470,9 @@ pub(crate) async fn run_summary_pipeline(
         !history_rules::is_current_trigger(message, incoming)
             && !history_rules::is_agent_status(message)
     });
+    if let Some(sender_filter) = options.sender_filter.as_deref() {
+        history.retain(|message| history_rules::matches_sender_filter(message, sender_filter));
+    }
     let filtered_history_len = history.len();
     let removed_history_len = raw_history_len.saturating_sub(filtered_history_len);
     info!(
@@ -485,7 +494,7 @@ pub(crate) async fn run_summary_pipeline(
         config,
         client,
         &trigger.room_id,
-        options,
+        &options,
         task,
         history,
     )

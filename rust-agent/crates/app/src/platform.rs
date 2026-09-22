@@ -274,6 +274,7 @@ impl PlatformWorker {
         until: DateTime<Utc>,
         limit: u32,
         media_decode_limit: Option<usize>,
+        sender_filter: Option<&str>,
         before: Option<&PlatformHistoryCursor>,
     ) -> Result<Vec<PlatformHistoryMessage>> {
         let routed = self.route(room_id)?;
@@ -289,14 +290,24 @@ impl PlatformWorker {
                     until,
                     limit,
                     media_decode_limit,
+                    sender_filter,
                     before.and_then(PlatformHistoryCursor::wxdb_local_id),
                 )
                 .await
                 .map(|messages| messages.into_iter().map(Into::into).collect())
                 .map_err(Into::into),
             PlatformHistoryWorker::Discord { http, bot_user_id } => {
-                query_discord_history(http, *bot_user_id, room_id, since, until, limit, before)
-                    .await
+                query_discord_history(
+                    http,
+                    *bot_user_id,
+                    room_id,
+                    since,
+                    until,
+                    limit,
+                    sender_filter,
+                    before,
+                )
+                .await
             }
         }
     }
@@ -369,6 +380,7 @@ fn discord_gateway_intents() -> GatewayIntents {
     GatewayIntents::GUILD_MESSAGES | GatewayIntents::DIRECT_MESSAGES
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query_discord_history(
     http: &Http,
     bot_user_id: UserId,
@@ -376,6 +388,7 @@ async fn query_discord_history(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     limit: u32,
+    sender_filter: Option<&str>,
     cursor: Option<&PlatformHistoryCursor>,
 ) -> Result<Vec<PlatformHistoryMessage>> {
     let channel_id = parse_discord_channel_id(room_id)?;
@@ -389,7 +402,11 @@ async fn query_discord_history(
             break;
         }
 
-        let batch_limit = remaining.min(100) as u8;
+        let batch_limit = if sender_filter.is_some() {
+            100
+        } else {
+            remaining.min(100) as u8
+        };
         let mut request = GetMessages::new().limit(batch_limit);
         if let Some(before_id) = before {
             request = request.before(before_id);
@@ -414,6 +431,10 @@ async fn query_discord_history(
                 continue;
             }
 
+            if !discord_sender_matches_filter(message, sender_filter) {
+                continue;
+            }
+
             let content = discord_message_content(message);
             if content.trim().is_empty() {
                 continue;
@@ -433,6 +454,9 @@ async fn query_discord_history(
                 thumbnail_path: None,
                 is_self: message.author.id == bot_user_id,
             });
+            if collected.len() >= max_messages {
+                break;
+            }
         }
 
         before = messages.last().map(|message| message.id);
@@ -443,6 +467,22 @@ async fn query_discord_history(
 
     collected.sort_by_key(|message| message.timestamp);
     Ok(collected)
+}
+
+fn discord_sender_matches_filter(message: &Message, sender_filter: Option<&str>) -> bool {
+    let Some(filter) = sender_filter
+        .map(normalize_sender_filter)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    [message.author.id.to_string(), message.author.name.clone()]
+        .into_iter()
+        .any(|value| normalize_sender_filter(&value) == filter)
+}
+
+fn normalize_sender_filter(value: &str) -> String {
+    value.trim().trim_start_matches('@').to_lowercase()
 }
 
 impl PlatformSender {
@@ -632,6 +672,10 @@ fn create_discord_summary_command(name: &str) -> CreateCommand {
                 "可选：image、img 或 图片生成图片总结",
             )
             .required(false),
+        )
+        .add_option(
+            CreateCommandOption::new(CommandOptionType::User, "user", "可选：只总结该用户的消息")
+                .required(false),
         )
 }
 
@@ -845,22 +889,34 @@ fn discord_slash_command_content(command: &CommandInteraction) -> Option<String>
             .find(|option| option.name == name)
             .and_then(|option| option.value.as_i64())
     };
+    let user = command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == "user")
+        .and_then(|option| match &option.value {
+            serenity::all::CommandDataOptionValue::User(user_id) => Some(user_id.to_string()),
+            _ => None,
+        });
     discord_slash_command_content_from_values(
         command.data.name.as_str(),
         value("platform"),
         value("time"),
         value("image"),
+        user.as_deref(),
         value("prompt"),
         value("mode"),
         int_value("pages"),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discord_slash_command_content_from_values(
     name: &str,
     platform: Option<&str>,
     time: Option<&str>,
     image: Option<&str>,
+    sender: Option<&str>,
     prompt: Option<&str>,
     mode: Option<&str>,
     pages: Option<i64>,
@@ -882,6 +938,10 @@ fn discord_slash_command_content_from_values(
             )
         }) {
             content.push_str(" image");
+        }
+        if let Some(sender) = sender {
+            content.push_str(" @");
+            content.push_str(sender);
         }
         return Some(content);
     }
@@ -1530,17 +1590,19 @@ mod tests {
                 Some("wx"),
                 Some("24h"),
                 Some("img"),
+                Some("123456789012345678"),
                 None,
                 None,
                 None,
             ),
-            Some("/总结 wx 24h image".to_string())
+            Some("/总结 wx 24h image @123456789012345678".to_string())
         );
         assert_eq!(
             discord_slash_command_content_from_values(
                 "summary",
                 None,
                 Some("1d"),
+                None,
                 None,
                 None,
                 None,
@@ -1555,6 +1617,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Some("夜景"),
                     None,
                     None
@@ -1562,13 +1625,16 @@ mod tests {
                 Some("/图片 夜景".to_string())
             );
             assert_eq!(
-                discord_slash_command_content_from_values(name, None, None, None, None, None, None),
+                discord_slash_command_content_from_values(
+                    name, None, None, None, None, None, None, None
+                ),
                 Some("/图片".to_string())
             );
         }
         assert_eq!(
             discord_slash_command_content_from_values(
                 "image",
+                None,
                 None,
                 None,
                 None,

@@ -7,7 +7,7 @@ Windows 使用 WinUI 3 原生管理界面，macOS 使用 SwiftUI 原生管理界
 ## 能力
 
 - 微信群与 Discord 频道可同时接入，统一使用 `/总结` 指令和定时任务。
-- `/总结 [platform] [time] [图片] [预览]`：支持 `wx`、`微信`、`wechat`、`dc`、`discord`，大小写不敏感；平台省略时使用收到指令的平台。`预览`/`preview` 只在任务中心保存结果，不发送到群。
+- `/总结 [platform] [time] [图片] [预览] [@成员]`：支持 `wx`、`微信`、`wechat`、`dc`、`discord`，大小写不敏感；平台省略时使用收到指令的平台。`预览`/`preview` 只在任务中心保存结果，不发送到群。
 - 文本总结、图片总结、图片生成，以及超长历史按页读取和分段处理。
 - 按群聊或频道单独关闭图片总结，让指定房间只发送文字总结。
 - 可选图片转述、视频转述和语音转写；语音可通过 FFmpeg 转为 MP3。
@@ -147,7 +147,7 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 # db_dir = "D:\\Temp\\xwechat_files\\wxid_xxx\\db_storage"
 ```
 
-`wxdb init` 会刷新本地密钥缓存。缓存和密钥数据敏感，请放在受信任磁盘；缓存目录可在 GUI 的接入平台页修改。
+`wxdb init` 会刷新本地密钥缓存。成员过滤依赖 `wxdb v0.1.2+` 的 `wxdb history --sender`；该过滤会在媒体解码预算扣减前执行。缓存和密钥数据敏感，请放在受信任磁盘；缓存目录可在 GUI 的接入平台页修改。
 
 ### 按群聊/频道能力覆盖
 
@@ -167,6 +167,7 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 | --- | --- |
 | `/总结` | 总结当前平台、默认时间范围内的聊天。 |
 | `/总结 24h` | 总结最近 24 小时。支持 `30m`、`2h`、`1d`、`48h`、`30d` 等时长。 |
+| `/总结 24h @Alice` | 只总结该成员在最近 24 小时内的消息；微信按 sender ID/群昵称精确匹配，Discord 使用原生用户选择器。 |
 | `/总结 dc 1d` | 在当前群中请求 Discord 平台最近一天的总结。 |
 | `/总结 微信 2h 图片` | 总结微信最近两小时，并按图片开关生成或跳过配图。 |
 | `/总结 24h 预览` | 生成文字预览，仅保存在任务中心，便于检查模型与提示词。 |
@@ -175,7 +176,7 @@ cache_dir = "D:\\SummaryAgentCache\\wxdb"
 
 `图片`、`image`、`img` 均可用。`[manual_summary].image_by_default = false` 时，只有包含图片参数才生成图片；设为 `true` 时含图片参数表示跳过生图。
 
-Discord 使用原生 Slash Commands：`/summary`、`/总结`（可选 `platform`、`time`、`image`），以及 `/image`、`/img`、`/图片`（可选 `prompt`、`mode=single|manga`、`pages=2-8`）。Discord 图片任务要求 `[discord].image_output_channel_id`，命令来源频道只负责鉴权，进度和编号图片统一发送到该频道；机器人需要查看频道、发消息和上传附件权限。Discord 普通消息中的同名命令不会再触发。全局命令由 Discord 同步，首次出现可能需要短暂传播时间。Discord 长文本默认分段发送；在“接入平台”页选 `file` 后，达到阈值会改用 `.txt` 附件。
+Discord 使用原生 Slash Commands：`/summary`、`/总结`（可选 `platform`、`time`、`image`、`user`），以及 `/image`、`/img`、`/图片`（可选 `prompt`、`mode=single|manga`、`pages=2-8`）。Discord 图片任务要求 `[discord].image_output_channel_id`，命令来源频道只负责鉴权，进度和编号图片统一发送到该频道；机器人需要查看频道、发消息和上传附件权限。Discord 普通消息中的同名命令不会再触发。全局命令由 Discord 同步，首次出现可能需要短暂传播时间。Discord 长文本默认分段发送；在“接入平台”页选 `file` 后，达到阈值会改用 `.txt` 附件。
 
 定时总结由 `[scheduled_summary]` 控制，默认每天本地时间 22:00 汇总 24 小时。定时任务不受手动图片冷却影响。
 

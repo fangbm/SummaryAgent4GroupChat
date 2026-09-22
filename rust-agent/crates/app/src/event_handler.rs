@@ -184,6 +184,7 @@ pub(crate) async fn handle_platform_event(
         command.image_token_present,
         command.preview_only,
     );
+    pipeline_options.sender_filter = command.sender_filter.clone();
     if config.image_gen.enabled && !config.image_summary_enabled_for_room(&trigger.room_id) {
         info!(room_id = %trigger.room_id, "image summary disabled by room capability");
         append_runtime_log(
