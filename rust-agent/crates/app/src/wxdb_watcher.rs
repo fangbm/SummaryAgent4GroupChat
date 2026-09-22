@@ -398,6 +398,7 @@ fn poll_room(
             until,
             crate::WXDB_COMMAND_WATCH_LIMIT as u32,
             Some(0),
+            None,
             before_local_id,
         )
         .with_context(|| format!("querying wxdb command watcher history for {chat_name}"))
