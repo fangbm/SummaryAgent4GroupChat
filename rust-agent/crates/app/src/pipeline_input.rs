@@ -16,6 +16,7 @@ use crate::{
     media_service, platform::PlatformWorker, runtime_log::append_runtime_log, summary_input,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn load_summary_history(
     config: &AgentConfig,
     client: &PlatformWorker,
@@ -24,6 +25,7 @@ pub(super) async fn load_summary_history(
     range: &ResolvedTimeRange,
     recent_observed_messages: Option<&RecentObservedMessages>,
     media_decode_limit_override: Option<usize>,
+    sender_filter: Option<&str>,
 ) -> Result<Option<Vec<crate::platform::PlatformHistoryMessage>>> {
     let history_page_limit = config.history_message_limit();
     let media_decode_limit = match (
@@ -62,10 +64,11 @@ pub(super) async fn load_summary_history(
         range.until,
         history_page_limit,
         media_decode_limit,
+        sender_filter,
     )
     .await
     .context("querying platform chat history")?;
-    if !history.is_empty() {
+    if !history.is_empty() || sender_filter.is_some() {
         return Ok(Some(history));
     }
 
@@ -112,6 +115,7 @@ pub(super) async fn load_summary_history(
             range.until,
             history_page_limit,
             media_decode_limit,
+            sender_filter,
         )
         .await
         .context("retrying platform chat history after suspicious empty result")?;
@@ -150,7 +154,7 @@ pub(super) async fn prepare_pipeline_input(
     config: &AgentConfig,
     client: &PlatformWorker,
     room_id: &str,
-    options: PipelineOptions,
+    options: &PipelineOptions,
     task: Option<&OperationalTask>,
     mut history: Vec<crate::platform::PlatformHistoryMessage>,
 ) -> Result<Option<PreparedPipelineInput>> {
