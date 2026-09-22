@@ -133,6 +133,7 @@ pub(crate) async fn query_platform_history_paginated(
     until: DateTime<Utc>,
     page_limit: usize,
     media_decode_limit: Option<usize>,
+    sender_filter: Option<&str>,
 ) -> Result<Vec<PlatformHistoryMessage>> {
     let page_limit = page_limit.max(1);
     let query_limit = page_limit.min(u32::MAX as usize) as u32;
@@ -153,6 +154,7 @@ pub(crate) async fn query_platform_history_paginated(
                 page_until,
                 query_limit,
                 remaining_media_decode_limit,
+                sender_filter,
                 cursor.as_ref(),
             )
             .await
@@ -397,6 +399,7 @@ pub(crate) async fn run_summary_pipeline(
         range,
         recent_observed_messages,
         options.media_decode_limit,
+        options.sender_filter.as_deref(),
     )
     .await?
     else {
