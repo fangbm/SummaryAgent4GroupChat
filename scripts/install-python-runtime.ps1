@@ -22,7 +22,7 @@ $env:PYTHONIOENCODING = "utf-8"
 $WxdbReleaseRepository = "fangbm/wxdb"
 # Keep a known-good direct asset URL as a fallback. GitHub's unauthenticated
 # REST API is shared per public IP and can return 403 after its rate limit.
-$FallbackWxdbDownloadUrl = "https://github.com/fangbm/wxdb/releases/download/v0.1.0/wxdb-v0.1.0-windows-x64.zip"
+$FallbackWxdbDownloadUrl = "https://github.com/fangbm/wxdb/releases/download/v0.1.2/wxdb-v0.1.2-windows-x64.zip"
 
 function Write-Step {
     param([string]$Message)
