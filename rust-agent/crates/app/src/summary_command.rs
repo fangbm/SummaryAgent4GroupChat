@@ -1,4 +1,4 @@
-//! Parsing for `/总结 [platform] [time] [img] [preview]` commands.
+//! Parsing for `/总结 [platform] [time] [img] [preview] [@sender]` commands.
 
 use wechat_summary_core::{config::PlatformKindConfig, TriggerMatch};
 
@@ -43,17 +43,39 @@ pub(crate) fn parse_args(
     let mut preview_only = false;
     let mut sender_filter = None;
     let mut range_tokens: Vec<&str> = Vec::new();
-    for token in args.split_whitespace() {
+    let tokens = args.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index];
         if let Some(platform) = PlatformKindConfig::parse_alias(token) {
             target_platform = platform;
+            index += 1;
         } else if is_image_token(token) {
             image_token_present = true;
+            index += 1;
         } else if is_preview_token(token) {
             preview_only = true;
+            index += 1;
         } else if let Some(sender) = token.strip_prefix('@').filter(|sender| !sender.is_empty()) {
-            sender_filter = Some(sender.to_string());
+            let mut sender_parts = vec![sender];
+            index += 1;
+            while index < tokens.len()
+                && !tokens[index].starts_with('@')
+                && recognized_non_sender_token_count(&tokens, index) == 0
+            {
+                sender_parts.push(tokens[index]);
+                index += 1;
+            }
+            sender_filter = Some(sender_parts.join(" "));
         } else {
-            range_tokens.push(token);
+            let consumed = recognized_time_token_count(&tokens, index);
+            if consumed == 0 {
+                range_tokens.push(token);
+                index += 1;
+            } else {
+                range_tokens.extend_from_slice(&tokens[index..index + consumed]);
+                index += consumed;
+            }
         }
     }
 
@@ -82,6 +104,30 @@ fn is_preview_token(token: &str) -> bool {
         token.trim().to_ascii_lowercase().as_str(),
         "preview" | "dry-run"
     ) || matches!(token.trim(), "预览" | "试运行")
+}
+
+fn recognized_non_sender_token_count(tokens: &[&str], index: usize) -> usize {
+    let token = tokens[index];
+    if PlatformKindConfig::parse_alias(token).is_some()
+        || is_image_token(token)
+        || is_preview_token(token)
+        || is_default_time_range_token(token)
+    {
+        return 1;
+    }
+    recognized_time_token_count(tokens, index)
+}
+
+fn recognized_time_token_count(tokens: &[&str], index: usize) -> usize {
+    if parse_strict_duration_minutes(&tokens[index..index + 1]).is_some() {
+        return 1;
+    }
+    if index + 1 < tokens.len()
+        && parse_strict_duration_minutes(&tokens[index..index + 2]).is_some()
+    {
+        return 2;
+    }
+    0
 }
 
 fn parse_time_range_minutes(tokens: &[&str]) -> Option<Option<i64>> {
@@ -164,5 +210,21 @@ mod tests {
 
         assert_eq!(command.range_minutes, Some(24 * 60));
         assert_eq!(command.sender_filter.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn parses_sender_filter_with_spaces_when_trailing() {
+        let command = parse_args("24h @Alice Smith", PlatformKindConfig::Wx4py).unwrap();
+
+        assert_eq!(command.range_minutes, Some(24 * 60));
+        assert_eq!(command.sender_filter.as_deref(), Some("Alice Smith"));
+    }
+
+    #[test]
+    fn parses_sender_filter_with_spaces_before_time_range() {
+        let command = parse_args("@Alice Smith 24h", PlatformKindConfig::Wx4py).unwrap();
+
+        assert_eq!(command.range_minutes, Some(24 * 60));
+        assert_eq!(command.sender_filter.as_deref(), Some("Alice Smith"));
     }
 }
