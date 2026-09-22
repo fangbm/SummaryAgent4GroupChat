@@ -55,7 +55,8 @@ impl RecentTriggerAttempts {
         event_at: DateTime<Utc>,
         observed_at: DateTime<Utc>,
     ) -> bool {
-        let retention_cutoff = observed_at - Duration::seconds(crate::TRIGGER_DEDUPE_RETENTION_SECONDS);
+        let retention_cutoff =
+            observed_at - Duration::seconds(crate::TRIGGER_DEDUPE_RETENTION_SECONDS);
         self.attempts_by_key.retain(|_, attempts| {
             attempts.retain(|attempt| attempt.observed_at >= retention_cutoff);
             !attempts.is_empty()
@@ -63,13 +64,15 @@ impl RecentTriggerAttempts {
         let process_cutoff = observed_at - Duration::seconds(crate::TRIGGER_DEDUPE_WINDOW_SECONDS);
         let key = trigger_key(trigger);
         if self.attempts_by_key.get(&key).is_some_and(|attempts| {
-            attempts.iter().any(|attempt| match (stable_id, attempt.stable_id.as_deref()) {
-                (Some(current), Some(previous)) => crate::stable_ids_match(previous, current),
-                _ => {
-                    attempt.observed_at >= process_cutoff
-                        || event_times_close(attempt.event_at, event_at)
-                }
-            })
+            attempts
+                .iter()
+                .any(|attempt| match (stable_id, attempt.stable_id.as_deref()) {
+                    (Some(current), Some(previous)) => crate::stable_ids_match(previous, current),
+                    _ => {
+                        attempt.observed_at >= process_cutoff
+                            || event_times_close(attempt.event_at, event_at)
+                    }
+                })
         }) {
             return true;
         }
@@ -160,5 +163,9 @@ fn event_times_close(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
 }
 
 fn trigger_key(trigger: &TriggerMatch) -> String {
-    format!("{}\n{}", trigger.room_id.trim(), trigger.trigger_content.trim())
+    format!(
+        "{}\n{}",
+        trigger.room_id.trim(),
+        trigger.trigger_content.trim()
+    )
 }

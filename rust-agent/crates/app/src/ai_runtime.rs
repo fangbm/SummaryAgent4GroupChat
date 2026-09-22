@@ -1,6 +1,9 @@
 //! Shared AI client tracing and request context helpers.
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use wechat_summary_ai::{AiTraceContext, OpenAiCompatibleLlm};

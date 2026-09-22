@@ -565,11 +565,17 @@ mod tests {
     fn recovers_builtin_image_commands_when_realtime_listener_misses_them() {
         let matcher = matcher();
         assert!(is_recoverable_command(&matcher, &incoming("/图片")));
-        assert!(is_recoverable_command(&matcher, &incoming("/image city at night")));
+        assert!(is_recoverable_command(
+            &matcher,
+            &incoming("/image city at night")
+        ));
     }
 
     #[test]
     fn does_not_recover_arbitrary_room_text() {
-        assert!(!is_recoverable_command(&matcher(), &incoming("普通聊天内容")));
+        assert!(!is_recoverable_command(
+            &matcher(),
+            &incoming("普通聊天内容")
+        ));
     }
 }
